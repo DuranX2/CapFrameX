@@ -1,16 +1,15 @@
 <Project>
-
   <!-- Central Package Management: one version per package for every project under source/.
        Add new packages here, not with Version= on the PackageReference in a csproj.
        If a project genuinely needs a different version of a shared package, override locally
        with <PackageReference Include="Foo" VersionOverride="1.2.3" /> in that project instead
        of changing the version here. -->
-
   <ItemGroup>
     <PackageVersion Include="DryIoc.dll" Version="5.4.3" />
     <PackageVersion Include="DynamicData" Version="9.5.0" />
     <PackageVersion Include="EmbedIO" Version="3.5.2" />
     <PackageVersion Include="Extended.Wpf.Toolkit" Version="5.1.2" />
+    <PackageVersion Include="FFmpeg.AutoGen" Version="9.0.1.1" />
     <PackageVersion Include="FluentValidation" Version="12.2.0" />
     <PackageVersion Include="FluentValidation.DependencyInjectionExtensions" Version="12.2.0" />
     <PackageVersion Include="gong-wpf-dragdrop" Version="4.0.0" />
@@ -42,6 +41,7 @@
     <PackageVersion Include="MSTest.TestAdapter" Version="4.5.2" />
     <PackageVersion Include="MSTest.TestFramework" Version="4.5.2" />
     <PackageVersion Include="NAudio" Version="3.3.0" />
+    <PackageVersion Include="NAudio.Wasapi" Version="3.3.0" />
     <PackageVersion Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageVersion Include="OxyPlot.Core" Version="2.2.0" />
     <PackageVersion Include="OxyPlot.Wpf" Version="2.2.0" />
@@ -58,6 +58,8 @@
     <PackageVersion Include="Serilog.Sinks.Console" Version="6.1.1" />
     <PackageVersion Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageVersion Include="SharpVectors.Wpf" Version="1.8.6" />
+    <PackageVersion Include="SkiaSharp" Version="4.156.1" />
+    <PackageVersion Include="SkiaSharp.NativeAssets.Win32" Version="4.156.1" />
     <PackageVersion Include="Squidex.ClientLibrary" Version="4.2.0" />
     <PackageVersion Include="System.Diagnostics.PerformanceCounter" Version="10.0.14" />
     <PackageVersion Include="System.IdentityModel.Tokens.Jwt" Version="8.23.0" />
@@ -74,5 +76,4 @@
     <!-- Native SDK for the bootstrapper's BAFunctions DLL; same WiX version as above. -->
     <PackageVersion Include="WixToolset.WixStandardBootstrapperApplicationFunctionApi" Version="6.0.2" />
   </ItemGroup>
-
 </Project>

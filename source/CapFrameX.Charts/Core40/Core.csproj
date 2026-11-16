@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <RootNamespace>LiveCharts</RootNamespace>
+    <AssemblyName>LiveCharts</AssemblyName>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- Vendored LiveCharts: the library calls its own [Obsolete] members internally (ChartFunctions
+         .GetUnitWidth, AxisSection.UpdateSection, Axis.AxisChanged, Chart.PrepareScrolBar, ...).
+         Resolving these means changing upstream code, so the obsolete diagnostics are silenced
+         here rather than in every consumer. -->
+    <NoWarn>$(NoWarn);CS0612;CS0618</NoWarn>
+  </PropertyGroup>
+
+</Project>

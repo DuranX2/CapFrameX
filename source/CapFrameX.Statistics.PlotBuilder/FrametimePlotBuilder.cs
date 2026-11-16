@@ -1,0 +1,207 @@
+﻿using CapFrameX.Data.Session.Contracts;
+using CapFrameX.Statistics.NetStandard;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using CapFrameX.Statistics.PlotBuilder.Contracts;
+using OxyPlot;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace CapFrameX.Statistics.PlotBuilder
+{
+    public class FrametimePlotBuilder : PlotBuilder
+    {
+        public FrametimePlotBuilder(IFrametimeStatisticProviderOptions options, IStatisticProvider frametimeStatisticProvider) : base(options, frametimeStatisticProvider) { }
+
+        public void BuildPlotmodel(ISession session, IPlotSettings plotSettings, double startTime, double endTime, ERemoveOutlierMethod eRemoveOutlinerMethod, Action<PlotModel> onFinishAction = null)
+        {
+            var plotModel = PlotModel;
+            Reset(false);
+
+            if (session == null)
+            {
+                plotModel.InvalidatePlot(true);
+                return;
+            }
+
+            plotModel.Axes.Add(AxisDefinitions[EPlotAxis.XAXIS]);
+            plotModel.Axes.Add(AxisDefinitions[EPlotAxis.YAXISFRAMETIMES]);
+
+            var frametimepoints = session.GetFrametimePointsTimeWindow(startTime, endTime, _frametimeStatisticProviderOptions, eRemoveOutlinerMethod);
+            // Only the display time graph and its moving average read these points.
+            var displaytimespoints = plotSettings.ShowDisplayTimes
+                ? session.GetDisplayChangeTimePointsTimeWindow(startTime, endTime, _frametimeStatisticProviderOptions, eRemoveOutlinerMethod)
+                : null;
+
+            IList<Point> GpuActiveTimePoints = new List<Point>();
+            IList<Point> CpuActiveTimePoints = new List<Point>();
+
+            if (plotSettings.ShowGpuActiveCharts)
+                GpuActiveTimePoints = session.GetGpuActiveTimePointsTimeWindow(startTime, endTime, _frametimeStatisticProviderOptions, eRemoveOutlinerMethod);
+
+            if (plotSettings.ShowCpuActiveCharts)
+                CpuActiveTimePoints = session.GetCpuActiveTimePointsTimeWindow(startTime, endTime, _frametimeStatisticProviderOptions, eRemoveOutlinerMethod);
+
+            SetFrametimeChart(plotModel, frametimepoints, displaytimespoints, GpuActiveTimePoints, CpuActiveTimePoints, plotSettings);
+
+            if (plotSettings.IsAnyPercentageGraphVisible && session.HasValidSensorData())
+            {
+                plotModel.Axes.Add(AxisDefinitions[EPlotAxis.YAXISPERCENTAGE]);
+
+                if (plotSettings.ShowGpuLoad)
+                    SetGPULoadChart(plotModel, session.GetGPULoadPointTimeWindow());
+                if (plotSettings.ShowCpuLoad)
+                    SetCPULoadChart(plotModel, session.GetCPULoadPointTimeWindow());
+                if (plotSettings.ShowCpuMaxThreadLoad)
+                    SetCPUMaxThreadLoadChart(plotModel, session.GetCPUMaxThreadLoadPointTimeWindow());
+                if (plotSettings.ShowGpuPowerLimit)
+                    SetGpuPowerLimitChart(plotModel, session.GetGpuPowerLimitPointTimeWindow());
+            }
+
+            // Draw display times graph
+            if (plotSettings.ShowDisplayTimes)
+            {
+                SetDisplayTimeChart(plotModel, displaytimespoints);
+            }
+
+            // Draw PC latency graph
+            if (plotSettings.ShowPcLatency)
+            {
+                SetPcLatencyChart(plotModel, session.GetPcLatencyPointTimeWindow());
+            }
+
+            // Draw Animation Error graph
+            if (plotSettings.ShowAnimationError)
+            {
+                SetAnimationErrorChart(plotModel, session.GetAnimationErrorPointTimeWindow());
+            }
+
+            SetAggregationSeparators(session, plotModel, plotSettings.ShowAggregationSeparators);
+
+            onFinishAction?.Invoke(plotModel);
+            plotModel.InvalidatePlot(true);
+        }
+
+        private void SetFrametimeChart(PlotModel plotModel, IList<Point> frametimePoints, IList<Point> displaytimespoints,
+            IList<Point> GpuActiveTimePoints, IList<Point> CpuActiveTimePoints, IPlotSettings plotSettings)
+        {
+            if (frametimePoints == null || !frametimePoints.Any()) return;
+
+            var frametimeDataPoints = frametimePoints.Select(pnt => new DataPoint(pnt.X, pnt.Y));
+            var GpuActiveTimeDataPoints = GpuActiveTimePoints.Select(pnt => new DataPoint(pnt.X, pnt.Y));
+            var CpuActiveTimeDataPoints = CpuActiveTimePoints.Select(pnt => new DataPoint(pnt.X, pnt.Y));
+
+            // The moving average (and the stuttering threshold derived from it) must be indexed
+            // and positioned against the series it was computed from. Display times are filtered
+            // for invalid entries (e.g. MsBetweenDisplayChange == 0), so their point list can be
+            // shorter than the frametime list — indexing across the two crashes the chart.
+            IList<Point> movingAverageSourcePoints =
+                plotSettings.ShowDisplayTimes && displaytimespoints != null && displaytimespoints.Any()
+                    ? displaytimespoints
+                    : frametimePoints;
+
+            IList<double> movingAverageValues = _frametimesStatisticProvider
+                .GetMovingAverage(movingAverageSourcePoints.Select(pnt => pnt.Y).ToList());
+
+            var stuttering = new List<double>(movingAverageValues.Count);
+
+            for (int i = 0; i < movingAverageValues.Count; i++)
+            {
+                stuttering.Add(movingAverageValues[i] * plotSettings.StutteringFactor);
+            }
+
+            plotModel.Series.Clear();
+
+            var frametimeSeries = new LineSeries
+            {
+                Title = "Frame Times",
+                StrokeThickness = 1.5,
+                LegendStrokeThickness = 4,
+                Color = Constants.FrametimeColor,
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            var GpuActiveTimeSeries = new LineSeries
+            {
+                Title = "GPU-Busy Times",
+                StrokeThickness = 1.5,
+                LegendStrokeThickness = 4,
+                Color = Constants.GpuActiveTimeColor,
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            var CpuActiveTimeSeries = new LineSeries
+            {
+                Title = "CPU-Busy Times",
+                StrokeThickness = 1.5,
+                LegendStrokeThickness = 4,
+                Color = OxyColor.FromArgb(255, 100, 149, 237),
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            var movingAverageSeries = new LineSeries
+            {
+                Title = "Moving Average",
+                StrokeThickness = 3,
+                LegendStrokeThickness = 4,
+                Color = Constants.FrametimeMovingAverageColor,
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            var stutteringSeries = new LineSeries
+            {
+                Title = "Stuttering",
+                StrokeThickness = 2,
+                LegendStrokeThickness = 4,
+                LineStyle = LineStyle.Dash,
+                Color = OxyColor.FromAColor(180, OxyColors.Red),
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            var lowFPSSeries = new LineSeries
+            {
+                Title = "Low FPS",
+                StrokeThickness = 3,
+                LegendStrokeThickness = 4,
+                LineStyle = LineStyle.LongDash,
+                Color = OxyColor.FromAColor(180, OxyColor.FromRgb(255, 180, 0)),
+                EdgeRenderingMode = EdgeRenderingMode.PreferSpeed
+            };
+
+            frametimeSeries.Points.AddRange(frametimeDataPoints);
+            movingAverageSeries.Points.AddRange(movingAverageValues.Select((y, i) => new DataPoint(movingAverageSourcePoints[i].X, y)));
+
+            if (plotSettings.ShowGpuActiveCharts)
+                GpuActiveTimeSeries.Points.AddRange(GpuActiveTimeDataPoints);
+
+            if (plotSettings.ShowCpuActiveCharts)
+                CpuActiveTimeSeries.Points.AddRange(CpuActiveTimeDataPoints);
+
+            UpdateAxis(EPlotAxis.XAXIS, (axis) =>
+            {
+                axis.Minimum = frametimePoints.First().X;
+                axis.Maximum = frametimePoints.Last().X;
+            }, false);
+
+            plotModel.Series.Add(frametimeSeries);
+            plotModel.Series.Add(movingAverageSeries);
+
+            if (plotSettings.ShowGpuActiveCharts)
+                plotModel.Series.Add(GpuActiveTimeSeries);
+
+            if (plotSettings.ShowCpuActiveCharts)
+                plotModel.Series.Add(CpuActiveTimeSeries);
+
+            if (plotSettings.ShowThresholds)
+            {
+                stutteringSeries.Points.AddRange(stuttering.Select((y, i) => new DataPoint(movingAverageSourcePoints[i].X, y)));
+                double lowFpsThreshold = 1000 / plotSettings.LowFPSThreshold;
+                lowFPSSeries.Points.Add(new DataPoint(frametimePoints.First().X, lowFpsThreshold));
+                lowFPSSeries.Points.Add(new DataPoint(frametimePoints.Last().X, lowFpsThreshold));
+
+                plotModel.Series.Add(stutteringSeries);
+                plotModel.Series.Add(lowFPSSeries);
+            }
+        }
+    }
+}

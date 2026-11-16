@@ -1,0 +1,730 @@
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Monitoring.Contracts;
+using CapFrameX.Overlay;
+using CapFrameX.PresentMonInterface;
+using CapFrameX.ViewModel.SubModels;
+using Microsoft.Extensions.Logging;
+using Prism.Commands;
+using Prism.Events;
+using Prism.Mvvm;
+using Prism.Navigation.Regions;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Reactive.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+
+namespace CapFrameX.ViewModel
+{
+    /// <summary>
+    /// System information landing page: static hardware identification (CPU, GPU,
+    /// mainboard, memory) with vendor badges plus live base telemetry (load, power,
+    /// temperature, clocks). While this view is visible it sets
+    /// <see cref="ISensorConfig.EvaluateAllSensors"/> so the sensor snapshot stream
+    /// keeps delivering values even when neither overlay nor logging is running.
+    /// Visible means: the info tab is the active view and the shell is neither
+    /// minimized nor hidden to the tray - otherwise the telemetry pauses so the
+    /// tab causes no CPU load in the background. A software block lists the components the
+    /// measurements depend on (sensor driver, capture backend, RTSS, Vulkan layer) with version
+    /// and state, a security block the boot and code integrity settings that decide which drivers
+    /// load and cost performance. The whole page can be copied as text for bug reports.
+    /// </summary>
+    public class InfoViewModel : BindableBase, INavigationAware
+    {
+        private const string NoValue = "–";
+
+        private readonly ISensorService _sensorService;
+        private readonly ISensorConfig _sensorConfig;
+        private readonly ISystemInfo _systemInfo;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IRTSSService _rtssService;
+        private readonly IAppVersionProvider _appVersionProvider;
+        private readonly ILogger<InfoViewModel> _logger;
+
+        // This view is the startup page and the initial activation does not raise
+        // OnNavigatedTo, so both flags start as active.
+        private bool _isViewActive = true;
+        private bool _isShellVisible = true;
+
+        // Live-metrics subscription, attached only while the output is visible. Guarded because
+        // the shell-visibility event and the navigation callbacks can arrive on different threads.
+        private readonly object _liveMetricsLock = new object();
+        private IDisposable _liveMetricsSubscription;
+
+        // Repaint rate of the live telemetry on the Info tab.
+        private const int LiveMetricsSampleMs = 1000;
+
+        private string _rawCpuDetails;
+        private string _rawRamName;
+        private string _rawDriverVersion;
+        private Dictionary<ISensorEntry, float> _lastSnapshot;
+
+        private string _cpuName = CxLang.T("InfoViewModel_Detecting");
+        private string _cpuDetails = string.Empty;
+        private VendorBadge _cpuVendorBadge;
+        private string _gpuName = CxLang.T("InfoViewModel_Detecting");
+        private string _gpuDetails = string.Empty;
+        private VendorBadge _gpuVendorBadge;
+        private string _mainboardName = CxLang.T("InfoViewModel_Detecting");
+        private string _mainboardDetails = string.Empty;
+        private VendorBadge _mainboardVendorBadge;
+        private string _ramName = CxLang.T("InfoViewModel_Detecting");
+        private string _ramDetails = string.Empty;
+        private VendorBadge _ramVendorBadge;
+        private string _osVersion = string.Empty;
+
+        private double _cpuLoad;
+        private string _cpuLoadText = NoValue;
+        private string _cpuPowerText = NoValue;
+        private string _cpuTempText = NoValue;
+        private string _cpuClockText = NoValue;
+
+        private double _gpuLoad;
+        private string _gpuLoadText = NoValue;
+        private string _gpuPowerText = NoValue;
+        private string _gpuTempText = NoValue;
+        private string _gpuClockText = NoValue;
+        private string _gpuVramText = NoValue;
+
+        private double _ramLoad;
+        private string _ramLoadText = NoValue;
+        private string _ramUsedText = NoValue;
+        private string _ramAvailableText = NoValue;
+
+        private string _resizableBarStatusColor = StatusGray;
+        private string _hagsStatusColor = StatusGray;
+        private string _gameModeStatusColor = StatusGray;
+
+        private SoftwareComponentStatus _pawnIoStatus = SoftwareComponentStatus.Detecting;
+        private SoftwareComponentStatus _presentMonStatus = SoftwareComponentStatus.Detecting;
+        private SoftwareComponentStatus _rtssStatus = SoftwareComponentStatus.Detecting;
+        private SoftwareComponentStatus _vulkanLayerStatus = SoftwareComponentStatus.Detecting;
+
+        private PlatformSecurityStatus _secureBootStatus = PlatformSecurityStatus.Unknown;
+        private PlatformSecurityStatus _testSigningStatus = PlatformSecurityStatus.Unknown;
+        private PlatformSecurityStatus _vbsStatus = PlatformSecurityStatus.Unknown;
+        private PlatformSecurityStatus _memoryIntegrityStatus = PlatformSecurityStatus.Unknown;
+
+        private const string StatusGreen = "#4CAF50";
+        private const string StatusOrange = "#FF9800";
+        private const string StatusGray = "#757575";
+
+        public string CpuName { get => _cpuName; set => SetProperty(ref _cpuName, value); }
+        public string CpuDetails { get => _cpuDetails; set => SetProperty(ref _cpuDetails, value); }
+        public VendorBadge CpuVendorBadge { get => _cpuVendorBadge; set => SetProperty(ref _cpuVendorBadge, value); }
+        public string GpuName { get => _gpuName; set => SetProperty(ref _gpuName, value); }
+        public string GpuDetails { get => _gpuDetails; set => SetProperty(ref _gpuDetails, value); }
+        public VendorBadge GpuVendorBadge { get => _gpuVendorBadge; set => SetProperty(ref _gpuVendorBadge, value); }
+        public string MainboardName { get => _mainboardName; set => SetProperty(ref _mainboardName, value); }
+        public string MainboardDetails { get => _mainboardDetails; set => SetProperty(ref _mainboardDetails, value); }
+        public VendorBadge MainboardVendorBadge { get => _mainboardVendorBadge; set => SetProperty(ref _mainboardVendorBadge, value); }
+        public string RamName { get => _ramName; set => SetProperty(ref _ramName, value); }
+        public string RamDetails { get => _ramDetails; set => SetProperty(ref _ramDetails, value); }
+        public VendorBadge RamVendorBadge { get => _ramVendorBadge; set => SetProperty(ref _ramVendorBadge, value); }
+        public string OsVersion { get => _osVersion; set => SetProperty(ref _osVersion, value); }
+
+        public double CpuLoad { get => _cpuLoad; set => SetProperty(ref _cpuLoad, value); }
+        public string CpuLoadText { get => _cpuLoadText; set => SetProperty(ref _cpuLoadText, value); }
+        public string CpuPowerText { get => _cpuPowerText; set => SetProperty(ref _cpuPowerText, value); }
+        public string CpuTempText { get => _cpuTempText; set => SetProperty(ref _cpuTempText, value); }
+        public string CpuClockText { get => _cpuClockText; set => SetProperty(ref _cpuClockText, value); }
+
+        public double GpuLoad { get => _gpuLoad; set => SetProperty(ref _gpuLoad, value); }
+        public string GpuLoadText { get => _gpuLoadText; set => SetProperty(ref _gpuLoadText, value); }
+        public string GpuPowerText { get => _gpuPowerText; set => SetProperty(ref _gpuPowerText, value); }
+        public string GpuTempText { get => _gpuTempText; set => SetProperty(ref _gpuTempText, value); }
+        public string GpuClockText { get => _gpuClockText; set => SetProperty(ref _gpuClockText, value); }
+        public string GpuVramText { get => _gpuVramText; set => SetProperty(ref _gpuVramText, value); }
+
+        public double RamLoad { get => _ramLoad; set => SetProperty(ref _ramLoad, value); }
+        public string RamLoadText { get => _ramLoadText; set => SetProperty(ref _ramLoadText, value); }
+        public string RamUsedText { get => _ramUsedText; set => SetProperty(ref _ramUsedText, value); }
+        public string RamAvailableText { get => _ramAvailableText; set => SetProperty(ref _ramAvailableText, value); }
+
+        public string ResizableBarStatusColor { get => _resizableBarStatusColor; set => SetProperty(ref _resizableBarStatusColor, value); }
+        public string HagsStatusColor { get => _hagsStatusColor; set => SetProperty(ref _hagsStatusColor, value); }
+        public string GameModeStatusColor { get => _gameModeStatusColor; set => SetProperty(ref _gameModeStatusColor, value); }
+
+        public SoftwareComponentStatus PawnIoStatus { get => _pawnIoStatus; set => SetProperty(ref _pawnIoStatus, value); }
+        public SoftwareComponentStatus PresentMonStatus { get => _presentMonStatus; set => SetProperty(ref _presentMonStatus, value); }
+        public SoftwareComponentStatus RtssStatus { get => _rtssStatus; set => SetProperty(ref _rtssStatus, value); }
+        public SoftwareComponentStatus VulkanLayerStatus { get => _vulkanLayerStatus; set => SetProperty(ref _vulkanLayerStatus, value); }
+
+        public PlatformSecurityStatus SecureBootStatus { get => _secureBootStatus; set => SetProperty(ref _secureBootStatus, value); }
+        public PlatformSecurityStatus TestSigningStatus { get => _testSigningStatus; set => SetProperty(ref _testSigningStatus, value); }
+        public PlatformSecurityStatus VbsStatus { get => _vbsStatus; set => SetProperty(ref _vbsStatus, value); }
+        public PlatformSecurityStatus MemoryIntegrityStatus { get => _memoryIntegrityStatus; set => SetProperty(ref _memoryIntegrityStatus, value); }
+
+        public ICommand CopySystemInfoCommand { get; }
+
+        public InfoViewModel(ISensorService sensorService,
+                             ISensorConfig sensorConfig,
+                             ISystemInfo systemInfo,
+                             IAppConfiguration appConfiguration,
+                             IRTSSService rtssService,
+                             IAppVersionProvider appVersionProvider,
+                             IEventAggregator eventAggregator,
+                             ILogger<InfoViewModel> logger)
+        {
+            _sensorService = sensorService;
+            _sensorConfig = sensorConfig;
+            _systemInfo = systemInfo;
+            _appConfiguration = appConfiguration;
+            _rtssService = rtssService;
+            _appVersionProvider = appVersionProvider;
+            _logger = logger;
+
+            CxLang.Instance.PropertyChanged += OnLanguageChanged;
+            CopySystemInfoCommand = new DelegateCommand(OnCopySystemInfo);
+
+            UpdateSensorEvaluationState();
+
+            // Pause the telemetry while the shell is minimized or hidden to the tray.
+            eventAggregator.GetEvent<PubSubEvent<AppMessages.ShellVisibilityChanged>>()
+                .Subscribe(msg =>
+                {
+                    _isShellVisible = msg.IsContentVisible;
+                    UpdateSensorEvaluationState();
+                });
+
+            // The portable version registers the layers while this tab is already shown, so no
+            // navigation refreshes it. The layer status does not depend on the sensor service.
+            eventAggregator.GetEvent<PubSubEvent<AppMessages.VulkanLayerRegistrationChanged>>()
+                .Subscribe(_ => Task.Run(UpdateVulkanLayerStatus));
+
+            // Two independent blocks: the board/memory/OS identification comes from WMI and is
+            // available right away, while CPU and GPU identity have to wait for the sensor
+            // service to finish hardware detection. Queuing the first behind the second only
+            // delayed the tab - they run side by side.
+            _ = Task.Run(InitializeBaseSystemInfo);
+            _ = Task.Run(InitializeSensorBoundInfoAsync);
+
+            UpdateLiveMetricsSubscription();
+        }
+
+        /// <summary>
+        /// Attaches the live-metrics stream only while its output can actually be seen.
+        /// <para>
+        /// The subscription used to be created once in the constructor and never released. That is
+        /// not free while the tab is hidden: <c>Sample(TimeSpan)</c> is TIME driven, so its periodic
+        /// Rx timer belongs to the SUBSCRIPTION rather than to the data flow. It kept firing every
+        /// 500 ms even though the <see cref="IsLiveViewVisible"/> gate in front of it discarded
+        /// every element, and <c>ObserveOnDispatcher</c> put each of those ticks on the UI thread —
+        /// where the cost is a wake-up plus contention on the window manager's global lock, not
+        /// computation. Same shape as the PMD buffers in OnlineMetricService.
+        /// </para>
+        /// </summary>
+        private void UpdateLiveMetricsSubscription()
+        {
+            lock (_liveMetricsLock)
+            {
+                if (IsLiveViewVisible)
+                {
+                    if (_liveMetricsSubscription != null) return;
+                    _liveMetricsSubscription = _sensorService.SensorSnapshotStream
+                        // Kept as a guard: visibility can flip between attach and delivery.
+                        .Where(_ => IsLiveViewVisible)
+                        .Sample(TimeSpan.FromMilliseconds(LiveMetricsSampleMs))
+                        .ObserveOnDispatcher()
+                        .Subscribe(snapshot => UpdateLiveMetrics(snapshot.Item2));
+                }
+                else
+                {
+                    _liveMetricsSubscription?.Dispose();
+                    _liveMetricsSubscription = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Live telemetry runs only while its output can actually be seen. Window focus
+        /// is deliberately not part of the criterion - CapFrameX may run on a second
+        /// monitor while a game holds the focus on the first display.
+        /// </summary>
+        private bool IsLiveViewVisible => _isViewActive && _isShellVisible;
+
+        private void UpdateSensorEvaluationState()
+        {
+            _sensorConfig.EvaluateAllSensors = IsLiveViewVisible;
+            UpdateLiveMetricsSubscription();
+        }
+
+        private void OnLanguageChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName == nameof(CxLang.UiLanguage))
+            {
+                UpdateCpuDetails();
+                UpdateRamName();
+                UpdateGpuDetails();
+                RefreshSoftwareComponents();
+                // The security statuses are shared instances, so the periodic refresh assigns the
+                // same object and raises nothing; the bindings would keep the previous language.
+                RaisePropertyChanged(nameof(SecureBootStatus));
+                RaisePropertyChanged(nameof(TestSigningStatus));
+                RaisePropertyChanged(nameof(VbsStatus));
+                RaisePropertyChanged(nameof(MemoryIntegrityStatus));
+                if (_lastSnapshot != null)
+                {
+                    UpdateLiveMetrics(_lastSnapshot);
+                }
+            }
+        }
+
+        private void UpdateCpuDetails()
+        {
+            CpuDetails = !string.IsNullOrEmpty(_rawCpuDetails)
+                ? CxLang.Instance.TranslateUiText(_rawCpuDetails)
+                : string.Empty;
+        }
+
+        private void UpdateRamName()
+        {
+            RamName = !string.IsNullOrEmpty(_rawRamName)
+                ? CxLang.Instance.TranslateUiText(_rawRamName)
+                : string.Empty;
+        }
+
+        private void UpdateGpuDetails()
+        {
+            GpuDetails = IsUsable(_rawDriverVersion)
+                ? CxLang.Format("InfoView_Driver0", _rawDriverVersion)
+                : string.Empty;
+        }
+
+        /// <summary>
+        /// Everything WMI can answer without the sensor service. The first call collects the
+        /// whole set in one go (see <c>SystemInfo</c>), so the individual getters below cost
+        /// a field read each.
+        /// </summary>
+        private void InitializeBaseSystemInfo()
+        {
+            try
+            {
+                _rawCpuDetails = _systemInfo.GetProcessorCoreCountInfo();
+                UpdateCpuDetails();
+
+                MainboardName = _systemInfo.GetMotherboardName();
+                MainboardVendorBadge = VendorBadge.FromVendorName(_systemInfo.GetMotherboardManufacturerBrand());
+                var biosVersion = _systemInfo.GetBiosVersion();
+                MainboardDetails = IsUsable(biosVersion) ? $"BIOS {biosVersion}" : string.Empty;
+
+                _rawRamName = _systemInfo.GetSystemRAMInfoName();
+                UpdateRamName();
+                UpdateRamManufacturer();
+
+                OsVersion = _systemInfo.GetOSVersion();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while collecting system information.");
+            }
+        }
+
+        /// <summary>
+        /// CPU and GPU identity are resolved through the sensor service, so this block can only
+        /// run once hardware detection completed.
+        /// </summary>
+        private async Task InitializeSensorBoundInfoAsync()
+        {
+            try
+            {
+                await _sensorService.SensorServiceCompletionSource.Task;
+
+                CpuName = _systemInfo.GetProcessorName();
+                CpuVendorBadge = VendorBadge.FromCpuVendor(_sensorService.GetCpuVendor());
+
+                UpdateGpuInfo();
+                UpdateRamManufacturer();
+
+                // PawnIO is installed and started while the sensor service opens the hardware,
+                // so its state is only meaningful from here on.
+                UpdateSoftwareComponents();
+
+                // Keep the GPU block in sync with the graphics adapter selection
+                // (auto mode: discrete GPU, otherwise the configured adapter).
+                _appConfiguration.OnValueChanged
+                    .Where(change => change.key == nameof(IAppConfiguration.GraphicsAdapter))
+                    .Subscribe(_ => UpdateGpuInfo());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while collecting processor and graphics card information.");
+            }
+        }
+
+        /// <summary>
+        /// Resolves the GPU identity through the sensor service, which applies the same
+        /// adapter selection as the GPU sensor filter: auto mode picks the discrete GPU
+        /// on iGPU/dGPU systems, otherwise the configured adapter is used. Intentionally
+        /// bypasses <see cref="ISystemInfo.GetGraphicCardName"/> — its WMI fallback
+        /// reports the display-driving adapter, which is the iGPU on hybrid systems.
+        /// </summary>
+        private void UpdateGpuInfo()
+        {
+            try
+            {
+                GpuName = _sensorService.GetGpuName();
+                GpuVendorBadge = VendorBadge.FromGpuVendor(_sensorService.GetGpuVendor());
+                _rawDriverVersion = _sensorService.GetGpuDriverVersion();
+                UpdateGpuDetails();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while updating GPU information.");
+            }
+        }
+
+        /// <summary>
+        /// Versions and states of the software the measurements depend on. Everything here is a
+        /// service query, a registry read or a version resource, so it is cheap enough to refresh
+        /// on every visit of the tab.
+        /// </summary>
+        private void UpdateSoftwareComponents()
+        {
+            try
+            {
+                PawnIoStatus = SoftwareComponentStatus.FromPawnIo(DriverInstaller.QueryStatus());
+                PresentMonStatus = SoftwareComponentStatus.ForPresentMon(
+                    CaptureServiceConfiguration.GetPresentMonVersion(),
+                    File.Exists(CaptureServiceConfiguration.GetPresentMonPath()));
+                RtssStatus = SoftwareComponentStatus.ForRtss(_rtssService.GetRTSSVersion());
+                UpdateVulkanLayerStatus();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while collecting software component information.");
+            }
+        }
+
+        // The probe reports a registry it cannot read as Unknown instead of throwing.
+        private void UpdateVulkanLayerStatus()
+            => VulkanLayerStatus = SoftwareComponentStatus.FromVulkanLayer(VulkanLayerRegistrationProbe.Query());
+
+        private void UpdateRamManufacturer()
+        {
+            var manufacturer = _systemInfo.GetSystemRAMManufacturer() ?? string.Empty;
+            if (string.Equals(RamDetails, manufacturer, StringComparison.Ordinal))
+                return;
+
+            RamDetails = manufacturer;
+            RamVendorBadge = VendorBadge.FromVendorName(manufacturer);
+        }
+
+        private static bool IsUsable(string value)
+            => !string.IsNullOrWhiteSpace(value) && value != "Unknown";
+
+        private void UpdateLiveMetrics(Dictionary<ISensorEntry, float> snapshot)
+        {
+            _lastSnapshot = snapshot;
+            try
+            {
+                // SPD discovery can finish on a retry after sensor initialization. Refresh the
+                // cached identity while this tab is visible, using the existing telemetry tick.
+                // The base WMI snapshot must already be ready so this UI update never waits for it.
+                if (_rawRamName != null)
+                    UpdateRamManufacturer();
+
+                float? cpuLoad = null, cpuPower = null, cpuTemp = null, cpuMaxClock = null, cpuCoreClockMax = null;
+                float? gpuLoad = null, gpuPower = null, gpuTemp = null, gpuClock = null;
+                float? vramUsedGb = null, vramUsedMb = null, vramTotalGb = null, vramTotalMb = null;
+                float? d3dDedicatedUsed = null, d3dSharedUsed = null, d3dSharedTotal = null;
+                float? ramLoad = null, ramUsed = null, ramAvailable = null;
+
+                foreach (var pair in snapshot)
+                {
+                    var entry = pair.Key;
+                    var value = pair.Value;
+                    var name = entry.Name ?? string.Empty;
+
+                    bool isCpu = entry.HardwareType == "Cpu";
+                    bool isGpu = entry.HardwareType != null
+                        && entry.HardwareType.StartsWith("Gpu", StringComparison.Ordinal);
+                    bool isMemory = entry.HardwareType == "Memory";
+
+                    switch (entry.SensorType)
+                    {
+                        case "Load":
+                            if (isCpu && name == "CPU Total")
+                                cpuLoad = value;
+                            else if (isGpu && name == "GPU Core")
+                                gpuLoad = value;
+                            else if (isMemory && name == "RAM Usage")
+                                ramLoad = value;
+                            break;
+
+                        case "Power":
+                            if (isCpu && name.StartsWith("CPU Package", StringComparison.Ordinal))
+                                cpuPower = value;
+                            else if (isGpu && IsGpuBoardPowerSensor(name))
+                                gpuPower = gpuPower.HasValue ? Math.Max(gpuPower.Value, value) : value;
+                            break;
+
+                        case "Temperature":
+                            if (isCpu && name.StartsWith("CPU Package", StringComparison.Ordinal))
+                                cpuTemp = cpuTemp ?? value;
+                            else if (isGpu && name == "GPU Core")
+                                gpuTemp = value;
+                            break;
+
+                        case "Clock":
+                            if (isCpu)
+                            {
+                                // Max core clock is "CPU Max" (Intel and AMD alike);
+                                // "CPU Max Clock" covers plugin-provided sensors.
+                                if (name == "CPU Max" || name == "CPU Max Clock")
+                                    cpuMaxClock = value;
+                                // Per-core clocks are named "Core #1 P1" / "Core P1" - no
+                                // "CPU" prefix. Skip the effective/thread clock variants.
+                                else if (name.StartsWith("Core", StringComparison.Ordinal)
+                                    && name.IndexOf("Effective", StringComparison.Ordinal) < 0)
+                                    cpuCoreClockMax = cpuCoreClockMax.HasValue ? Math.Max(cpuCoreClockMax.Value, value) : value;
+                            }
+                            else if (isGpu && name == "GPU Core")
+                                gpuClock = value;
+                            break;
+
+                        case "Data":
+                            if (isGpu && name == "GPU Memory Dedicated")
+                                vramUsedGb = value;
+                            else if (isGpu && name == "GPU Memory Total")
+                                vramTotalGb = value;
+                            // Intel D3D GPU naming (iGPUs and IGCL-less discrete cards)
+                            else if (isGpu && name == "D3D Dedicated Memory Used")
+                                d3dDedicatedUsed = value;
+                            else if (isGpu && name == "D3D Shared Memory Used")
+                                d3dSharedUsed = value;
+                            else if (isGpu && name == "D3D Shared Memory Total")
+                                d3dSharedTotal = value;
+                            else if (isMemory && name == "RAM Used")
+                                ramUsed = value;
+                            else if (isMemory && name == "RAM Available")
+                                ramAvailable = value;
+                            break;
+
+                        case "SmallData":
+                            // Legacy MB-based variants, kept as fallback.
+                            if (isGpu && name == "GPU Memory Dedicated")
+                                vramUsedMb = value;
+                            else if (isGpu && name == "GPU Memory Total")
+                                vramTotalMb = value;
+                            break;
+                    }
+                }
+
+                CpuLoad = cpuLoad ?? 0d;
+                CpuLoadText = FormatValue(cpuLoad, "F0", "%");
+                CpuPowerText = FormatValue(cpuPower, "F0", " W");
+                CpuTempText = FormatValue(cpuTemp, "F0", " °C");
+                CpuClockText = FormatValue(cpuMaxClock ?? cpuCoreClockMax, "F0", " MHz");
+
+                GpuLoad = gpuLoad ?? 0d;
+                GpuLoadText = FormatValue(gpuLoad, "F0", "%");
+                GpuPowerText = FormatValue(gpuPower, "F0", " W");
+                GpuTempText = FormatValue(gpuTemp, "F0", " °C");
+                GpuClockText = FormatValue(gpuClock, "F0", " MHz");
+                GpuVramText = FormatVram(vramUsedGb, vramUsedMb, vramTotalGb, vramTotalMb,
+                    d3dDedicatedUsed, d3dSharedUsed, d3dSharedTotal);
+
+                if (!ramLoad.HasValue && ramUsed.HasValue && ramAvailable.HasValue
+                    && ramUsed.Value + ramAvailable.Value > 0f)
+                {
+                    ramLoad = 100f * ramUsed.Value / (ramUsed.Value + ramAvailable.Value);
+                }
+
+                RamLoad = ramLoad ?? 0d;
+                RamLoadText = FormatValue(ramLoad, "F0", "%");
+                RamUsedText = FormatValue(ramUsed, "F1", " GB");
+                RamAvailableText = FormatValue(ramAvailable, "F1", " GB");
+
+                UpdateSystemStatus();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while updating live system metrics.");
+            }
+        }
+
+        private static bool IsGpuBoardPowerSensor(string name)
+        {
+            // Board power naming differs per vendor: "GPU Power" (NVIDIA),
+            // "GPU Total"/"GPU TBP" (AMD), "GPU TBP"/"GPU TDP" (Intel).
+            return (name == "GPU Power" || name == "GPU Total" || name == "GPU TBP" || name == "GPU TDP")
+                && !name.Contains("Limit");
+        }
+
+        private static string FormatValue(float? value, string format, string unit)
+        {
+            return value.HasValue
+                ? value.Value.ToString(format, CultureInfo.InvariantCulture) + CxLang.Instance.TranslateUiText(unit)
+                : NoValue;
+        }
+
+        private static string FormatVram(float? usedGb, float? usedMb, float? totalGb, float? totalMb,
+            float? d3dDedicatedUsed, float? d3dSharedUsed, float? d3dSharedTotal)
+        {
+            float? used = usedGb ?? (usedMb / 1024f);
+            float? total = totalGb ?? (totalMb / 1024f);
+
+            if (!used.HasValue)
+            {
+                // Intel D3D naming. A real discrete frame buffer holds gigabytes even at
+                // the desktop; integrated GPUs carry at most a tiny dedicated carve-out
+                // and their actual budget is shared system memory.
+                if (d3dDedicatedUsed >= 1f)
+                {
+                    used = d3dDedicatedUsed;
+                }
+                else if (d3dSharedUsed.HasValue)
+                {
+                    used = d3dSharedUsed;
+                    total = d3dSharedTotal;
+                }
+                else
+                {
+                    used = d3dDedicatedUsed;
+                }
+            }
+
+            if (!used.HasValue)
+                return NoValue;
+
+            var usedText = used.Value.ToString("F1", CultureInfo.InvariantCulture);
+
+            if (total.HasValue && total.Value > 0f)
+            {
+                var totalText = total.Value.ToString("F0", CultureInfo.InvariantCulture);
+                return $"{usedText} / {totalText} {CxLang.Instance.TranslateUiText("GB")}";
+            }
+
+            return $"{usedText} {CxLang.Instance.TranslateUiText("GB")}";
+        }
+
+        private void UpdateSystemStatus()
+        {
+            ResizableBarStatusColor = GetStatusColor(ResizableBarStatus);
+            HagsStatusColor = GetStatusColor(_systemInfo.HardwareAcceleratedGPUSchedulingStatus);
+            GameModeStatusColor = GetStatusColor(_systemInfo.GameModeStatus);
+
+            SecureBootStatus = PlatformSecurityStatus.ForSecureBoot(_systemInfo.SecureBootStatus);
+            TestSigningStatus = PlatformSecurityStatus.ForTestSigning(_systemInfo.TestSigningStatus);
+            VbsStatus = PlatformSecurityStatus.ForVirtualizationBasedSecurity(_systemInfo.VirtualizationBasedSecurityStatus);
+            MemoryIntegrityStatus = PlatformSecurityStatus.ForMemoryIntegrity(_systemInfo.MemoryIntegrityStatus);
+        }
+
+        private ESystemInfoTertiaryStatus ResizableBarStatus
+            => _systemInfo.ResizableBarD3DStatus != ESystemInfoTertiaryStatus.Error
+                ? _systemInfo.ResizableBarD3DStatus : _systemInfo.ResizableBarHardwareStatus;
+
+        private void OnCopySystemInfo()
+        {
+            try
+            {
+                // The live telemetry only refreshes the security block while it runs, so read the
+                // current state once more instead of copying whatever was shown last.
+                UpdateSystemStatus();
+                Clipboard.SetDataObject(BuildSystemReport(), false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while copying the system information.");
+            }
+        }
+
+        /// <summary>
+        /// The Info tab as plain text: identification, Windows settings, platform security and
+        /// software components. Live telemetry is left out - it says nothing about the setup.
+        /// </summary>
+        private string BuildSystemReport()
+        {
+            var report = new StringBuilder();
+            report.AppendLine(CxLang.Format("InfoViewModel_ReportHeader01",
+                _appVersionProvider.GetAppVersion(), _appVersionProvider.GetReleaseChannel()));
+            AppendReportLine(report, CxLang.T("InfoViewModel_OperatingSystem"), OsVersion);
+            AppendReportLine(report, CxLang.T("InfoViewModel_Processor"), DescribeWithDetails(CpuName, CpuDetails));
+            AppendReportLine(report, CxLang.T("InfoViewModel_GraphicsCard"), DescribeWithDetails(GpuName, GpuDetails));
+            AppendReportLine(report, CxLang.T("InfoViewModel_Mainboard"), DescribeWithDetails(MainboardName, MainboardDetails));
+            AppendReportLine(report, CxLang.T("InfoViewModel_Memory"), DescribeWithDetails(RamName, RamDetails));
+            report.AppendLine();
+            AppendReportLine(report, CxLang.T("InfoView_ResizableBAR"), DescribeStatus(ResizableBarStatus));
+            AppendReportLine(report, CxLang.T("InfoView_HardwareAcceleratedGPUScheduling"), DescribeStatus(_systemInfo.HardwareAcceleratedGPUSchedulingStatus));
+            AppendReportLine(report, CxLang.T("InfoView_WindowsGameMode"), DescribeStatus(_systemInfo.GameModeStatus));
+            AppendReportLine(report, CxLang.T("InfoView_SecureBoot"), SecureBootStatus.State);
+            AppendReportLine(report, CxLang.T("InfoView_TestSigning"), TestSigningStatus.State);
+            AppendReportLine(report, CxLang.T("InfoViewModel_VirtualizationBasedSecurity"), VbsStatus.State);
+            AppendReportLine(report, CxLang.T("InfoView_MemoryIntegrity"), MemoryIntegrityStatus.State);
+            report.AppendLine();
+            AppendReportLine(report, CxLang.T("InfoView_PawnIODriver"), DescribeComponent(PawnIoStatus));
+            AppendReportLine(report, CxLang.T("InfoView_PresentMon"), DescribeComponent(PresentMonStatus));
+            AppendReportLine(report, CxLang.T("InfoView_RTSS"), DescribeComponent(RtssStatus));
+            AppendReportLine(report, CxLang.T("InfoView_VulkanLayer"), DescribeComponent(VulkanLayerStatus));
+            return report.ToString();
+        }
+
+        private static void AppendReportLine(StringBuilder report, string label, string value)
+            => report.AppendLine($"{label}: {(string.IsNullOrWhiteSpace(value) ? NoValue : value)}");
+
+        internal static string DescribeWithDetails(string name, string details)
+            => string.IsNullOrWhiteSpace(details) ? name : $"{name} ({details})";
+
+        internal static string DescribeStatus(ESystemInfoTertiaryStatus status)
+        {
+            switch (status)
+            {
+                case ESystemInfoTertiaryStatus.Enabled:
+                    return CxLang.T("InfoViewModel_Enabled");
+                case ESystemInfoTertiaryStatus.Disabled:
+                    return CxLang.T("InfoViewModel_Disabled");
+                default:
+                    return CxLang.T("InfoViewModel_Unknown");
+            }
+        }
+
+        internal static string DescribeComponent(SoftwareComponentStatus status)
+            => status.Version == SoftwareComponentStatus.NoValue ? status.State : $"{status.Version} ({status.State})";
+
+        private static string GetStatusColor(ESystemInfoTertiaryStatus status)
+        {
+            switch (status)
+            {
+                case ESystemInfoTertiaryStatus.Enabled:
+                    return StatusGreen;
+                case ESystemInfoTertiaryStatus.Disabled:
+                    return StatusOrange;
+                default:
+                    return StatusGray;
+            }
+        }
+
+        public bool IsNavigationTarget(NavigationContext navigationContext) => true;
+
+        public void OnNavigatedFrom(NavigationContext navigationContext)
+        {
+            _isViewActive = false;
+            UpdateSensorEvaluationState();
+        }
+
+        public void OnNavigatedTo(NavigationContext navigationContext)
+        {
+            _isViewActive = true;
+            UpdateSensorEvaluationState();
+            RefreshSoftwareComponents();
+        }
+
+        // Cheap enough for every visit of the tab. It also rebuilds the texts that are resolved at
+        // query time (the Vulkan layer details), which is why a language switch takes this path too.
+        private void RefreshSoftwareComponents()
+        {
+            if (_sensorService.SensorServiceCompletionSource.Task.IsCompleted)
+                _ = Task.Run(UpdateSoftwareComponents);
+        }
+    }
+}

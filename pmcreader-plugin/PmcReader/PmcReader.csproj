@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <Platforms>AnyCPU;x64</Platforms>
+    <!-- The interop layer loads an x64 kernel driver and issues raw MSR opcodes, so the
+         process has to be 64-bit regardless of the selected solution platform. -->
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>PmcReader</RootNamespace>
+    <AssemblyName>PmcReader</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Deterministic>true</Deterministic>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WMI moved out of the platform on .NET; GenericMonitoringArea queries Win32_Processor.
+         Version kept in step with source/Directory.Packages.props to avoid a downgrade in consumers. -->
+    <PackageReference Include="System.Management" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Superseded by Zen1.cs, referenced by nothing, and it imports
+         System.Runtime.InteropServices.WindowsRuntime, which does not exist on .NET.
+         The legacy project never compiled it either; SDK-style default globbing would. -->
+    <Compile Remove="AMD\Zen.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Ring0 extracts the driver from the assembly at runtime and looks it up by this exact
+         name (see Interop\Ring0.cs, DriverResourceName). Non-resx files are not embedded by
+         default, so both the item and its logical name have to stay explicit. -->
+    <EmbeddedResource Include="Interop\WinRing0.sys">
+      <LogicalName>PmcReader.Interop.WinRing0.sys</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Interop\WinRing0x64.sys">
+      <LogicalName>PmcReader.Interop.WinRing0x64.sys</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Interop\winpmem_64.sys">
+      <LogicalName>PmcReader.Interop.winpmem_64.sys</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Update="Properties\Resources.resx">
+      <Generator>ResXFileCodeGenerator</Generator>
+      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+    <None Update="Properties\Settings.settings">
+      <Generator>SettingsSingleFileGenerator</Generator>
+      <LastGenOutput>Settings.Designer.cs</LastGenOutput>
+    </None>
+  </ItemGroup>
+
+</Project>

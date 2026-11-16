@@ -1,0 +1,1683 @@
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data;
+using CapFrameX.Extensions;
+using CapFrameX.Hardware.Controller;
+using CapFrameX.Hotkey;
+using CapFrameX.MVVM.Dialogs;
+using CapFrameX.Overlay;
+using CapFrameX.PresentMonInterface;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using CapFrameX.ViewModel.SubModels;
+using GongSolutions.Wpf.DragDrop;
+using Microsoft.Extensions.Logging;
+using Prism.Commands;
+using Prism.Mvvm;
+using Prism.Navigation.Regions;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using Microsoft.Win32;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Data;
+using System.Windows.Input;
+
+namespace CapFrameX.ViewModel
+{
+    public partial class OverlayViewModel : BindableBase, INavigationAware, IDropTarget
+    {
+        private readonly IOverlayService _overlayService;
+        private readonly IOverlayEntryProvider _overlayEntryProvider;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IPathService _pathService;
+        private readonly ISensorService _sensorService;
+        private readonly IRTSSService _rTSSService;
+        private readonly IThreadAffinityController _threadAffinityController;
+        private readonly IOnlineMetricService _onlineMetricService;
+        private readonly IOverlayTemplateService _overlayTemplateService;
+        private readonly IHookLearnedProfileService _hookLearnedProfiles;
+        private readonly IHookOverlayStatusService _hookOverlayStatus;
+        private int _selectedOverlayEntryIndex = -1;
+        private IOverlayEntry _selectedOverlayEntry;
+        private IOverlayEntryFormatChange _checkboxes = new OverlayEntryFormatChange();
+        private bool _setSensorTypeButtonEnabled;
+        private bool _setGroupButtonEnabled;
+        private bool _overlayItemsOptionsEnabled = false;
+        private bool _saveButtonIsEnable;
+        private Subject<object> _configSubject = new Subject<object>();
+        private ResetOverlayConfigDialog _resetOverlayConfigContent;
+        private bool _resetOverlayConfigContentIsOpen;
+        private string _hookLearnedProfileText = CxLang.T("OverlayViewModel_NoLearnedCompatibilityProfiles");
+        private string _filterText = string.Empty;
+        private EOverlayEntryType? _selectedEntryTypeFilter;
+        private ICollectionView _overlayEntriesView;
+        private readonly object _overlayEntriesViewLock = new object();
+        private IReadOnlyList<HookFreeDisplayItem> _hookFreeDisplayItemsSource =
+            Array.Empty<HookFreeDisplayItem>();
+        private bool _displaySettingsChangedSubscribed;
+        private IReadOnlyList<string> _osdFontFamilies;
+        private readonly ILogger<OverlayViewModel> _logger;
+        private MpoSupportInfo _hookFreeMpo;
+        private string _loggedHookFreeMpo;
+
+        public bool OverlayItemsOptionsEnabled
+        {
+            get { return _overlayItemsOptionsEnabled; }
+            set
+            {
+                _overlayItemsOptionsEnabled = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool SetGroupButtonEnabled
+        {
+            get => _setGroupButtonEnabled;
+            set
+            {
+                _setGroupButtonEnabled = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool SetSensorTypeButtonEnabled
+        {
+            get => _setSensorTypeButtonEnabled;
+            set
+            {
+                _setSensorTypeButtonEnabled = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsOverlayActive
+        {
+            get { return _appConfiguration.IsOverlayActive; }
+            set
+            {
+                // A refused activation still raises the change, so the toggle springs back.
+                OverlayActivation.TrySet(_appConfiguration, _overlayService, IsRTSSInstalled, value);
+                RaisePropertyChanged();
+            }
+        }
+
+        internal static bool CanSetOverlayActive(bool requestedActive, bool isRTSSInstalled,
+            EOverlayRenderer renderer)
+            => OverlayActivation.CanSet(requestedActive,
+                OverlayRendererSelection.CanShowOverlay(renderer, isRTSSInstalled));
+
+        // False while the renderer is set to Off: the overlay toggles are disabled then, and
+        // their tool tip says why.
+        public bool CanSwitchOverlay => !OverlayModeOff;
+
+        public string OverlayToggleToolTip => OverlayModeOff
+            ? CxLang.T("OverlayView_OverlayRendererIsOff")
+            : CxLang.T("OverlayView_ShowOrHideTheOverlay");
+
+        //public bool ToggleGlobalRTSSOSD
+        //{
+        //    get { return _appConfiguration.ToggleGlobalRTSSOSD; }
+        //    set
+        //    {
+        //        _appConfiguration.ToggleGlobalRTSSOSD = value;
+        //        RaisePropertyChanged();
+        //    }
+        //}
+
+        public bool OSDCustomPosition
+        {
+            get { return _appConfiguration.OSDCustomPosition; }
+            set
+            {
+                _appConfiguration.OSDCustomPosition = value;
+                _rTSSService.SetOSDCustomPosition(value);
+                RaisePropertyChanged();
+            }
+        }
+        public int OSDPositionX
+        {
+            get { return _appConfiguration.OSDPositionX; }
+            set
+            {
+
+                _appConfiguration.OSDPositionX = value;
+                _rTSSService.SetOverlayPosition(value, _appConfiguration.OSDPositionY);
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OSDPositionY
+        {
+            get { return _appConfiguration.OSDPositionY; }
+            set
+            {
+
+                _appConfiguration.OSDPositionY = value;
+                _rTSSService.SetOverlayPosition(_appConfiguration.OSDPositionX, value);
+                RaisePropertyChanged();
+            }
+        }
+
+        public string OverlayHotkeyString
+        {
+            get { return _appConfiguration.OverlayHotKey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.OverlayHotKey = value;
+                SetGlobalHookEventOverlayHotkey();
+                RaisePropertyChanged();
+            }
+        }
+        public string OverlayConfigHotkeyString
+        {
+            get { return _appConfiguration.OverlayConfigHotKey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.OverlayConfigHotKey = value;
+                SetGlobalHookEventOverlayConfigHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public string OverlayPositionHotkeyString
+        {
+            get { return _appConfiguration.OverlayPositionHotkey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.OverlayPositionHotkey = value;
+                SetGlobalHookEventOverlayPositionHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public string ThreadAffinityHotkeyString
+        {
+            get { return _appConfiguration.ThreadAffinityHotkey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.ThreadAffinityHotkey = value;
+                SetGlobalHookEventThreadAffinityHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public string ResetMetricsHotkeyString
+        {
+            get { return _appConfiguration.ResetMetricsHotkey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.ResetMetricsHotkey = value;
+                SetGlobalHookEventResetMetricsHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OSDRefreshPeriod
+        {
+            get => _appConfiguration.OSDRefreshPeriod;
+            set
+            {
+                _appConfiguration.OSDRefreshPeriod = value;
+                _sensorService.SetOSDInterval(TimeSpan.FromMilliseconds(value));
+                RaisePropertyChanged();
+            }
+        }
+
+        public int MetricInterval
+        {
+            get => _appConfiguration.MetricInterval;
+            set
+            {
+                _appConfiguration.MetricInterval = value;
+                _onlineMetricService.SetMetricInterval();
+                RaisePropertyChanged();
+            }
+        }
+
+        public int SelectedOverlayEntryIndex
+        {
+            get { return _selectedOverlayEntryIndex; }
+            set
+            {
+                _selectedOverlayEntryIndex = value;
+                OverlayItemsOptionsEnabled = _selectedOverlayEntryIndex > -1 ? true : false;
+                RaisePropertyChanged();
+
+            }
+        }
+
+        public IOverlayEntry SelectedOverlayEntry
+        {
+            get { return _selectedOverlayEntry; }
+            set
+            {
+                if (value != null && value.Identifier == "RunHistory")
+                    OverlayItemsOptionsEnabled = false;
+
+                _selectedOverlayEntry = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(SelectedOverlayItemName));
+                RaisePropertyChanged(nameof(SelectedOverlayItemGroupName));
+                RaisePropertyChanged(nameof(SelectedOverlayItemSensorType));
+                DetermineMultipleGroupEntries(_selectedOverlayEntry);
+                DetermineMultipleSensorTypeEntries(_selectedOverlayEntry);
+            }
+        }
+
+        public IOverlayEntryFormatChange Checkboxes
+        {
+            get { return _checkboxes; }
+            set
+            {
+                _checkboxes = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SelectedRelatedMetric
+        {
+            get
+            {
+                return _appConfiguration.RelatedMetricOverlay;
+            }
+            set
+            {
+                _appConfiguration.RelatedMetricOverlay = value;
+                _overlayService.ResetHistory();
+                RaisePropertyChanged();
+            }
+        }
+
+        public EOverlayTemplate SelectedOverlayTemplate
+        {
+            get
+            {
+                return (EOverlayTemplate)_appConfiguration.SelectedOverlayTemplate;
+            }
+            set
+            {
+                _appConfiguration.SelectedOverlayTemplate = (int)value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsConfig0Checked
+        {
+            get
+            {
+                return _appConfiguration.OverlayEntryConfigurationFile == 0;
+            }
+            set
+            {
+                if (value)
+                    _appConfiguration.OverlayEntryConfigurationFile = 0;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsConfig1Checked
+        {
+            get
+            {
+                return _appConfiguration.OverlayEntryConfigurationFile == 1;
+            }
+            set
+            {
+                if (value)
+                    _appConfiguration.OverlayEntryConfigurationFile = 1;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsConfig2Checked
+        {
+            get
+            {
+                return _appConfiguration.OverlayEntryConfigurationFile == 2;
+            }
+            set
+            {
+                if (value)
+                    _appConfiguration.OverlayEntryConfigurationFile = 2;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool SaveButtonIsEnable
+        {
+            get { return _saveButtonIsEnable; }
+            set
+            {
+                _saveButtonIsEnable = value;
+                RaisePropertyChanged();
+            }
+        }
+        public bool AutoDisableOverlay
+        {
+            get
+            {
+                return _appConfiguration.AutoDisableOverlay;
+            }
+            set
+            {
+                _appConfiguration.AutoDisableOverlay = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public ResetOverlayConfigDialog ResetOverlayConfigContent
+        {
+            get { return _resetOverlayConfigContent; }
+            set
+            {
+                _resetOverlayConfigContent = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ResetOverlayConfigContentIsOpen
+        {
+            get { return _resetOverlayConfigContentIsOpen; }
+            set
+            {
+                _resetOverlayConfigContentIsOpen = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowSystemTimeSeconds
+        {
+            get { return _appConfiguration.ShowSystemTimeSeconds; }
+            set
+            {
+                _appConfiguration.ShowSystemTimeSeconds = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool EnableHookFreeOverlay
+        {
+            get { return _appConfiguration.EnableHookFreeOverlay; }
+            set
+            {
+                _appConfiguration.EnableHookFreeOverlay = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(CanConfigureHookFreeOptions));
+            }
+        }
+
+        public IReadOnlyList<HookFreeDisplayItem> HookFreeDisplayItemsSource
+        {
+            get { return _hookFreeDisplayItemsSource; }
+            private set
+            {
+                _hookFreeDisplayItemsSource = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string HookFreeDisplayDeviceName
+        {
+            get { return _appConfiguration.HookFreeDisplayDeviceName; }
+            set
+            {
+                // ItemsSource replacement briefly clears SelectedValue. Keep the persisted
+                // selection until the refreshed list has supplied its matching item again.
+                if (string.IsNullOrWhiteSpace(value) ||
+                    string.Equals(value, _appConfiguration.HookFreeDisplayDeviceName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                _appConfiguration.HookFreeDisplayDeviceName = value;
+                RaisePropertyChanged();
+                UpdateHookFreeMpo(value);
+            }
+        }
+
+        // Shown under both hook-free choices whether or not it is selected, so it warns before the
+        // switch: without an MPO plane on its display, the visible window makes DWM compose the game.
+        public string HookFreeMpoWarning => GetHookFreeMpoWarning(_hookFreeMpo);
+
+        public bool ShowHookFreeMpoWarning => _hookFreeMpo?.WarnsHookFree == true;
+
+        public static string GetHookFreeMpoWarning(MpoSupportInfo mpo)
+        {
+            switch (mpo?.Status)
+            {
+                case MpoSupportStatus.NoOverlayPlane:
+                    return CxLang.T("OverlayView_HookFreeMpoMissing") + " " +
+                        CxLang.T("OverlayView_HookFreeMpoConsequence");
+                case MpoSupportStatus.SwitchedOff:
+                    return CxLang.T("OverlayView_HookFreeMpoSwitchedOff") + " " +
+                        CxLang.T("OverlayView_HookFreeMpoConsequence");
+                default:
+                    return string.Empty;
+            }
+        }
+
+        private void UpdateHookFreeMpo(string deviceName)
+        {
+            _hookFreeMpo = MpoSupportProbe.Query(deviceName);
+            string described = _hookFreeMpo.ToString();
+            if (!string.Equals(described, _loggedHookFreeMpo, StringComparison.Ordinal))
+            {
+                _loggedHookFreeMpo = described;
+                _logger?.LogInformation("MPO check for the hook-free display {Result}", described);
+            }
+
+            RaisePropertyChanged(nameof(HookFreeMpoWarning));
+            RaisePropertyChanged(nameof(ShowHookFreeMpoWarning));
+        }
+
+        public int HookFreeRefreshRate
+        {
+            get { return _appConfiguration.HookFreeRefreshRate; }
+            set
+            {
+                _appConfiguration.HookFreeRefreshRate = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool EnableHookOverlay
+        {
+            get { return _appConfiguration.EnableHookOverlay; }
+            set
+            {
+                _appConfiguration.EnableHookOverlay = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(CanConfigureHookFreeOptions));
+            }
+        }
+
+        // In-game hook graph source: false = the hook's local present ring (frame time, zero latency);
+        // true = CapFrameX's PresentMon stream (frame + display times, buffered/replayed). Only applies
+        // while the in-game hook is the chosen renderer (the checkbox greys out otherwise).
+        public bool HookOverlayUsePresentMonFrametimes
+        {
+            get { return _appConfiguration.HookOverlayUsePresentMonFrametimes; }
+            set
+            {
+                _appConfiguration.HookOverlayUsePresentMonFrametimes = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShareOverlayCompatibilityProfiles
+        {
+            get { return _appConfiguration.ShareOverlayCompatibilityProfiles; }
+            set
+            {
+                _appConfiguration.ShareOverlayCompatibilityProfiles = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // What the learned store knows about the currently selected game, kept current by the
+        // store's change stream and the hook status stream (which carries the selected PID).
+        public string HookLearnedProfileText
+        {
+            get { return _hookLearnedProfileText; }
+            private set
+            {
+                _hookLearnedProfileText = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // PresentMon replay baseline shared by the hook-free renderer and the in-game hook's
+        // PresentMon source. A larger value bridges wider delivery gaps but adds graph latency.
+        public int OsdReplayBufferSize
+        {
+            get { return _appConfiguration.OsdReplayBufferSize; }
+            set
+            {
+                _appConfiguration.OsdReplayBufferSize = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public ExtendedOsdLoggingViewModel ExtendedOsdLogging { get; }
+
+        // OSD background (panel + chart area) opacity in percent for BOTH CapFrameX renderers
+        // (in-game hook via the metrics SHM, hook-free via the C API). Applies live: the hook
+        // publisher and the hook-free bridge re-read the config on every OSD tick.
+        public int OsdBackgroundOpacity
+        {
+            get { return _appConfiguration.OsdBackgroundOpacity; }
+            set
+            {
+                _appConfiguration.OsdBackgroundOpacity = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Uniform size of BOTH CapFrameX renderers in percent; RTSS has its own zoom in the RTSS
+        // settings and is unaffected. Applies live through the same two paths as the opacity.
+        public int OsdZoom
+        {
+            get { return _appConfiguration.OsdZoom; }
+            set
+            {
+                _appConfiguration.OsdZoom = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Size and margins of the CapFrameX renderers follow the game's height relative to 1080p,
+        // on top of the zoom above. RTSS is unaffected.
+        public bool OsdScaleWithResolution
+        {
+            get { return _appConfiguration.OsdScaleWithResolution; }
+            set
+            {
+                _appConfiguration.OsdScaleWithResolution = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Font of the classic rows and graphs in the CapFrameX renderers. Designs keep the fonts
+        // chosen in the overlay editor; RTSS is unaffected.
+        public string OsdFontFamily
+        {
+            get { return _appConfiguration.OsdFontFamily; }
+            set
+            {
+                if (value == null) return; // the selection is cleared while the list is rebuilt
+                _appConfiguration.OsdFontFamily = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // The installed fonts, read once. A stored font that is no longer installed stays in the
+        // list so the selection still shows it; the renderers then fall back to a system font.
+        public IReadOnlyList<string> OsdFontFamilies => _osdFontFamilies ??= ListFontFamilies(OsdFontFamily);
+
+        internal static IReadOnlyList<string> ListFontFamilies(string selected)
+        {
+            var families = System.Windows.Media.Fonts.SystemFontFamilies
+                .Select(family => family.Source)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (!string.IsNullOrWhiteSpace(selected) &&
+                !families.Contains(selected, StringComparer.OrdinalIgnoreCase))
+                families.Add(selected);
+            families.Sort(StringComparer.CurrentCultureIgnoreCase);
+            return families;
+        }
+
+        // Placement of the CapFrameX overlay: anchored corner + distance from it. Reaches all
+        // three CapFrameX renderers; RTSS is positioned by its own settings.
+        public int OsdAnchor
+        {
+            get { return _appConfiguration.OsdAnchor; }
+            set
+            {
+                _appConfiguration.OsdAnchor = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OsdMarginX
+        {
+            get { return _appConfiguration.OsdMarginX; }
+            set
+            {
+                _appConfiguration.OsdMarginX = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OsdMarginY
+        {
+            get { return _appConfiguration.OsdMarginY; }
+            set
+            {
+                _appConfiguration.OsdMarginY = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // OLED pixel orbit for every design; a design can still request its own orbit.
+        public bool OsdPixelOrbitEnabled
+        {
+            get { return _appConfiguration.OsdPixelOrbitEnabled; }
+            set
+            {
+                _appConfiguration.OsdPixelOrbitEnabled = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OsdPixelOrbitInterval
+        {
+            get { return _appConfiguration.OsdPixelOrbitInterval; }
+            set
+            {
+                _appConfiguration.OsdPixelOrbitInterval = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int OsdPixelOrbitRadius
+        {
+            get { return _appConfiguration.OsdPixelOrbitRadius; }
+            set
+            {
+                _appConfiguration.OsdPixelOrbitRadius = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Controls the renderer-side smoothing of numeric values for BOTH CapFrameX renderers.
+        // Off displays the latest published value directly; RTSS is unaffected.
+        public bool UseOsdValueSmoothing
+        {
+            get { return _appConfiguration.UseOsdValueSmoothing; }
+            set
+            {
+                _appConfiguration.UseOsdValueSmoothing = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Overlay renderer is a single choice of four mutually exclusive modes, surfaced as a
+        // radio group over IAppConfiguration.OverlayRenderer. The configuration mirrors it onto
+        // the two renderer flags, so the gating in HookOverlayManager / OsdOverlayBridge keeps
+        // working unchanged; Off clears both flags like RTSS and additionally stops the RTSS feed.
+        public bool OverlayModeRtss
+        {
+            get { return _appConfiguration.UsesRtss(); }
+            set { if (value) SetOverlayMode(EOverlayRenderer.Rtss); }
+        }
+
+        public bool OverlayModeHook
+        {
+            get { return _appConfiguration.EnableHookOverlay; }
+            set { if (value) SetOverlayMode(EOverlayRenderer.InGame); }
+        }
+
+        public string InGameOverlayDescription => CxLang.T("OverlayViewModel_InjectedIntoTheGameFor");
+
+        public bool OverlayModeHookFree
+        {
+            get { return !_appConfiguration.EnableHookOverlay && _appConfiguration.EnableHookFreeOverlay; }
+            set { if (value) SetOverlayMode(EOverlayRenderer.HookFree); }
+        }
+
+        public bool OverlayModeOff
+        {
+            get { return _appConfiguration.OverlayRenderer == EOverlayRenderer.Off; }
+            set { if (value) SetOverlayMode(EOverlayRenderer.Off); }
+        }
+
+        public bool CanConfigureHookFreeOptions =>
+            _appConfiguration.EnableHookOverlay || _appConfiguration.EnableHookFreeOverlay;
+
+        // True when RTSS is the chosen renderer but "Hide OSD on RTSS" (HideOverlay) suppresses its
+        // output — a contradictory combination worth flagging in the UI next to the renderer choice.
+        public bool ShowRtssHiddenHint => OverlayModeRtss && _appConfiguration.HideOverlay;
+
+        private void SetOverlayMode(EOverlayRenderer renderer)
+        {
+            // The configuration writes the renderer and both flags before it raises any change,
+            // so a switch releases or re-arms RTSS at most once.
+            if (_appConfiguration.OverlayRenderer != renderer)
+                _appConfiguration.OverlayRenderer = renderer;
+
+            RaiseOverlayRendererProperties();
+        }
+
+        private void RaiseOverlayRendererProperties()
+        {
+            UpdateTileOverlayAvailability();
+            RaisePropertyChanged(nameof(OverlayModeRtss));
+            RaisePropertyChanged(nameof(OverlayModeHook));
+            RaisePropertyChanged(nameof(OverlayModeHookFree));
+            RaisePropertyChanged(nameof(OverlayModeOff));
+            RaisePropertyChanged(nameof(CanSwitchOverlay));
+            RaisePropertyChanged(nameof(OverlayToggleToolTip));
+            RaisePropertyChanged(nameof(CanConfigureHookFreeOptions));
+            RaisePropertyChanged(nameof(EnableHookOverlay));
+            RaisePropertyChanged(nameof(EnableHookFreeOverlay));
+            RaisePropertyChanged(nameof(HookOverlayUsePresentMonFrametimes));
+            RaisePropertyChanged(nameof(ShowRtssHiddenHint));
+            RaisePropertyChanged(nameof(CanUseDesign));
+            UseDesignCommand?.RaiseCanExecuteChanged();
+        }
+
+        public bool UseThreadAffinity
+        {
+            get { return _appConfiguration.UseThreadAffinity; }
+            set
+            {
+                _appConfiguration.UseThreadAffinity = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string FilterText
+        {
+            get => _filterText;
+            set
+            {
+                _filterText = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(HasActiveFilter));
+                RefreshOverlayEntriesView();
+            }
+        }
+
+        public EOverlayEntryType? SelectedEntryTypeFilter
+        {
+            get => _selectedEntryTypeFilter;
+            set
+            {
+                _selectedEntryTypeFilter = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(HasActiveFilter));
+                RefreshOverlayEntriesView();
+            }
+        }
+
+        public ICollectionView OverlayEntriesView
+        {
+            get => _overlayEntriesView;
+            private set
+            {
+                _overlayEntriesView = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public Array EntryTypeFilterItems => new object[] { null }
+            .Concat(Enum.GetValues(typeof(EOverlayEntryType)).Cast<object>())
+            .ToArray();
+
+        public bool HasActiveFilter
+            => !string.IsNullOrWhiteSpace(_filterText) || _selectedEntryTypeFilter.HasValue;
+
+        public string SelectedOverlayItemName
+            => SelectedOverlayEntry?.Description;
+
+        public string SelectedOverlayItemGroupName
+           => SelectedOverlayEntry?.GroupName;
+
+        public string SelectedOverlayItemSensorType
+          => SelectedOverlayEntry == null ? null
+          : _sensorService.GetSensorTypeString(SelectedOverlayEntry.OverlayEntryType, SelectedOverlayEntry.StableIdentifier);
+
+        private bool HasSelectedOverlayEntry() => SelectedOverlayEntry != null;
+
+        public ICommand ConfigSwitchCommand { get; }
+
+        public ICommand SaveConfigCommand { get; }
+
+        public ICommand SaveToConfig0Command { get; }
+
+        public ICommand SaveToConfig1Command { get; }
+
+        public ICommand SaveToConfig2Command { get; }
+
+        public ICommand OpenResetDialogCommand { get; }
+
+        public ICommand ResetConfigCommand { get; }
+
+        public ICommand ResetColorAndLimitDefaultsCommand { get; }
+
+        public ICommand SetFormatForGroupNameCommand { get; }
+
+        public ICommand SetFormatForSensorTypeCommand { get; }
+
+        public ICommand SetFormatForAllGroupsCommand { get; }
+
+        public ICommand SetFormatForAllValuesCommand { get; }
+
+        public ICommand SetToMinOsdCommand { get; }
+
+        public ICommand OpenConfigFolderCommand { get; }
+
+        public ICommand SortByEntryTypeCommand { get; }
+
+        public ICommand ClearFilterCommand { get; }
+
+        public ICommand LaunchOverlayPreviewAppCommand { get; }
+
+        public ICommand ApplyOverlayTemplateCommand { get; }
+
+        public DelegateCommand RevertOverlayTemplateCommand { get; }
+
+        public bool IsRTSSInstalled
+            => _rTSSService.IsRTSSInstalled();
+
+        public IAppConfiguration AppConfiguration => _appConfiguration;
+
+        public Array SecondMetricItems => Enum.GetValues(typeof(EMetric))
+            .Cast<EMetric>()
+            .Where(metric => metric != EMetric.Average && metric != EMetric.None)
+            .ToArray();
+        public Array ThirdMetricItems => Enum.GetValues(typeof(EMetric))
+            .Cast<EMetric>()
+            .Where(metric => metric != EMetric.Average)
+            .ToArray();
+
+        public Array NumberOfRunsItemsSource => Enumerable.Range(1, 20).ToArray();
+
+        public Array OutlierPercentageItemsSource => Enumerable.Range(1, 9).ToArray();
+
+        public Array OutlierHandlingItems => Enum.GetValues(typeof(EOutlierHandling))
+            .Cast<EOutlierHandling>()
+            .ToArray();
+
+        public Array RelatedMetricItemsSource => new[] { "Average", "Second", "Third" };
+
+        public Array RefreshPeriodItemsSource => new[] { 500, 1000, 1500, 2000 };
+
+        public Array HookFreeRefreshRateItemsSource => new[] { 1, 2, 5, 10, 20, 30, 60, 120 };
+
+        public Array MetricIntervalItemsSource => new[] { 5, 10, 20, 30, 60, 120, 240, 300 };
+
+        public Array OverlayTemplateItems => Enum.GetValues(typeof(EOverlayTemplate))
+            .Cast<EOverlayTemplate>()
+            .ToArray();
+
+        public ObservableCollection<IOverlayEntry> OverlayEntries { get; private set; }
+            = new ObservableCollection<IOverlayEntry>();
+
+        public OverlayGroupControl OverlaySubModelGroupControl { get; }
+
+        public OverlayGroupSeparating OverlaySubModelGroupSeparating { get; }
+
+        public OverlayViewModel(IOverlayService overlayService, IOverlayEntryProvider overlayEntryProvider, IAppConfiguration appConfiguration,
+            IPathService pathService, ISensorService sensorService, IRTSSService rTSSService, IThreadAffinityController threadAffinityController,
+            IOnlineMetricService onlineMetricService, IOverlayTemplateService overlayTemplateService,
+            IHookLearnedProfileService hookLearnedProfileService, IHookOverlayStatusService hookOverlayStatusService,
+            IOverlayDesignService overlayDesignService = null, Prism.Events.IEventAggregator eventAggregator = null,
+            ILogger<OverlayViewModel> logger = null)
+        {
+            _logger = logger;
+            _overlayService = overlayService;
+            _overlayEntryProvider = overlayEntryProvider;
+            _appConfiguration = appConfiguration;
+            _pathService = pathService;
+            _sensorService = sensorService;
+            _rTSSService = rTSSService;
+            _overlayTemplateService = overlayTemplateService;
+            _threadAffinityController = threadAffinityController;
+            _onlineMetricService = onlineMetricService;
+            _hookLearnedProfiles = hookLearnedProfileService ?? NullHookLearnedProfileService.Instance;
+            _hookOverlayStatus = hookOverlayStatusService;
+            InitializeDesigns(overlayDesignService, eventAggregator);
+            ExtendedOsdLogging = new ExtendedOsdLoggingViewModel(new ExtendedOsdLoggingController());
+            RefreshHookFreeDisplayItems();
+
+            // Define submodels
+            OverlaySubModelGroupControl = new OverlayGroupControl(this);
+            OverlaySubModelGroupSeparating = new OverlayGroupSeparating(this);
+
+            _overlayEntryProvider.OverlayEntriesChanged
+                ?.ObserveOnDispatcher()
+                .Subscribe(ApplyReloadedOverlayEntries);
+
+            ResetOverlayConfigContent = new ResetOverlayConfigDialog();
+
+            ConfigSwitchCommand = new DelegateCommand<object>(_configSubject.OnNext);
+            _configSubject
+                .Select(obj =>
+                {
+                    return Convert.ToInt32(obj);
+                })
+                .Select(index => Observable.FromAsync(() =>
+                    Task.Run(() => _overlayEntryProvider.SwitchConfigurationTo(index))))
+                .Concat()
+                .Do(_ => _overlayService.RequestRefresh())
+                .StartWith(System.Reactive.Unit.Default)
+                .SelectMany(_ => overlayEntryProvider.GetOverlayEntries(false))
+                .ObserveOnDispatcher()
+                .Subscribe(ApplyReloadedOverlayEntries);
+
+            // The template revert state was taken from the profile that was active when the
+            // template was applied. Restored into another profile it would replace that profile's
+            // entries, so a switch discards it as soon as it starts. The hotkey requests the
+            // switch from a worker thread, hence the dispatcher.
+            _configSubject
+                .ObserveOnDispatcher()
+                .Subscribe(_ => DiscardTemplateRevertState());
+
+            // The provider gates renderer-dependent items in place. A renderer change must not use
+            // the profile-switch path: that reloads JSON and discards unsaved item edits.
+            _appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OverlayRenderer)
+                         || x.key == nameof(IAppConfiguration.EnableHookFreeOverlay)
+                         || x.key == nameof(IAppConfiguration.EnableHookOverlay)
+                         || x.key == nameof(IAppConfiguration.HookOverlayUsePresentMonFrametimes))
+                .Throttle(TimeSpan.FromMilliseconds(50))
+                .ObserveOnDispatcher()
+                .Subscribe(_ => RaiseOverlayRendererProperties());
+
+            // The overlay is also switched by the status bar, by the auto-disable during a capture
+            // and by remote clients; the toggles on this page have to follow all of them.
+            _overlayService.IsOverlayActiveStream
+                ?.ObserveOnDispatcher()
+                .Subscribe(_ => RaisePropertyChanged(nameof(IsOverlayActive)));
+
+            // Keep the "RTSS output is hidden" hint (ShowRtssHiddenHint) in sync when the user
+            // toggles "Hide OSD on RTSS" from the other settings view.
+            _appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.HideOverlay))
+                .ObserveOnDispatcher()
+                .Subscribe(_ => RaisePropertyChanged(nameof(ShowRtssHiddenHint)));
+
+            CxLang.Instance.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(CxLang.UiLanguage))
+                    RaisePropertyChanged(nameof(HookFreeMpoWarning));
+            };
+
+            SaveConfigCommand = new DelegateCommand<object>(
+               async (object targetConfig) =>
+               {
+                   int index = Convert.ToInt32(targetConfig);
+                   if (index == 3)
+                   {
+                       SaveButtonIsEnable = false;
+                       await _overlayEntryProvider.SaveOverlayEntriesToJson(_appConfiguration.OverlayEntryConfigurationFile);
+                       SaveButtonIsEnable = _overlayEntryProvider.HasPendingChanges;
+                   }
+                   else
+                   {
+                       await _overlayEntryProvider.SaveOverlayEntriesToJson(index);
+                       if (index == _appConfiguration.OverlayEntryConfigurationFile)
+                           SaveButtonIsEnable = _overlayEntryProvider.HasPendingChanges;
+                   }
+               });
+
+            OpenResetDialogCommand = new DelegateCommand(() => ResetOverlayConfigContentIsOpen = true);
+            ResetConfigCommand = new DelegateCommand(async () => await OnResetDefaults());
+
+            _hookLearnedProfiles.Changes
+                .ObserveOnDispatcher()
+                .Subscribe(_ => RefreshHookLearnedProfileText());
+            _hookOverlayStatus?.StatusStream
+                .Select(status => status?.ProcessId ?? 0)
+                .DistinctUntilChanged()
+                .ObserveOnDispatcher()
+                .Subscribe(_ => RefreshHookLearnedProfileText());
+            RefreshHookLearnedProfileText();
+            CxLang.Instance.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(CxLang.UiLanguage))
+                {
+                    RaisePropertyChanged(nameof(InGameOverlayDescription));
+                    RaisePropertyChanged(nameof(DeleteDesignMessage));
+                    RaisePropertyChanged(nameof(DesignStatus));
+                    RefreshHookLearnedProfileText();
+                }
+            };
+            CxLang.Instance.OverlayLanguageChanged += OnOverlayLanguageChanged;
+
+            // Every format command copies from (or resets) the selected entry, and the selection is
+            // empty until the user picks a row and again whenever the entry list is reloaded.
+            SetFormatForGroupNameCommand = new DelegateCommand(
+               () => _overlayEntryProvider.SetFormatForGroupName(SelectedOverlayItemGroupName, SelectedOverlayEntry, Checkboxes),
+               HasSelectedOverlayEntry)
+                .ObservesProperty(() => SelectedOverlayEntry);
+
+            SetFormatForSensorTypeCommand = new DelegateCommand(
+               () => _overlayEntryProvider.SetFormatForSensorType(_sensorService.GetSensorTypeString(SelectedOverlayEntry.OverlayEntryType, SelectedOverlayEntry.StableIdentifier), SelectedOverlayEntry, Checkboxes),
+               HasSelectedOverlayEntry)
+                .ObservesProperty(() => SelectedOverlayEntry);
+
+            ResetColorAndLimitDefaultsCommand = new DelegateCommand(
+                () => _overlayEntryProvider.ResetColorAndLimits(SelectedOverlayEntry),
+                HasSelectedOverlayEntry)
+                .ObservesProperty(() => SelectedOverlayEntry);
+
+            SetFormatForAllGroupsCommand = new DelegateCommand(
+               () => _overlayEntryProvider.SetFormatForAllGroups(SelectedOverlayEntry, Checkboxes),
+               HasSelectedOverlayEntry)
+                .ObservesProperty(() => SelectedOverlayEntry);
+
+            SetFormatForAllValuesCommand = new DelegateCommand(
+               () => _overlayEntryProvider.SetFormatForAllValues(SelectedOverlayEntry, Checkboxes),
+               HasSelectedOverlayEntry)
+                .ObservesProperty(() => SelectedOverlayEntry);
+
+            SetToMinOsdCommand = new DelegateCommand(
+                () => OnSetMinOsd());
+
+            OpenConfigFolderCommand = new DelegateCommand(OnOpenConfigFolder);
+            SortByEntryTypeCommand = new DelegateCommand(OnSortByEntryType);
+            ClearFilterCommand = new DelegateCommand(OnClearFilter);
+            LaunchOverlayPreviewAppCommand = new DelegateCommand(OnLaunchOverlayPreviewApp);
+            ApplyOverlayTemplateCommand = new DelegateCommand(OnApplyOverlayTemplate);
+            // Without an applied template there is nothing to revert to; the stored state would be
+            // empty and the revert would clear the whole list.
+            RevertOverlayTemplateCommand = new DelegateCommand(OnRevertOverlayTemplate,
+                () => _overlayTemplateService.HasStoredState);
+
+            SetGlobalHookEventOverlayHotkey();
+            SetGlobalHookEventOverlayConfigHotkey();
+            SetGlobalHookEventOverlayPositionHotkey();
+            SetGlobalHookEventThreadAffinityHotkey();
+            SetGlobalHookEventResetMetricsHotkey();
+
+            InitializeOSDCustomPosition();
+        }
+
+        private void OnOverlayLanguageChanged()
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher != null && !dispatcher.CheckAccess())
+            {
+                dispatcher.BeginInvoke(new Action(OnOverlayLanguageChanged));
+                return;
+            }
+
+            if (OverlayEntries != null)
+            {
+                foreach (var entry in OverlayEntries.OfType<OverlayEntryWrapper>())
+                {
+                    entry.RefreshLocalization();
+                }
+            }
+            OverlayEntriesView?.Refresh();
+        }
+
+        // Shared refresh path after the provider re-read its entry list (profile switch or display
+        // topology change): rebind the view collection and re-apply formats.
+        private void ApplyReloadedOverlayEntries(IOverlayEntry[] entries)
+        {
+            entries.ForEach(entry => entry.UpdateGroupName = OverlaySubModelGroupSeparating.UpdateGroupName);
+            OverlaySubModelGroupSeparating.SetOverlayEntries(entries);
+
+            OverlayEntries.Clear();
+            OverlayEntries.AddRange(entries);
+            SetupOverlayEntriesView();
+            _overlayEntryProvider.UpdateOverlayEntryFormats();
+
+            SetSaveButtonIsEnableAction();
+            SaveButtonIsEnable = _overlayEntryProvider.HasPendingChanges;
+        }
+
+        private void SetSaveButtonIsEnableAction()
+        {
+            OverlayEntries.ForEach(entry => entry.PropertyChangedAction = SetSaveButtonIsEnable);
+            OverlaySubModelGroupSeparating.OverlayGroupNameSeparatorEntries.ForEach(entry => entry.PropertyChangedAction = SetSaveButtonIsEnable);
+        }
+
+        // Every path that swaps in new entry objects (template apply and revert, reset to defaults)
+        // has to hook them up again: without PropertyChangedAction an edit no longer enables the
+        // save button, without UpdateGroupName a renamed group no longer reaches the separator list.
+        private void AttachEntryCallbacks()
+        {
+            OverlayEntries.ForEach(entry => entry.UpdateGroupName = OverlaySubModelGroupSeparating.UpdateGroupName);
+            SetSaveButtonIsEnableAction();
+        }
+
+        private void SetSaveButtonIsEnable()
+        {
+            _overlayEntryProvider.MarkPendingChanges();
+            SaveButtonIsEnable = true;
+        }
+
+        private void RefreshHookLearnedProfileText()
+        {
+            string text;
+            try
+            {
+                int total = _hookLearnedProfiles.GetAll().Count;
+                string processName = ResolveHookTargetProcessName();
+                if (processName == null)
+                {
+                    text = total == 0
+                        ? CxLang.T("OverlayViewModel_NoLearnedCompatibilityProfiles")
+                        : string.Format(CxLang.T("OverlayViewModel_LearnedProfilesNoGame"), total);
+                }
+                else
+                {
+                    IReadOnlyList<HookLearnedProfileSummary> entries =
+                        _hookLearnedProfiles.GetForProcess(processName);
+                    if (entries.Count == 0)
+                    {
+                        text = string.Format(CxLang.T("OverlayViewModel_NoLearnedProfileForProcess"), processName, total);
+                    }
+                    else
+                    {
+                        HookLearnedProfileSummary entry = entries[0];
+                        if (entry.PendingStageName != null)
+                            text = CxLang.Format("OverlayViewModel_ProfileNextLaunchStage01", processName, entry.PendingStageName);
+                        else if (entry.Exhausted)
+                            text = CxLang.Format("OverlayViewModel_ProfileExhausted0", processName);
+                        else if (entry.Verified)
+                            text = CxLang.Format("OverlayViewModel_ProfileVerified012", processName, entry.StageName, entry.UpdatedUtc.ToLocalTime().ToString("g"));
+                        else
+                            text = CxLang.Format("OverlayViewModel_ProfileNotVerified01", processName, entry.StageName);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                text = CxLang.Format("OverlayViewModel_ProfilesUnavailable0", ex.Message);
+            }
+            HookLearnedProfileText = text;
+        }
+
+        private string ResolveHookTargetProcessName()
+        {
+            int pid = _hookOverlayStatus?.Current?.ProcessId ?? 0;
+            if (pid <= 0) return null;
+            try
+            {
+                using (var process = Process.GetProcessById(pid))
+                    return process.ProcessName;
+            }
+            catch (Exception ex) when (ex is ArgumentException ||
+                                       ex is InvalidOperationException ||
+                                       ex is System.ComponentModel.Win32Exception ||
+                                       ex is NotSupportedException)
+            {
+                return null;
+            }
+        }
+
+        private async Task OnResetDefaults()
+        {
+            bool wasOverlayActive = _appConfiguration.IsOverlayActive;
+            if (wasOverlayActive)
+            {
+                IsOverlayActive = false;
+                // give overlay management a bit time to disable overlay
+                await Task.Delay(200);
+            }
+
+            try
+            {
+                var overlayEntries = await _overlayEntryProvider.GetDefaultOverlayEntries();
+
+                OverlaySubModelGroupSeparating.SetOverlayEntries(overlayEntries);
+                OverlayEntries.ForEach(entry => entry.Dispose());
+                OverlayEntries.Clear();
+                OverlayEntries.AddRange(overlayEntries);
+                SetupOverlayEntriesView();
+                AttachEntryCallbacks();
+                OverlayItemsOptionsEnabled = false;
+                _overlayEntryProvider.UpdateOverlayEntryFormats();
+
+                await _overlayEntryProvider.SaveOverlayEntriesToJson(_appConfiguration.OverlayEntryConfigurationFile);
+                SaveButtonIsEnable = _overlayEntryProvider.HasPendingChanges;
+                ResetOverlayConfigContentIsOpen = false;
+            }
+            finally
+            {
+                if (wasOverlayActive)
+                    IsOverlayActive = true;
+            }
+        }
+
+        private void OnSetMinOsd()
+        {
+            foreach (var entry in OverlayEntries)
+            {
+                switch (entry.Identifier)
+                {
+                    case "CaptureTimer":
+                    case "Framerate":
+                    case "Frametime":
+                        entry.ShowOnOverlay = true;
+                        break;
+                    default:
+                        entry.ShowOnOverlay = false;
+                        break;
+                }
+            }
+        }
+
+        private void SetGlobalHookEventOverlayHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.Overlay, () =>
+            {
+                IsOverlayActive = !IsOverlayActive;
+            });
+        }
+
+        private void SetGlobalHookEventOverlayConfigHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.OverlayConfig, () =>
+            {
+                var nextConfig = GetNextConfig();
+                Task.Run(() => _configSubject.OnNext(nextConfig));
+            });
+        }
+
+        private void SetGlobalHookEventOverlayPositionHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.OverlayPosition, () =>
+            {
+                OsdAnchor = OsdAnchorPositionCycle.GetNext(OsdAnchor);
+            });
+        }
+
+        private void SetGlobalHookEventThreadAffinityHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.ThreadAffinity, () =>
+            {
+                Task.Run(() => _threadAffinityController.ToggleAffinity());
+            });
+        }
+
+        private void SetGlobalHookEventResetMetricsHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.ResetMetrics, () =>
+            {
+                Task.Run(() => _onlineMetricService.ResetRealtimeMetrics());
+            });
+        }
+
+        private string GetNextConfig()
+        {
+            if (IsConfig0Checked)
+            {
+                IsConfig1Checked = true;
+                return "1";
+            }
+
+            else if (IsConfig1Checked)
+            {
+                IsConfig2Checked = true;
+                return "2";
+            }
+            else
+            {
+                IsConfig0Checked = true;
+                return "0";
+            }
+        }
+
+        private void InitializeOSDCustomPosition()
+        {
+            _rTSSService.SetOSDCustomPosition(_appConfiguration.OSDCustomPosition);
+            _rTSSService.SetOverlayPosition(_appConfiguration.OSDPositionX, _appConfiguration.OSDPositionY);
+        }
+
+        private void OnOpenConfigFolder()
+        {
+            try
+            {
+                // UseShellExecute is required to open a folder in Explorer on .NET Core+
+                Process.Start(new ProcessStartInfo(_pathService.ConfigFolder) { UseShellExecute = true });
+            }
+            catch { }
+        }
+
+        private void OnLaunchOverlayPreviewApp()
+        {
+            try
+            {
+                var appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+                var vkcubePath = Path.Combine(appDirectory, "3d-test-app", "vkcube.exe");
+                if (!File.Exists(vkcubePath))
+                    return;
+
+                // --present_mode 2 = VK_PRESENT_MODE_FIFO_KHR (V-Sync, ~60fps)
+                // --width/--height = window dimensions
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = vkcubePath,
+                    Arguments = "--present_mode 2 --width 520 --height 820",
+                    UseShellExecute = false
+                };
+                Process.Start(startInfo);
+            }
+            catch { }
+        }
+
+        private void OnApplyOverlayTemplate()
+        {
+            // An empty list (entries not loaded yet) would be stored as the revert state and pushed
+            // to the provider, wiping its entries.
+            if (!OverlayEntries.Any())
+                return;
+
+            // Store current state before applying template
+            _overlayTemplateService.StoreCurrentState(OverlayEntries);
+            RevertOverlayTemplateCommand.RaiseCanExecuteChanged();
+            var clonedEntries = OverlayEntries.Select(entry => entry.Clone()).ToList();
+
+            // Apply the selected template
+            _overlayTemplateService.ApplyTemplate(SelectedOverlayTemplate, clonedEntries);
+
+            // Group entries by template section, sort groups by section order,
+            // then sort elements within each group by SortKey.
+            var sortedEntries = OverlayUtils.SortForTemplate(clonedEntries);
+
+            // Dispose old entries and replace with sorted and templated entries
+            OverlayEntries.ForEach(entry => entry.Dispose());
+            OverlayEntries.Clear();
+            OverlayEntries.AddRange(sortedEntries);
+
+            // Update OverlayEntryProvider accordingly
+            _overlayEntryProvider.UpdateOverlayEntries(sortedEntries);
+
+            // Setup view, refresh Separators list, and notify overlay
+            SetupOverlayEntriesView();
+            OverlaySubModelGroupSeparating.SetOverlayEntries(sortedEntries);
+            AttachEntryCallbacks();
+
+            SetSaveButtonIsEnable();
+
+            _overlayService.RequestRefresh();
+        }
+
+        private void DiscardTemplateRevertState()
+        {
+            _overlayTemplateService.ClearStoredState();
+            RevertOverlayTemplateCommand.RaiseCanExecuteChanged();
+        }
+
+        private void OnRevertOverlayTemplate()
+        {
+            if (!_overlayTemplateService.HasStoredState)
+                return;
+
+            var storedOverlayEntries = _overlayTemplateService.GetStoredOverlayEntries().ToList();
+
+            OverlayEntries.ForEach(entry => entry.Dispose());
+            OverlayEntries.Clear();
+            OverlayEntries.AddRange(storedOverlayEntries);
+
+            // Update OverlayEntryProvider accordingly
+            _overlayEntryProvider.UpdateOverlayEntries(OverlayEntries);
+
+            // Setup view, refresh Separators list, and notify overlay
+            SetupOverlayEntriesView();
+            OverlaySubModelGroupSeparating.SetOverlayEntries(OverlayEntries);
+            AttachEntryCallbacks();
+
+            SetSaveButtonIsEnable();
+
+            _overlayService.RequestRefresh();
+        }
+
+        private void OnSortByEntryType()
+        {
+            // Sort entries by OverlayEntryType
+            // 1. CX
+            // 2. GPU
+            // 3. CPU
+            // 4. RAM
+            // 5. HDD (Storage)
+            // 6. OnlineMetric
+            // 7. Undefined
+            var sortedEntries = OverlayEntries.OrderBy(entry =>
+            {
+                switch (entry.OverlayEntryType)
+                {
+                    case EOverlayEntryType.CX:
+                        return 1;
+                    case EOverlayEntryType.GPU:
+                        return 2;
+                    case EOverlayEntryType.CPU:
+                        return 3;
+                    case EOverlayEntryType.RAM:
+                        return 4;
+                    case EOverlayEntryType.HDD:
+                        return 5;
+                    case EOverlayEntryType.OnlineMetric:
+                        return 6;
+                    case EOverlayEntryType.Undefined:
+                        return 7;
+                    default:
+                        return 8;
+                }
+            }).ThenBy(entry => entry.SortKey, new SortKeyComparer()).ToList();
+
+            // Update OverlayEntryProvider accordingly
+            _overlayEntryProvider.SortOverlayEntriesByType();
+
+            OverlayEntries.Clear();
+            OverlayEntries.AddRange(sortedEntries);
+            SetupOverlayEntriesView();
+            SetSaveButtonIsEnable();
+        }
+
+        private void SetupOverlayEntriesView()
+        {
+            lock (_overlayEntriesViewLock)
+            {
+                OverlayEntriesView = CollectionViewSource.GetDefaultView(OverlayEntries);
+                OverlayEntriesView.Filter = FilterOverlayEntry;
+            }
+        }
+
+        private void RefreshOverlayEntriesView()
+        {
+            lock (_overlayEntriesViewLock)
+            {
+                if (OverlayEntriesView == null)
+                    return;
+
+                if (OverlayEntriesView is IEditableCollectionView editableView)
+                {
+                    if (editableView.IsAddingNew)
+                        editableView.CommitNew();
+                    if (editableView.IsEditingItem)
+                    {
+                        if (editableView.CanCancelEdit)
+                            editableView.CancelEdit();
+                        else
+                            editableView.CommitEdit();
+                    }
+                }
+
+                OverlayEntriesView.Refresh();
+            }
+        }
+
+        private void OnClearFilter()
+        {
+            FilterText = string.Empty;
+            SelectedEntryTypeFilter = null;
+        }
+
+        private bool FilterOverlayEntry(object item)
+        {
+            if (!(item is IOverlayEntry entry))
+                return false;
+
+            // Filter by entry type
+            if (_selectedEntryTypeFilter.HasValue && entry.OverlayEntryType != _selectedEntryTypeFilter.Value)
+                return false;
+
+            // Filter by search text across all columns
+            if (!string.IsNullOrWhiteSpace(_filterText))
+            {
+                var searchText = _filterText.Trim();
+                bool matchesDescription = entry.Description?.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0
+                    || CxLang.Instance.TranslateOverlayDescription(entry)?.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0;
+                bool matchesGroupName = entry.GroupName?.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0
+                    || CxLang.Instance.TranslateOverlay(entry.GroupName)?.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0;
+                bool matchesStableId = entry.StableIdentifier?.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!matchesDescription && !matchesGroupName && !matchesStableId)
+                    return false;
+            }
+
+            return true;
+        }
+
+        public void UpdateGroupNameEnable()
+        {
+            RaisePropertyChanged(nameof(SelectedOverlayItemGroupName));
+            DetermineMultipleGroupEntries(_selectedOverlayEntry);
+        }
+
+        public void DetermineMultipleGroupEntries(IOverlayEntry selectedEntry)
+        {
+            if (selectedEntry == null)
+                return;
+
+            SetGroupButtonEnabled =
+                OverlayEntries.Count(entry => entry.GroupName == selectedEntry.GroupName) > 1;
+        }
+
+        public void DetermineMultipleSensorTypeEntries(IOverlayEntry selectedEntry)
+        {
+            if (selectedEntry == null)
+                return;
+
+            string selectedSensorType = _sensorService.GetSensorTypeString(selectedEntry.OverlayEntryType, selectedEntry.StableIdentifier);
+            SetSensorTypeButtonEnabled = selectedSensorType != string.Empty &&
+                OverlayEntries.Count((entry => _sensorService.GetSensorTypeString(entry.OverlayEntryType, entry.StableIdentifier) == selectedSensorType)) > 1;
+        }
+
+
+        public bool IsNavigationTarget(NavigationContext navigationContext)
+        {
+            return true;
+        }
+
+        public void OnNavigatedFrom(NavigationContext navigationContext)
+        {
+            if (_displaySettingsChangedSubscribed)
+            {
+                SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+                _displaySettingsChangedSubscribed = false;
+            }
+        }
+
+        public void OnNavigatedTo(NavigationContext navigationContext)
+        {
+            RefreshDesigns();
+            RefreshHookFreeDisplayItems();
+            if (!_displaySettingsChangedSubscribed)
+            {
+                SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+                _displaySettingsChangedSubscribed = true;
+            }
+        }
+
+        private void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess())
+            {
+                RefreshHookFreeDisplayItems(notifyRenderer: true);
+                return;
+            }
+
+            dispatcher.BeginInvoke(new Action(() =>
+                RefreshHookFreeDisplayItems(notifyRenderer: true)));
+        }
+
+        private void RefreshHookFreeDisplayItems(bool notifyRenderer = false)
+        {
+            var displays = DisplayDetection.GetDisplays();
+            var items = displays
+                .Select(display =>
+                {
+                    string deviceName = display.DeviceName;
+                    string primarySuffix = display.IsPrimary ? " (Primary)" : string.Empty;
+                    string displayName = $"{DisplayDetection.GetShortName(deviceName)} — " +
+                        $"{display.Width} × {display.Height}{primarySuffix}";
+
+                    return new HookFreeDisplayItem(deviceName, displayName, display.IsPrimary);
+                })
+                .ToArray();
+
+            HookFreeDisplayItemsSource = items;
+            _overlayEntryProvider.RefreshDisplayEntries(displays);
+
+            string selectedDeviceName = _appConfiguration.HookFreeDisplayDeviceName;
+            bool selectionExists = items.Any(item =>
+                string.Equals(item.DeviceName, selectedDeviceName,
+                    StringComparison.OrdinalIgnoreCase));
+            if (!selectionExists)
+            {
+                var fallback = items.FirstOrDefault(item => item.IsPrimary) ?? items.FirstOrDefault();
+                selectedDeviceName = fallback?.DeviceName ?? string.Empty;
+            }
+
+            if (!string.Equals(_appConfiguration.HookFreeDisplayDeviceName, selectedDeviceName,
+                    StringComparison.OrdinalIgnoreCase) || notifyRenderer)
+            {
+                // Re-emitting the same device name after a topology change makes the bridge
+                // resolve its potentially changed native monitor index immediately.
+                _appConfiguration.HookFreeDisplayDeviceName = selectedDeviceName;
+            }
+
+            RaisePropertyChanged(nameof(HookFreeDisplayDeviceName));
+            // A topology change can move the display to another adapter or mode.
+            UpdateHookFreeMpo(selectedDeviceName);
+        }
+
+        void IDropTarget.Drop(IDropInfo dropInfo)
+        {
+            if (HasActiveFilter || dropInfo == null)
+                return;
+
+            if (!(dropInfo.VisualTarget is FrameworkElement frameworkElement)
+                || frameworkElement.Name != "OverlayItemDataGrid")
+                return;
+
+            var draggedEntries = OverlayEntryReorder.GetDraggedItems<IOverlayEntry>(dropInfo.Data);
+            if (draggedEntries.Count == 0)
+                return;
+
+            var reorderedEntries = OverlayEntryReorder.CreateOrder(
+                OverlayEntries,
+                draggedEntries,
+                dropInfo.InsertIndex);
+
+            // ObservableCollection.Move raises item-level move notifications. Keeping the
+            // collection and view instances alive preserves both the viewport and selection.
+            OverlayEntryReorder.ApplyOrder(
+                OverlayEntries,
+                reorderedEntries,
+                _overlayEntryProvider.MoveEntry);
+
+            SetSaveButtonIsEnable();
+        }
+
+        void IDropTarget.DragOver(IDropInfo dropInfo)
+        {
+            if (dropInfo != null
+                && !HasActiveFilter
+                && OverlayEntryReorder.GetDraggedItems<IOverlayEntry>(dropInfo.Data).Count > 0)
+            {
+                // standard behavior
+                dropInfo.DropTargetAdorner = DropTargetAdorners.Insert;
+                dropInfo.Effects = DragDropEffects.Move;
+            }
+        }
+
+    }
+}

@@ -1,0 +1,228 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Directory.Build.props selects the optional OSD checkout. Build its neutral native
+         bridge from source when enabled; otherwise use external\CapFrameX.OSD-prebuilt. -->
+    <!-- Preserve the explicit x64 mapping on the optional project reference. Visual Studio
+         otherwise removes the platform for projects that are not listed in the solution. -->
+    <ShouldUnsetParentConfigurationAndPlatform Condition="'$(CfxOsdFromSource)' == 'true' And '$(ShouldUnsetParentConfigurationAndPlatform)' == ''">false</ShouldUnsetParentConfigurationAndPlatform>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- the CapFrameX overlay contracts this project adapts -->
+    <ProjectReference Include="..\CapFrameX.Contracts\CapFrameX.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.PresentMonInterface\CapFrameX.PresentMonInterface.csproj" />
+    <ProjectReference Include="..\CapFrameX.Statistics.NetStandard\CapFrameX.Statistics.NetStandard.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="StarterDesigns\*.json" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <!-- Embed the shared exports directly so shipped profiles and downloadable templates stay identical. -->
+    <EmbeddedResource Include="..\..\overlay-templates\RTX-50-Ryzen-3D-APEX.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\AMD-Ryzen-Radeon-REDLINE.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\RTX-50-Core-Ultra-FUSION-ARL.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\RTX-50-Core-FUSION-RPL.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\RTX-50-Ryzen-FUSION.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Panther-Lake-Arc-Aurora.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\BLUELINE-Nova-Lake.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\OLED-Minimal.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Performance-Strip.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <!-- Recreated from the overlay of the YouTube channel Geralt Benchmarks (https://www.youtube.com/@GeraltBenchmarks). -->
+    <EmbeddedResource Include="..\..\overlay-templates\NVIDIA-GeForce-RTX-GREENLINE.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\ICELINE-Vertical.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\DUOLINE-Radeon-Ryzen.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\DUOLINE-GeForce-Ryzen.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\DUOLINE-Radeon-Intel.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\DUOLINE-GeForce-Intel.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\DUOLINE-Arc-Intel.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <!-- Board artwork rendered by scripts\New-BlackwellBoardArt.py. -->
+    <EmbeddedResource Include="..\..\overlay-templates\Blackwell-Thermals-RTX-5090.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Blackwell-Thermals-RTX-5080.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Blackwell-Thermals-RTX-5070.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Blackwell-Thermals-RTX-5060.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <!-- Original artwork rendered by scripts\New-AnimeOverlayArt.py. -->
+    <EmbeddedResource Include="..\..\overlay-templates\Anime-Cherry-Blossom.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Anime-Neon-Night.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Anime-Lunar.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <!-- Adapted from Slick Overlay for RTSS by HeyOkay (MIT License, overlay-templates\Slick-Overlay-LICENSE.txt). -->
+    <EmbeddedResource Include="..\..\overlay-templates\Slick-Overlay-Vertical-Panel.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Slick-Overlay-Wide-3-Rows.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Slick-Overlay-Compact-2x2.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\overlay-templates\Slick-Overlay-Single-Line.json"
+                      Link="StarterDesigns\%(Filename)%(Extension)" LogicalName="CapFrameX.OSD.Integration.StarterDesigns.%(Filename)%(Extension)" />
+    <None Remove="HookCompatibilityProfiles.xml" />
+    <EmbeddedResource Include="HookCompatibilityProfiles.xml"
+                      LogicalName="CapFrameX.OSD.Integration.HookCompatibilityProfiles.xml" />
+    <Content Include="HookCompatibilityProfiles.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(CfxOsdFromSource)' == 'true'">
+    <ProjectReference Include="$(_CfxOsdSourceDir)CapFrameX.OSD.Interop\CapFrameX.OSD.Interop.csproj">
+      <!-- The optional OSD project is not listed in CapFrameX.sln, so Visual Studio
+           cannot apply a solution platform mapping to this x64-only reference. -->
+      <SetPlatform>Platform=x64</SetPlatform>
+      <CfxOptionalOsd>true</CfxOptionalOsd>
+      <AdditionalProperties>ShouldUnsetParentConfigurationAndPlatform=false</AdditionalProperties>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(CfxOsdFromSource)' != 'true'">
+    <Reference Include="CapFrameX.OSD.Interop">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\net10.0-windows\CapFrameX.OSD.Interop.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- IObservable.Subscribe extensions (matches CapFrameX.Contracts' version) -->
+    <PackageReference Include="System.Reactive" />
+    <!-- structured logging for the hook injection manager (same Serilog the app uses) -->
+    <PackageReference Include="Serilog" />
+    <!-- learned compatibility profiles (HookLearnedProfileStore), the same JSON stack the
+         other per-user stores in the configuration folder use -->
+    <PackageReference Include="Newtonsoft.Json" />
+    <!-- Win32_ProcessStartTrace subscription, so waiting for an early-injection target costs
+         nothing instead of polling the full process list 40x per second. Same version the
+         app already ships through CapFrameX.SystemInfo.NetStandard and LibreHardwareMonitorLib. -->
+    <PackageReference Include="System.Management" />
+    <!-- HookTargetPolicy asks whether Ricochet's kernel driver runs (atvi-randgrid_*). Same
+         package and version as CapFrameX.PMD's BENCHLAB service check. -->
+    <PackageReference Include="System.ServiceProcess.ServiceController" />
+  </ItemGroup>
+
+  <!-- Stage the in-game hook renderer (cfx_osd_hook.dll) into a 'hook' SUBFOLDER of the
+       app output — NOT next to the exe. HookOverlayManager injects a per-version COPY of
+       this file (under LocalAppData), so games lock the copy, never this staged source.
+       Keeping it in a subfolder also means a game that (legacy) locked the old top-level
+       bin\cfx_osd_hook.dll never blocks this build. Prefer the selected source checkout's
+       hook_poc output only when source builds are enabled; otherwise use the prebuilt binary.
+       Explicit per-file overrides remain authoritative for custom development payloads. -->
+  <PropertyGroup>
+    <CfxOsdHookDllPath Condition="'$(CfxOsdHookDllPath)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\hook_poc\build\bin\RelWithDebInfo\cfx_osd_hook.dll')">$(_CfxOsdSourceDir)CapFrameX.OSD\hook_poc\build\bin\RelWithDebInfo\cfx_osd_hook.dll</CfxOsdHookDllPath>
+    <CfxOsdHookDllPath Condition="'$(CfxOsdHookDllPath)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\cfx_osd_hook.dll')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\cfx_osd_hook.dll</CfxOsdHookDllPath>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CfxOsdHookDllPath)' != ''">
+    <Content Include="$(CfxOsdHookDllPath)">
+      <Link>hook\cfx_osd_hook.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- x86 hook for 32-bit (WOW64) games. HookInjector resolves the target's 32-bit LoadLibraryW
+       from the x64 app, so only the hook DLL is staged into hook\x86\. Same
+       source-then-prebuilt fallback as the x64 hook. -->
+  <PropertyGroup>
+    <CfxOsdHookDllX86Path Condition="'$(CfxOsdHookDllX86Path)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\hook_poc\build-x86\bin\RelWithDebInfo\cfx_osd_hook.dll')">$(_CfxOsdSourceDir)CapFrameX.OSD\hook_poc\build-x86\bin\RelWithDebInfo\cfx_osd_hook.dll</CfxOsdHookDllX86Path>
+    <CfxOsdHookDllX86Path Condition="'$(CfxOsdHookDllX86Path)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\x86\cfx_osd_hook.dll')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\x86\cfx_osd_hook.dll</CfxOsdHookDllX86Path>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CfxOsdHookDllX86Path)' != ''">
+    <Content Include="$(CfxOsdHookDllX86Path)">
+      <Link>hook\x86\cfx_osd_hook.dll</Link>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- MinHook is linked statically into both DXGI hook DLLs. Ship its BSD license once beside
+       the hook payload for both source and prebuilt builds. -->
+  <PropertyGroup>
+    <CfxOsdMinHookLicensePath Condition="'$(CfxOsdMinHookLicensePath)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\third_party\minhook\LICENSE.txt')">$(_CfxOsdSourceDir)CapFrameX.OSD\third_party\minhook\LICENSE.txt</CfxOsdMinHookLicensePath>
+    <CfxOsdMinHookLicensePath Condition="'$(CfxOsdMinHookLicensePath)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\MinHook.LICENSE.txt')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\MinHook.LICENSE.txt</CfxOsdMinHookLicensePath>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CfxOsdMinHookLicensePath)' != ''">
+    <Content Include="$(CfxOsdMinHookLicensePath)">
+      <Link>hook\MinHook.LICENSE.txt</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <!-- Vulkan implicit layer, one folder per bitness: 'vulkan' (x64) and 'vulkan\x86', the same
+       split the hook already uses. The installer registers each manifest in the matching
+       registry view — a wrong-bitness entry does not merely fail to load, it shadows the
+       correct one, because the loader identifies layers by NAME. Keep every DLL beside its
+       manifest: library_path is relative, which is why both manifests can be identical files. -->
+  <PropertyGroup>
+    <CfxOsdVulkanDllPath Condition="'$(CfxOsdVulkanDllPath)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build\bin\RelWithDebInfo\cfx_osd_vklayer.dll')">$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build\bin\RelWithDebInfo\cfx_osd_vklayer.dll</CfxOsdVulkanDllPath>
+    <CfxOsdVulkanDllPath Condition="'$(CfxOsdVulkanDllPath)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\cfx_osd_vklayer.dll')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\cfx_osd_vklayer.dll</CfxOsdVulkanDllPath>
+    <CfxOsdVulkanManifestPath Condition="'$(CfxOsdVulkanManifestPath)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\cfx_osd_vklayer.json')">$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\cfx_osd_vklayer.json</CfxOsdVulkanManifestPath>
+    <CfxOsdVulkanManifestPath Condition="'$(CfxOsdVulkanManifestPath)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\cfx_osd_vklayer_v1.json')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\cfx_osd_vklayer_v1.json</CfxOsdVulkanManifestPath>
+    <CfxOsdVulkanDllPathX86 Condition="'$(CfxOsdVulkanDllPathX86)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build-x86\bin\RelWithDebInfo\cfx_osd_vklayer.dll')">$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build-x86\bin\RelWithDebInfo\cfx_osd_vklayer.dll</CfxOsdVulkanDllPathX86>
+    <CfxOsdVulkanDllPathX86 Condition="'$(CfxOsdVulkanDllPathX86)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\x86\cfx_osd_vklayer.dll')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\x86\cfx_osd_vklayer.dll</CfxOsdVulkanDllPathX86>
+    <!-- Byte-identical to the x64 manifest, but a separate source file: MSBuild deduplicates
+         Content items by Include, so one file cannot be staged to two link targets. -->
+    <CfxOsdVulkanManifestPathX86 Condition="'$(CfxOsdVulkanManifestPathX86)' == '' And '$(CfxOsdFromSource)' == 'true' And Exists('$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build-x86\bin\RelWithDebInfo\cfx_osd_vklayer.json')">$(_CfxOsdSourceDir)CapFrameX.OSD\vk_layer\build-x86\bin\RelWithDebInfo\cfx_osd_vklayer.json</CfxOsdVulkanManifestPathX86>
+    <CfxOsdVulkanManifestPathX86 Condition="'$(CfxOsdVulkanManifestPathX86)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\x86\cfx_osd_vklayer_v1.json')">$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\native\vk\x86\cfx_osd_vklayer_v1.json</CfxOsdVulkanManifestPathX86>
+  </PropertyGroup>
+  <!-- PreserveNewest, not Always: unlike the hook — which games load as a content-hashed copy
+       under LocalAppData, never from here — the registered layer is loaded straight out of this
+       folder by EVERY Vulkan process on the machine. 'Always' rewrites it on every build and
+       fails as soon as any Vulkan app is running; 'PreserveNewest' skips the copy while the
+       staged file is current, so only a genuinely rebuilt layer needs those apps closed. -->
+  <ItemGroup Condition="'$(CfxOsdVulkanDllPath)' != ''">
+    <Content Include="$(CfxOsdVulkanDllPath)">
+      <Link>vulkan\cfx_osd_vklayer.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="'$(CfxOsdVulkanManifestPath)' != ''">
+    <Content Include="$(CfxOsdVulkanManifestPath)">
+      <Link>vulkan\cfx_osd_vklayer_v1.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="'$(CfxOsdVulkanDllPathX86)' != ''">
+    <Content Include="$(CfxOsdVulkanDllPathX86)">
+      <Link>vulkan\x86\cfx_osd_vklayer.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="'$(CfxOsdVulkanManifestPathX86)' != ''">
+    <Content Include="$(CfxOsdVulkanManifestPathX86)">
+      <Link>vulkan\x86\cfx_osd_vklayer_v1.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <!-- Registers the layers of the folder it lies in. Portable extraction writes no registry
+       values, so the portable CapFrameX offers to run it at startup (PortableVulkanLayerPrompt).
+       The installer registers its layers itself and excludes the script. -->
+  <ItemGroup>
+    <Content Include="Register-CapFrameXVulkanLayer.ps1">
+      <Link>vulkan\Register-CapFrameXVulkanLayer.ps1</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

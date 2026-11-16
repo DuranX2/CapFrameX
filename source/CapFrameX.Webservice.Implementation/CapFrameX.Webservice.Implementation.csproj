@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Platforms>AnyCPU;x64;x86</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Squidex.ClientLibrary" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.Statistics.PlotBuilder\CapFrameX.Statistics.PlotBuilder.csproj" />
+    <ProjectReference Include="..\CapFrameX.Webservice.Data\CapFrameX.Webservice.Data.csproj" />
+  </ItemGroup>
+
+</Project>

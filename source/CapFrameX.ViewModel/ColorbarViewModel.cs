@@ -1,0 +1,1063 @@
+using CapFrameX.Configuration;
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.MVVM;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Extensions;
+using CapFrameX.Extensions.NetStandard;
+using CapFrameX.PresentMonInterface;
+using CapFrameX.Remote;
+using CapFrameX.Webservice.Data.DTO;
+using Microsoft.Extensions.Logging;
+using Microsoft.Win32;
+using Microsoft.Win32.TaskScheduler;
+using Newtonsoft.Json;
+using Prism.Commands;
+using Prism.Events;
+using Prism.Mvvm;
+using Prism.Navigation.Regions;
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.NetworkInformation;
+using System.Reactive.Linq;
+using System.Windows.Input;
+
+namespace CapFrameX.ViewModel
+{
+    public class ColorbarViewModel : BindableBase
+    {
+        private readonly IRegionManager _regionManager;
+        private readonly IEventAggregator _eventAggregator;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IPathService _pathService;
+        private readonly ISensorService _sensorService;
+        private readonly ILogger<ColorbarViewModel> _logger;
+        private readonly IShell _shell;
+        private readonly ISystemInfo _systemInfo;
+        private readonly LoginManager _loginManager;
+        private readonly CaptureManager _captureManager;
+        private PubSubEvent<AppMessages.OpenLoginWindow> _openLoginWindow;
+        public PubSubEvent<ViewMessages.OptionPopupClosed> OptionPopupClosed;
+        public PubSubEvent<ViewMessages.ThemeChanged> _themeChanged;
+
+        // The Info tab is the leading tab and the startup view (see CapFrameXViewRegion,
+        // which registers InfoView first so the region activates it initially).
+        private bool _infoIsChecked = true;
+        private bool _captureIsChecked;
+        private bool _overlayIsChecked;
+        private bool _singleRecordIsChecked;
+        private bool _recordComparisonIsChecked;
+        private bool _reportIsChecked;
+        private bool _sensorIsChecked;
+        private bool _pmdIsChecked;
+        private bool _cloudIsChecked;
+        private bool _aggregatioIsChecked;
+        private bool _hasCustomInfo;
+        private string _selectedView = "Options";
+        private bool _optionsViewSelected = true;
+        private bool _hardwareViewSelected;
+        private bool _appViewSelected;
+        private bool _remoteViewSelected;
+        private bool _updateViewSelected;
+        private bool _helpViewSelected;
+        private bool _showNotification;
+        private DateTime _notificationTimestamp = DateTime.MinValue;
+        private bool _isCaptureServiceRunning;
+        private bool _isCapturing;
+
+        public string OsdHttpUrl => WebserverFactory.OsdHttpUrl;
+        public string OsdWSUrl => WebserverFactory.OsdWSUrl;
+        public string SensorsWSUrl => WebserverFactory.SensorsWSUrl;
+        public string ActiveSensorsWSUrl => WebserverFactory.ActiveSensorsWSUrl;
+
+        public string CurrentPageName { get; set; } = "Info";
+
+        public IFileRecordInfo RecordInfo { get; set; }
+
+        public bool InfoIsChecked
+        {
+            get { return _infoIsChecked; }
+            set
+            {
+                _infoIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnInfoIsCheckedChanged();
+            }
+        }
+
+        public bool CaptureIsChecked
+        {
+            get { return _captureIsChecked; }
+            set
+            {
+                _captureIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnCaptureIsCheckedChanged();
+            }
+        }
+
+        public bool OverlayIsChecked
+        {
+            get { return _overlayIsChecked; }
+            set
+            {
+                _overlayIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnOverlayIsCheckedChanged();
+            }
+        }
+
+        public bool SingleRecordIsChecked
+        {
+            get { return _singleRecordIsChecked; }
+            set
+            {
+                _singleRecordIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnSingleRecordIsCheckedChanged();
+            }
+        }
+        public bool AggregationIsChecked
+        {
+            get { return _aggregatioIsChecked; }
+            set
+            {
+                _aggregatioIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnAggregationIsCheckedChanged();
+            }
+        }
+
+        public bool RecordComparisonIsChecked
+        {
+            get { return _recordComparisonIsChecked; }
+            set
+            {
+                _recordComparisonIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnRecordComparisonIsCheckedChanged();
+            }
+        }
+
+        public bool SensorIsChecked
+        {
+            get { return _sensorIsChecked; }
+            set
+            {
+                _sensorIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnSensorIsCheckedChanged();
+            }
+        }
+
+        public bool PmdIsChecked
+        {
+            get { return _pmdIsChecked; }
+            set
+            {
+                _pmdIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnPmdIsCheckedChanged();
+            }
+        }
+
+        public bool ReportIsChecked
+        {
+            get { return _reportIsChecked; }
+            set
+            {
+                _reportIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnReportIsCheckedChanged();
+            }
+        }
+
+        public bool CloudIsChecked
+        {
+            get { return _cloudIsChecked; }
+            set
+            {
+                _cloudIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnCloudIsCheckedChanged();
+            }
+        }
+
+        public int SelectedAverageTimeWindow
+        {
+            get { return _appConfiguration.IntervalAverageWindowTime; }
+            set
+            {
+                _appConfiguration.IntervalAverageWindowTime = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SelectedGraphicsAdapter
+        {
+            get { return _appConfiguration.GraphicsAdapter; }
+            set
+            {
+                _appConfiguration.GraphicsAdapter = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int FpsValuesRoundingDigits
+        {
+            get { return _appConfiguration.FpsValuesRoundingDigits; }
+            set
+            {
+                _appConfiguration.FpsValuesRoundingDigits = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string ScreenshotDirectory
+        {
+            get { return _appConfiguration.ScreenshotDirectory; }
+            set
+            {
+                _appConfiguration.ScreenshotDirectory = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int HorizontalGraphExportRes
+        {
+            get { return _appConfiguration.HorizontalGraphExportRes; }
+            set
+            {
+                _appConfiguration.HorizontalGraphExportRes = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int VerticalGraphExportRes
+        {
+            get { return _appConfiguration.VerticalGraphExportRes; }
+            set
+            {
+                _appConfiguration.VerticalGraphExportRes = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public EHardwareInfoSource SelectedHardwareInfoSource
+        {
+            get { return _appConfiguration.HardwareInfoSource.ConvertToEnum<EHardwareInfoSource>(); }
+            set
+            {
+                _appConfiguration.HardwareInfoSource = value.ConvertToString();
+                OnHardwareInfoSourceChanged();
+                RaisePropertyChanged();
+            }
+        }
+        public ECaptureFileMode SelectedCaptureFileMode
+        {
+            get { return _appConfiguration.CaptureFileMode.ConvertToEnum<ECaptureFileMode>(); }
+            set
+            {
+                _appConfiguration.CaptureFileMode = value.ConvertToString();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool HasCustomInfo
+        {
+            get { return _hasCustomInfo; }
+            set
+            {
+                _hasCustomInfo = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomCpuDescription
+        {
+            get { return _appConfiguration.CustomCpuDescription; }
+            set
+            {
+                _appConfiguration.CustomCpuDescription = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomGpuDescription
+        {
+            get { return _appConfiguration.CustomGpuDescription; }
+            set
+            {
+                _appConfiguration.CustomGpuDescription = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomRamDescription
+        {
+            get { return _appConfiguration.CustomRamDescription; }
+            set
+            {
+                _appConfiguration.CustomRamDescription = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomMainboardDescription
+        {
+            get { return _appConfiguration.CustomMainboardDescription; }
+            set
+            {
+                _appConfiguration.CustomMainboardDescription = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsGpuAccelerationActive
+        {
+            get { return _appConfiguration.IsGpuAccelerationActive; }
+            set
+            {
+                _appConfiguration.IsGpuAccelerationActive = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SelectedView
+        {
+            get { return _selectedView; }
+            set
+            {
+                _selectedView = value;
+                RaisePropertyChanged();
+            }
+        }
+
+
+        public bool OptionsViewSelected
+        {
+            get { return _optionsViewSelected; }
+            set
+            {
+                _optionsViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool HardwareViewSelected
+        {
+            get { return _hardwareViewSelected; }
+            set
+            {
+                _hardwareViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool AppViewSelected
+        {
+            get { return _appViewSelected; }
+            set
+            {
+                _appViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+        public bool RemoteViewSelected
+        {
+            get { return _remoteViewSelected; }
+            set
+            {
+                _remoteViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UpdateViewSelected
+        {
+            get { return _updateViewSelected; }
+            set
+            {
+                _updateViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool HelpViewSelected
+        {
+            get { return _helpViewSelected; }
+            set
+            {
+                _helpViewSelected = value;
+                OnViewSelectionChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public IReadOnlyList<LanguageOption> Languages => CxLang.Instance.Languages;
+
+        public string UiLanguage
+        {
+            get => string.IsNullOrWhiteSpace(_appConfiguration.UiLanguage) ? "en" : _appConfiguration.UiLanguage;
+            set
+            {
+                if (value == null || value == _appConfiguration.UiLanguage)
+                    return;
+                _appConfiguration.UiLanguage = value;
+                CxLang.Instance.SetUiLanguage(value);
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(HelpText));
+            }
+        }
+
+        public string OverlayLanguage
+        {
+            get => string.IsNullOrWhiteSpace(_appConfiguration.OverlayLanguage) ? "en" : _appConfiguration.OverlayLanguage;
+            set
+            {
+                if (value == null || value == _appConfiguration.OverlayLanguage)
+                    return;
+                _appConfiguration.OverlayLanguage = value;
+                CxLang.Instance.SetOverlayLanguage(value);
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool StartMinimized
+        {
+            get { return _appConfiguration.StartMinimized; }
+            set
+            {
+                _appConfiguration.StartMinimized = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool MinimizeToTray
+        {
+            get { return _appConfiguration.MinimizeToTray; }
+            set
+            {
+                _appConfiguration.MinimizeToTray = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool Autostart
+        {
+            get { return _appConfiguration.Autostart; }
+            set
+            {
+                _appConfiguration.Autostart = value;
+                RaisePropertyChanged();
+                OnAutostartChanged();
+            }
+        }
+
+        public bool AutoStartIsEnabeld => !PortableModeDetector.IsPortableMode;
+
+        public bool IsDarkModeToggleChecked
+        {
+            get { return _appConfiguration.UseDarkMode; }
+            set
+            {
+                _appConfiguration.UseDarkMode = value;
+                _themeChanged.Publish(new ViewMessages.ThemeChanged());
+            }
+        }
+
+        public bool ShowNotification
+        {
+            get { return _showNotification; }
+            set
+            {
+                _showNotification = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool AppNotificationsActive
+        {
+            get { return _appConfiguration.AppNotificationsActive; }
+            set
+            {
+                _appConfiguration.AppNotificationsActive = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool HideOverlay
+        {
+            get { return _appConfiguration.HideOverlay; }
+            set
+            {
+                _appConfiguration.HideOverlay = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool McpEnabled
+        {
+            get { return _appConfiguration.McpEnabled; }
+            set
+            {
+                _appConfiguration.McpEnabled = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string WebservicePort
+        {
+            get { return _appConfiguration.WebservicePort; }
+            set
+            {
+                _appConfiguration.WebservicePort = value.Replace(" ", string.Empty);
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UseTBPSim
+        {
+            get { return _appConfiguration.UseTBPSim; }
+            set
+            {
+                _appConfiguration.UseTBPSim = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UseDisplayChangeMetrics
+        {
+            get { return _appConfiguration.UseDisplayChangeMetrics; }
+            set
+            {
+                _appConfiguration.UseDisplayChangeMetrics = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UsePcLatency
+        {
+            get { return _appConfiguration.UsePcLatency; }
+            set
+            {
+                _appConfiguration.UsePcLatency = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public Array PresentMonCircularBufferSizeItemsSource
+            => PresentMonCircularBuffer.Sizes.ToArray();
+
+        /// <summary>
+        /// Only reaches PresentMon on its command line, so changing it restarts the capture
+        /// service. <see cref="IsCaptureServiceReady"/> keeps the combo box disabled until it is
+        /// back up.
+        /// </summary>
+        public int PresentMonCircularBufferSize
+        {
+            get { return _appConfiguration.PresentMonCircularBufferSize; }
+            set
+            {
+                if (value == _appConfiguration.PresentMonCircularBufferSize)
+                    return;
+
+                _appConfiguration.PresentMonCircularBufferSize = value;
+                RaisePropertyChanged();
+                RestartCaptureService();
+            }
+        }
+
+        /// <summary>
+        /// True while PresentMon runs properly and no capture is in progress - the only state in
+        /// which the capture service may be restarted.
+        /// </summary>
+        public bool IsCaptureServiceReady => _isCaptureServiceRunning && !_isCapturing;
+
+        public string PingURL
+        {
+            get { return _appConfiguration.PingURL; }
+            set
+            {
+                if (CheckURL(value))
+                    _appConfiguration.PingURL = value;
+                else
+                    _appConfiguration.PingURL = "google.com";
+                RaisePropertyChanged();
+            }
+        }
+
+        public string AppNotification { get; private set; }
+
+        public string HelpText
+        {
+            get
+            {
+                var language = CxLang.Instance.UiLanguage;
+                var localized = Path.Combine("HelpTexts", "ChartControls." + language + ".rtf");
+                var path = File.Exists(localized) ? localized : Path.Combine("HelpTexts", "ChartControls.rtf");
+                return File.ReadAllText(path);
+            }
+        }
+
+        public bool IsCompatibleWithRunningOS => CaptureServiceInfo.IsCompatibleWithRunningOS;
+
+        public Array HardwareInfoSourceItems => Enum.GetValues(typeof(EHardwareInfoSource))
+            .Cast<EHardwareInfoSource>()
+            .ToArray();
+        public Array CaptureFileModeItems => Enum.GetValues(typeof(ECaptureFileMode))
+            .Cast<ECaptureFileMode>()
+            .ToArray();
+
+        public Array AverageTimeWindows => new int[] { 250, 500, 1000 };
+
+        public Array GraphicsAdapters { get; set; }
+
+        public IAppConfiguration AppConfiguration => _appConfiguration;
+
+        public ILogger<ColorbarViewModel> Logger => _logger;
+
+        public IShell Shell => _shell;
+
+        public ICommand SelectScreenshotFolderCommand { get; }
+
+        public ICommand OpenScreenshotFolderCommand { get; }
+
+        public ICommand CloseNotificationCommand { get; }
+
+        public IList<int> RoundingDigits { get; }
+
+        public bool IsLoggedIn { get; private set; }
+
+        public ISensorService SensorService => _sensorService;
+
+        /// <summary>
+        /// Backs the update tab. Shared with the status bar and the embedded update dialog.
+        /// </summary>
+        public UpdateViewModel UpdateViewModel { get; }
+
+        public string ResolveDocumentsPath(string path) => _pathService.ResolveDocumentsPlaceholder(path);
+
+        public ColorbarViewModel(IRegionManager regionManager,
+            IEventAggregator eventAggregator,
+            IAppConfiguration appConfiguration,
+            IPathService pathService,
+            ISensorService sensorService,
+            ILogger<ColorbarViewModel> logger,
+            IShell shell,
+            ISystemInfo systemInfo,
+            LoginManager loginManager,
+            UpdateViewModel updateViewModel,
+            CaptureManager captureManager)
+        {
+            _regionManager = regionManager;
+            _eventAggregator = eventAggregator;
+            _appConfiguration = appConfiguration;
+            _pathService = pathService;
+            _sensorService = sensorService;
+            _logger = logger;
+            _shell = shell;
+            _systemInfo = systemInfo;
+            _loginManager = loginManager;
+            _captureManager = captureManager;
+            UpdateViewModel = updateViewModel;
+            CxLang.Instance.PropertyChanged += (_, __) => RaisePropertyChanged(nameof(HelpText));
+
+            RoundingDigits = new List<int>(Enumerable.Range(0, 8));
+            SelectScreenshotFolderCommand = new DelegateCommand(OnSelectScreenshotFolder);
+            OpenScreenshotFolderCommand = new DelegateCommand(OnOpenScreenshotFolder);
+            CloseNotificationCommand = new DelegateCommand(OnCloseNotification);
+
+            HasCustomInfo = SelectedHardwareInfoSource == EHardwareInfoSource.Custom;
+            IsLoggedIn = _loginManager.State.Token != null;
+
+            // Set GraphicsAdapters on dispatcher async
+            // Wait for sensor service initialization to complete
+            System.Windows.Application.Current.Dispatcher.InvokeAsync(async () =>
+            {
+                await sensorService.SensorServiceCompletionSource.Task;
+
+                GraphicsAdapters = sensorService.GetDetectedGpus()
+                    .Distinct()
+                    .Prepend("Auto")
+                    .ToArray();
+
+                RaisePropertyChanged(nameof(GraphicsAdapters));
+
+                // Seed the custom hardware descriptions only after GPU enumeration is
+                // complete: earlier, GetGraphicCardName() falls back to WMI, which
+                // reports the display-driving adapter - the iGPU on hybrid systems -
+                // and that wrong name would be persisted in the configuration.
+                SetHardwareInfoDefaultsFromConfig();
+            });
+
+            _captureManager.CaptureServiceRunningStream
+                .ObserveOnDispatcher()
+                .Subscribe(isRunning =>
+                {
+                    _isCaptureServiceRunning = isRunning;
+                    RaisePropertyChanged(nameof(IsCaptureServiceReady));
+                });
+
+            // Restarting the capture service kills a recording in progress, so a capture started
+            // while this popup is open has to lock the setting as well.
+            _captureManager.CaptureStatusChange
+                .ObserveOnDispatcher()
+                .Subscribe(status =>
+                {
+                    _isCapturing = status.Status != null && status.Status != ECaptureStatus.Stopped;
+                    RaisePropertyChanged(nameof(IsCaptureServiceReady));
+                });
+
+            SetAggregatorEvents();
+            SubscribeToAggregatorEvents();
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    OnAutostartChanged(true);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Unable to clean autostart configuration.");
+                }
+            });
+
+            if (AppNotificationsActive)
+            {
+                GetAppNotification();
+            }
+        }
+
+        public void OpenLoginWindow()
+        {
+            _openLoginWindow.Publish(new AppMessages.OpenLoginWindow());
+        }
+
+        public async void Logout()
+        {
+            await _loginManager.Logout();
+        }
+
+        // The restart waits for PresentMon's ETW session to go down and come back up, which must
+        // not block the UI thread. IsCaptureServiceReady goes false right away so the setting
+        // cannot be changed again while the service is down; the capture service pushes it back
+        // to true once PresentMon delivers data again.
+        private void RestartCaptureService()
+        {
+            _isCaptureServiceRunning = false;
+            RaisePropertyChanged(nameof(IsCaptureServiceReady));
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    _captureManager.RestartCaptureService();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Unable to restart the capture service.");
+                }
+            });
+        }
+
+        private void SetHardwareInfoDefaultsFromConfig()
+        {
+            if (CustomCpuDescription == "CPU")
+                CustomCpuDescription = _systemInfo.GetProcessorName();
+
+            if (CustomGpuDescription == "GPU")
+                CustomGpuDescription = _systemInfo.GetGraphicCardName();
+
+            if (CustomRamDescription == "RAM")
+                CustomRamDescription = _systemInfo.GetSystemRAMInfoName();
+
+            if (CustomMainboardDescription == "Mainboard")
+                CustomMainboardDescription = _systemInfo.GetMotherboardName();
+        }
+
+        private void OnSelectScreenshotFolder()
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog();
+
+            if (dialog.ShowDialog() == true)
+            {
+                _appConfiguration.ScreenshotDirectory = dialog.FolderName;
+                ScreenshotDirectory = dialog.FolderName;
+            }
+        }
+
+        private void OnOpenScreenshotFolder()
+        {
+            try
+            {
+                var path = _pathService.ResolveDocumentsPlaceholder(_appConfiguration.ScreenshotDirectory);
+                // UseShellExecute is required to open a folder in Explorer on .NET Core+
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }
+            catch { _logger.LogError("Error while opening screenshot folder."); }
+        }
+
+        private void OnInfoIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "InfoView");
+            CurrentPageName = "Info";
+        }
+
+        private void OnCaptureIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "CaptureView");
+            CurrentPageName = "Capture";
+        }
+        private void OnOverlayIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "OverlayView");
+            CurrentPageName = "Overlay";
+        }
+
+        private void OnSingleRecordIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "DataView");
+            CurrentPageName = "Analysis";
+        }
+
+        private void OnAggregationIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "AggregationView");
+            CurrentPageName = "Aggregation";
+        }
+
+        private void OnRecordComparisonIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "ComparisonView");
+            CurrentPageName = "Comparison";
+        }
+
+        private void OnSensorIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "SensorView");
+            CurrentPageName = "Sensor";
+        }
+
+        private void OnPmdIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "PmdView");
+            CurrentPageName = "Pmd";
+        }
+
+        private void OnReportIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "ReportView");
+            CurrentPageName = "Report";
+        }
+
+        private void OnCloudIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "CloudView");
+            CurrentPageName = "Cloud";
+        }
+
+        private void OnHardwareInfoSourceChanged()
+        {
+            // mange visibility
+            HasCustomInfo = SelectedHardwareInfoSource == EHardwareInfoSource.Custom;
+
+            // manage defaults
+            SetHardwareInfoDefaultsFromConfig();
+        }
+
+        private void OnViewSelectionChanged()
+        {
+            if (OptionsViewSelected)
+                SelectedView = "Options";
+
+            if(HardwareViewSelected)
+                SelectedView = "Hardware";
+
+            if (AppViewSelected)
+                SelectedView = "App";
+
+            if (RemoteViewSelected)
+            {
+                SelectedView = "Remote";
+                RaisePropertyChanged(nameof(OsdHttpUrl));
+                RaisePropertyChanged(nameof(OsdWSUrl));
+                RaisePropertyChanged(nameof(SensorsWSUrl));
+                RaisePropertyChanged(nameof(ActiveSensorsWSUrl));
+            }
+
+            if (UpdateViewSelected)
+                SelectedView = "Update";
+
+            if (HelpViewSelected)
+                SelectedView = "Help";
+        }
+
+        private void OnCloseNotification()
+        {
+            // save notification timestamp to config and disable notification
+            _appConfiguration.LastAppNotificationTimestamp = _notificationTimestamp;
+            ShowNotification = false;
+        }
+
+        public void OnAutostartChanged(bool cleanup = false)
+        {
+            if (PortableModeDetector.IsPortableMode)
+                return;
+
+            const string appName = "CapFrameX";
+
+            try
+            {
+                using (TaskService ts = new TaskService())
+                {
+                    // Refresh existing tasks as well to repair DLL targets and stale installation paths.
+                    if (Autostart)
+                    {
+                        // On modern .NET, the entry assembly is CapFrameX.dll; Windows must launch the apphost EXE.
+                        string appDirectory = AppContext.BaseDirectory;
+                        string appPath = Path.Combine(appDirectory, appName + ".exe");
+                        string userId = Environment.UserDomainName + "\\" + Environment.UserName;
+
+                        TaskDefinition td = ts.NewTask();
+                        td.RegistrationInfo.Description = "Autostart";
+                        td.Settings.DisallowStartIfOnBatteries = false;
+                        td.Settings.StopIfGoingOnBatteries = false;
+                        td.Principal.RunLevel = TaskRunLevel.Highest;
+
+                        var trigger = new LogonTrigger();
+                        trigger.UserId = userId;
+                        trigger.Delay = TimeSpan.FromSeconds(20);
+
+                        td.Triggers.Add(trigger);
+                        td.Actions.Add(new ExecAction(appPath, workingDirectory: appDirectory));
+
+                        using var task = ts.RootFolder.RegisterTaskDefinition(appName, td, TaskCreation.CreateOrUpdate,
+                            userId, null, TaskLogonType.InteractiveToken);
+                        _logger.LogInformation("Registered autostart task for {AppPath}.", appPath);
+                    }
+                    else if (ts.RootFolder.GetTasks().Any(t => t.Name == appName))
+                    {
+                        ts.RootFolder.DeleteTask(appName);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Unable to perform autostart task");
+            }
+
+            if (cleanup)
+            {
+                // delete old registry autostart option(remove in later versions)
+                try
+                {
+                    RegistryKey startKey = Registry.LocalMachine.OpenSubKey("SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+                    startKey?.DeleteValue(appName);
+                }
+                catch (ArgumentException) { }
+            }
+        }
+
+        private void SetAggregatorEvents()
+        {
+            OptionPopupClosed = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.OptionPopupClosed>>();
+            _openLoginWindow = _eventAggregator.GetEvent<PubSubEvent<AppMessages.OpenLoginWindow>>();
+            _themeChanged = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.ThemeChanged>>();
+        }
+        private void SubscribeToAggregatorEvents()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<AppMessages.LoginState>>()
+                .Subscribe(state =>
+                {
+                    IsLoggedIn = state.IsLoggedIn;
+                    RaisePropertyChanged(nameof(IsLoggedIn));
+                });
+
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.UpdateSession>>()
+                .Subscribe(msg =>
+                {
+                    RecordInfo = msg.RecordInfo;
+                });
+        }
+
+        private async void GetAppNotification()
+        {
+            // read notification timestamp from server and compare it with config.
+            // If request fails or timestamp is older do nothing, else show notification
+            try
+            {
+                using (var client = new HttpClient()
+                {
+                    BaseAddress = new Uri(ConfigurationManager.AppSettings["WebserviceUri"])
+                })
+                {
+                    client.DefaultRequestHeaders.AddCXClientUserAgent();
+                    var response = await client.GetAsync("appnotification");
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var notification = JsonConvert.DeserializeObject<SqAppNotificationDataDTO>(await response.Content.ReadAsStringAsync());
+                        if (notification.IsActive && notification.Timestamp > _appConfiguration.LastAppNotificationTimestamp)
+                        {
+                            _notificationTimestamp = notification.Timestamp;
+                            AppNotification = notification.Message;
+                            RaisePropertyChanged(nameof(AppNotification));
+                            ShowNotification = true;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                ShowNotification = false;
+            }
+        }
+
+        private bool CheckURL(string url)
+        {
+            Ping pingSender = new Ping();
+            try
+            {
+                PingReply reply = pingSender.Send(url);
+                return true;
+            }
+            catch { return false; }
+        }
+    }
+}

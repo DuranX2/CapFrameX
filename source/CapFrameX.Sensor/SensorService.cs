@@ -1,0 +1,1019 @@
+﻿using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data;
+using CapFrameX.Data.Session.Contracts;
+using CapFrameX.Extensions.NetStandard;
+using CapFrameX.Monitoring.Contracts;
+using LibreHardwareMonitor.Hardware;
+using LibreHardwareMonitor.Hardware.Gpu;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reactive.Concurrency;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CapFrameX.Sensor
+{
+    public class SensorService : ISensorService
+    {
+        private GpuSensorCache _gpuSensorCache;
+        private string _gpuSensorCacheAdapterSelection;
+        private readonly object _lockComputer = new object();
+        private readonly object _lockSensorUpdate = new object();
+        private readonly ISensorConfig _sensorConfig;
+        private readonly IRTSSService _rTSSService;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IRemoteOverlayDemand _remoteOverlayDemand;
+        private readonly ILogger<SensorService> _logger;
+        private readonly IDisposable _logDisposable;
+        private readonly IDisposable _sensorPollTimerDisposable;
+        private readonly Task<IPmcReaderSensorPlugin> _pmcReaderInitializationTask;
+        private readonly BehaviorSubject<(DateTime, Dictionary<ISensorEntry, float>)> _coreSensorSnapshotSubject;
+        private readonly SingleFlightSensorPoller<(DateTime, Dictionary<ISensorEntry, float>)> _sensorPoller;
+
+        private Computer _computer;
+        private SessionSensorDataLive _sessionSensorDataLive;
+        private volatile bool _isLoggingActive = false;
+        private volatile bool _isServiceAlive = true;
+
+        // Upper bound for the LibreHardwareMonitor computer teardown at shutdown. Vendor GPU
+        // libraries (AMD ADLX, Intel IGCL) can deadlock in their COM teardown on some systems;
+        // if Computer.Close() overruns this, we abandon it so the application still exits.
+        private static readonly TimeSpan _shutdownComputerTimeout = TimeSpan.FromSeconds(3);
+
+        private ISubject<TimeSpan> _sensorUpdateSubject;
+        private ISubject<TimeSpan> _osdUpdateSubject;
+        private ISubject<TimeSpan> _loggingUpdateSubject;
+        private TimeSpan _currentLoggingTimespan;
+        private TimeSpan _currentOSDTimespan;
+
+        private TimeSpan CurrentSensorTimespan
+        {
+            get => SelectSensorTimespan(
+                _currentLoggingTimespan,
+                _currentOSDTimespan,
+                _isLoggingActive,
+                UseSensorLogging);
+        }
+
+        public IObservable<(DateTime, Dictionary<ISensorEntry, float>)> SensorSnapshotStream { get; private set; }
+
+        public IObservable<TimeSpan> OsdUpdateStream => _osdUpdateSubject.AsObservable();
+
+        public Subject<bool> IsLoggingActiveStream { get; }
+
+        public bool UseSensorLogging => _appConfiguration.UseSensorLogging;
+
+        public bool IsOverlayActive => _appConfiguration.IsOverlayActive;
+
+        public Func<bool> IsSensorWebsocketActive { get; set; } = () => false;
+
+        public TaskCompletionSource<bool> SensorServiceCompletionSource { get; }
+           = new TaskCompletionSource<bool>();
+
+        public SensorService(IAppConfiguration appConfig, ISensorConfig sensorConfig,
+            IRTSSService rTSSService,
+            IRemoteOverlayDemand remoteOverlayDemand,
+            ILogger<SensorService> logger)
+        {
+            _appConfiguration = appConfig;
+            _remoteOverlayDemand = remoteOverlayDemand;
+            _sensorConfig = sensorConfig;
+            _rTSSService = rTSSService;
+            _logger = logger;
+            _currentOSDTimespan = TimeSpan.FromMilliseconds(_appConfiguration.OSDRefreshPeriod);
+            _currentLoggingTimespan = TimeSpan.FromMilliseconds(_appConfiguration.SensorLoggingRefreshPeriod);
+            _loggingUpdateSubject = new BehaviorSubject<TimeSpan>(_currentLoggingTimespan);
+            _osdUpdateSubject = new BehaviorSubject<TimeSpan>(_currentOSDTimespan);
+            _sensorUpdateSubject = new BehaviorSubject<TimeSpan>(CurrentSensorTimespan);
+            IsLoggingActiveStream = new Subject<bool>();
+
+            _sensorConfig.SensorLoggingRefreshPeriod = _appConfiguration.SensorLoggingRefreshPeriod;
+
+            Observable.FromAsync(() => StartOpenHardwareMonitor())
+               .Delay(TimeSpan.FromMilliseconds(500))
+               .Subscribe(t =>
+               {
+                   SensorServiceCompletionSource.SetResult(true);
+               });
+
+            _coreSensorSnapshotSubject = new BehaviorSubject<(DateTime, Dictionary<ISensorEntry, float>)>(
+                (DateTime.UtcNow, new Dictionary<ISensorEntry, float>()));
+            _sensorPoller = new SingleFlightSensorPoller<(DateTime, Dictionary<ISensorEntry, float>)>(
+                GetTimeStampedSensorValues,
+                snapshot => _coreSensorSnapshotSubject.OnNext(snapshot),
+                exception => _logger.LogError(exception, "Hardware sensor polling failed."),
+                "CapFrameX hardware sensor polling",
+                ThreadPriority.Lowest);
+
+            _pmcReaderInitializationTask = InitializePmcReaderPluginAsync();
+            var pluginPollingActivityStream = _sensorUpdateSubject
+                .Select(timespan => Observable.Concat(Observable.Return(-1L), Observable.Interval(timespan)))
+                .Switch()
+                .Select(_ => _isServiceAlive && ShouldPollPmcReaderSensors());
+
+            // Filtering snapshots after subscribing to the plugin is too late: its interval has
+            // already read every PMC and changed thread affinity before Where can discard the
+            // result. Switch the subscription itself instead, so inactive consumers leave only
+            // the cheap activity timer running and perform no ring-0 counter reads.
+            var pluginSensorStream = SensorStreamGate.WhileActive(
+                pluginPollingActivityStream,
+                CreatePmcReaderSensorStream,
+                () => (DateTime.UtcNow, new Dictionary<ISensorEntry, float>()));
+
+            SensorSnapshotStream = _coreSensorSnapshotSubject
+               .CombineLatest(
+                    pluginSensorStream.StartWith((DateTime.UtcNow, new Dictionary<ISensorEntry, float>())),
+                    MergeSensorSnapshots)
+               // The overlay refresh reads this replayed, immutable-after-publication snapshot.
+               // Sensor I/O is never part of the refresh call stack; an unfinished poll simply
+               // leaves this value unchanged for another display cycle.
+               .Replay(1)
+               .RefCount();
+
+            _logDisposable = SensorSnapshotStream
+                 .Sample(_loggingUpdateSubject.Select(timespan => Observable.Concat(Observable.Return(-1L), Observable.Interval(timespan))).Switch())
+                 .Where(_ => _isServiceAlive)
+                 .Where(_ => _isLoggingActive && UseSensorLogging)
+                 .SubscribeOn(Scheduler.Default)
+                 .Subscribe(sensorData => LogCurrentValues(sensorData.Item2, sensorData.Item1));
+
+            _sensorPollTimerDisposable = _sensorUpdateSubject
+               .Select(timespan => Observable.Concat(Observable.Return(-1L), Observable.Interval(timespan)))
+               .Switch()
+               .Where(_ => _isServiceAlive)
+               .Select((_, index) => index)
+               .Where(index => index == 0 || HasActiveSensorConsumer())
+               .Subscribe(
+                    index => _sensorPoller.TryRequest(forcePoll: index == 0),
+                    exception => _logger.LogError(exception, "Hardware sensor polling timer failed."));
+
+            _logger.LogDebug("{componentName} Ready", this.GetType().Name);
+        }
+
+        public void SetLoggingInterval(TimeSpan timeSpan)
+        {
+            _currentLoggingTimespan = timeSpan;
+            UpdateSensorInterval();
+            _loggingUpdateSubject.OnNext(timeSpan);
+        }
+
+        public void SetOSDInterval(TimeSpan timeSpan)
+        {
+            _currentOSDTimespan = timeSpan;
+            UpdateSensorInterval();
+            _osdUpdateSubject.OnNext(timeSpan);
+        }
+
+        public string GetSensorTypeString(EOverlayEntryType entryType, string stableIdentifier)
+        {
+            if (stableIdentifier == null)
+                return string.Empty;
+
+            // StableIdentifier format: "{HardwareName}/{sensorTypeLowercase}/{sensorName}"
+            var parts = stableIdentifier.Split('/');
+            if (parts.Length < 2)
+                return string.Empty;
+
+            string prefix;
+            switch (entryType)
+            {
+                case EOverlayEntryType.CPU:
+                    prefix = "CPU";
+                    break;
+                case EOverlayEntryType.GPU:
+                    prefix = "GPU";
+                    break;
+                case EOverlayEntryType.HDD:
+                    prefix = "Storage";
+                    break;
+                default:
+                    return string.Empty;
+            }
+
+            var sensorSubtype = parts[1];
+            switch (sensorSubtype)
+            {
+                case "load":
+                    return $"{prefix} Load";
+                case "clock":
+                    return $"{prefix} Clock";
+                case "power":
+                    return $"{prefix} Power";
+                case "temperature":
+                    return $"{prefix} Temperature";
+                case "voltage":
+                    return $"{prefix} Voltage";
+                case "throughput":
+                    return $"{prefix} Throughput";
+                case "factor":
+                    return prefix == "GPU" ? "GPU Limits" : string.Empty;
+                default:
+                    return string.Empty;
+            }
+        }
+
+        private Task StartOpenHardwareMonitor()
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    var simulationConfiguration = _appConfiguration.HardwareSimulationConfiguration;
+                    _computer = simulationConfiguration != null
+                        ? new Computer(simulationConfiguration, _sensorConfig)
+                        : new Computer(_sensorConfig);
+                    _computer.Open();
+                    _computer.IsCpuEnabled = true;
+                    _computer.IsGpuEnabled = true;
+                    _computer.IsMemoryEnabled = true;
+                    _computer.IsStorageEnabled = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error while starting OpenHardwareMonitor");
+                }
+            });
+        }
+
+        private void UpdateSensorInterval()
+        {
+            _sensorConfig.SensorLoggingRefreshPeriod = _appConfiguration.SensorLoggingRefreshPeriod;
+            _sensorUpdateSubject.OnNext(CurrentSensorTimespan);
+        }
+
+        public IEnumerable<string> GetDetectedGpus()
+        {
+            IEnumerable<IHardware> gpus = null;
+            lock (_lockComputer)
+            {
+                gpus = _computer?.Hardware
+               .Where(hdw => hdw.HardwareType == HardwareType.GpuAmd
+                   || hdw.HardwareType == HardwareType.GpuNvidia
+                   || hdw.HardwareType == HardwareType.GpuIntel);
+            }
+
+            return gpus.Select(gpu => gpu.Name);
+        }
+
+        public ISessionSensorData2 GetSensorSessionData()
+        {
+            return UseSensorLogging ? _sessionSensorDataLive
+                .ToSessionSensorData() : null;
+        }
+
+        public void StartSensorLogging()
+        {
+            if (UseSensorLogging)
+            {
+                _sessionSensorDataLive = new SessionSensorDataLive();
+                // Logging must be activated after creating a session data object
+                // because of time stamp consistency
+                _isLoggingActive = true;
+                _sensorConfig.IsSensorLoggingActive = true;
+                _sensorUpdateSubject.OnNext(CurrentSensorTimespan);
+            }
+            else
+            {
+                _sensorConfig.IsSensorLoggingActive = false;
+            }
+        }
+
+        public async Task StopSensorLogging()
+        {
+            await Task.Delay(_currentLoggingTimespan);
+            _isLoggingActive = false;
+            _sensorConfig.IsSensorLoggingActive = false;
+            _sensorUpdateSubject.OnNext(CurrentSensorTimespan);
+        }
+
+        public async Task<IEnumerable<ISensorEntry>> GetSensorEntries()
+        {
+            await SensorServiceCompletionSource.Task;
+            var entries = new List<ISensorEntry>();
+            try
+            {
+                var sensors = GetSensors();
+                if (sensors != null)
+                {
+                    foreach (var sensor in sensors)
+                    {
+                        if (sensor != null)
+                        {
+                            entries.Add(SensorEntry.FromSensor(sensor));
+                        }
+                    }
+                }
+
+                var pmcReaderPlugin = await _pmcReaderInitializationTask.ConfigureAwait(false);
+                if (pmcReaderPlugin != null)
+                {
+                    var pluginEntries = await pmcReaderPlugin.GetSensorEntriesAsync().ConfigureAwait(false);
+                    if (pluginEntries != null)
+                        entries.AddRange(pluginEntries);
+                }
+            }
+            catch
+            {
+                // Don't write periodic log entries
+            }
+
+            return entries;
+        }
+
+        private static (DateTime, Dictionary<ISensorEntry, float>) MergeSensorSnapshots(
+            (DateTime Timestamp, Dictionary<ISensorEntry, float> Values) coreSnapshot,
+            (DateTime Timestamp, Dictionary<ISensorEntry, float> Values) pluginSnapshot)
+        {
+            var merged = new Dictionary<string, KeyValuePair<ISensorEntry, float>>(StringComparer.Ordinal);
+
+            foreach (var entry in coreSnapshot.Values)
+                merged[entry.Key.Identifier] = entry;
+
+            foreach (var entry in pluginSnapshot.Values)
+                merged[entry.Key.Identifier] = entry;
+
+            var timestamp = coreSnapshot.Timestamp >= pluginSnapshot.Timestamp
+                ? coreSnapshot.Timestamp
+                : pluginSnapshot.Timestamp;
+
+            return (timestamp, merged.Values.ToDictionary(kvp => kvp.Key, kvp => kvp.Value));
+        }
+
+        private void LogCurrentValues(Dictionary<ISensorEntry, float> currentValues, DateTime timestamp)
+        {
+            _sessionSensorDataLive.AddMeasureTime(timestamp);
+            foreach (var sensorPair in currentValues)
+            {
+                if (_sensorConfig.IsSelectedForLogging(sensorPair.Key.Identifier))
+                {
+                    _sessionSensorDataLive.AddSensorValue(sensorPair.Key, sensorPair.Value);
+                }
+            }
+            _sessionSensorDataLive.CompleteMeasure();
+        }
+
+        private (DateTime, Dictionary<ISensorEntry, float>) GetTimeStampedSensorValues(
+            bool forceHardwarePoll)
+        {
+            // Waiting for one-time hardware discovery is safe here because this method is called
+            // exclusively by the dedicated polling worker, never by an OSD/UI refresh thread.
+            SensorServiceCompletionSource.Task.GetAwaiter().GetResult();
+            var dict = new Dictionary<ISensorEntry, float>();
+            Thread currentThread = Thread.CurrentThread;
+            ThreadPriority previousPriority = ThreadPriority.Normal;
+            bool priorityChanged = false;
+            try
+            {
+                if (forceHardwarePoll || ShouldPollHardwareSensors())
+                {
+                    // Ryzen clock collection moves this polling thread across the physical
+                    // cores. It must never displace a game thread on each core in one burst.
+                    // Lowest priority plus the worker's Win32 background mode deliberately
+                    // trades sensor freshness for frame-time stability under load.
+                    try
+                    {
+                        previousPriority = currentThread.Priority;
+                        if (previousPriority > ThreadPriority.Lowest)
+                        {
+                            currentThread.Priority = ThreadPriority.Lowest;
+                            priorityChanged = true;
+                        }
+                    }
+                    catch
+                    {
+                        // Priority lowering is best-effort. Sensor acquisition must still work
+                        // on runtimes which do not expose a mutable native thread priority.
+                    }
+
+                    var sensors = GetSensors();
+                    if (sensors != null)
+                    {
+                        foreach (var sensor in sensors)
+                        {
+                            if (sensor.Value != null)
+                            {
+                                string identifier = sensor.Identifier.ToString();
+                                if (!_sensorConfig.GetSensorEvaluate(identifier))
+                                    continue;
+
+                                dict.Add(new SensorEntry()
+                                {
+                                    Identifier = identifier,
+                                    Value = sensor.Value,
+                                    Name = sensor.Name,
+                                    SensorType = sensor.SensorType.ToString(),
+                                    HardwareType = sensor.Hardware.HardwareType.ToString(),
+                                    HardwareName = sensor.Hardware.Name
+                                },
+                                sensor.Value.Value);
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Don't write periodic log entries
+            }
+            finally
+            {
+                if (priorityChanged)
+                {
+                    try
+                    {
+                        currentThread.Priority = previousPriority;
+                    }
+                    catch
+                    {
+                        // The work item is complete; failure to restore a terminating scheduler
+                        // thread must not tear down the sensor stream.
+                    }
+                }
+            }
+
+            return (DateTime.UtcNow, dict);
+        }
+
+        private IObservable<(DateTime, Dictionary<ISensorEntry, float>)> CreatePmcReaderSensorStream()
+        {
+            return Observable.FromAsync(() => _pmcReaderInitializationTask)
+                .SelectMany(plugin => plugin?.SensorSnapshotStream
+                    ?? Observable.Empty<(DateTime, Dictionary<ISensorEntry, float>)>());
+        }
+
+        internal bool HasActiveSensorConsumer()
+        {
+            return SelectSensorPollTimerState(
+                IsOverlayActive,
+                _remoteOverlayDemand.IsActive,
+                _isLoggingActive,
+                UseSensorLogging,
+                IsSensorWebsocketActive(),
+                _sensorConfig.EvaluateAllSensors);
+        }
+
+        internal bool ShouldPollHardwareSensors()
+        {
+            return SelectHardwarePollingState(
+                IsOverlayActive,
+                _remoteOverlayDemand.IsActive,
+                _sensorConfig.HasSelectedOverlaySensors,
+                _isLoggingActive,
+                UseSensorLogging,
+                IsSensorWebsocketActive(),
+                _sensorConfig.EvaluateAllSensors);
+        }
+
+        internal bool ShouldPollPmcReaderSensors()
+        {
+            bool websocketActive = IsSensorWebsocketActive();
+            return SelectPmcReaderPollingState(
+                IsOverlayActive,
+                _remoteOverlayDemand.IsActive,
+                _sensorConfig.HasSelectedPmcOverlaySensors,
+                _isLoggingActive,
+                UseSensorLogging,
+                _sensorConfig.HasSelectedPmcLoggingSensors,
+                websocketActive,
+                _sensorConfig.WsSensorsEnabled,
+                _sensorConfig.WsActiveSensorsEnabled,
+                _sensorConfig.EvaluateAllSensors);
+        }
+
+        // The overlay entries, including the selected overlay sensors, have two consumers: the
+        // active overlay and remote API clients (IRemoteOverlayDemand), which read them with the
+        // overlay switched off.
+        internal static bool SelectSensorPollTimerState(
+            bool overlayActive,
+            bool remoteOverlayDemand,
+            bool loggingActive,
+            bool useSensorLogging,
+            bool websocketActive,
+            bool evaluateAllSensors)
+        {
+            return overlayActive
+                || remoteOverlayDemand
+                || (loggingActive && useSensorLogging)
+                || websocketActive
+                || evaluateAllSensors;
+        }
+
+        internal static bool SelectHardwarePollingState(
+            bool overlayActive,
+            bool remoteOverlayDemand,
+            bool hasSelectedOverlaySensors,
+            bool loggingActive,
+            bool useSensorLogging,
+            bool websocketActive,
+            bool evaluateAllSensors)
+        {
+            return ((overlayActive || remoteOverlayDemand) && hasSelectedOverlaySensors)
+                || (loggingActive && useSensorLogging)
+                || websocketActive
+                || evaluateAllSensors;
+        }
+
+        internal static bool SelectPmcReaderPollingState(
+            bool overlayActive,
+            bool remoteOverlayDemand,
+            bool hasSelectedOverlayPmcSensors,
+            bool loggingActive,
+            bool useSensorLogging,
+            bool hasSelectedLoggingPmcSensors,
+            bool websocketActive,
+            bool websocketAllSensors,
+            bool websocketActiveSensors,
+            bool evaluateAllSensors)
+        {
+            bool selectedLoggingConsumer = (loggingActive && useSensorLogging)
+                || (websocketActive && websocketActiveSensors);
+
+            return ((overlayActive || remoteOverlayDemand) && hasSelectedOverlayPmcSensors)
+                || (selectedLoggingConsumer && hasSelectedLoggingPmcSensors)
+                || (websocketActive && websocketAllSensors)
+                || evaluateAllSensors;
+        }
+
+        internal static TimeSpan SelectSensorTimespan(
+            TimeSpan loggingTimespan,
+            TimeSpan osdTimespan,
+            bool isLoggingActive,
+            bool useSensorLogging)
+        {
+            if (!isLoggingActive || !useSensorLogging)
+                return osdTimespan;
+
+            return loggingTimespan < osdTimespan ? loggingTimespan : osdTimespan;
+        }
+
+        private async Task<IPmcReaderSensorPlugin> InitializePmcReaderPluginAsync()
+        {
+#if DEBUG
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+#endif
+            // Assembly loading and plugin construction can execute arbitrary plugin code, so they
+            // belong to the asynchronous setup path as well as the expensive hardware discovery.
+            var plugin = await Task.Run(() => TryLoadPmcReaderPlugin()).ConfigureAwait(false);
+            if (plugin == null)
+                return null;
+
+            try
+            {
+                await plugin.InitializeAsync(_sensorUpdateSubject.AsObservable()).ConfigureAwait(false);
+#if DEBUG
+                stopwatch.Stop();
+                _logger.LogDebug("PmcReader plugin setup completed asynchronously in {elapsedMilliseconds:F2} ms.",
+                    stopwatch.Elapsed.TotalMilliseconds);
+#endif
+                return plugin;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize PmcReader plugin.");
+                try
+                {
+                    plugin.Dispose();
+                }
+                catch
+                {
+                    // Preserve the initialization exception; teardown is best-effort here.
+                }
+                return null;
+            }
+        }
+
+        private IPmcReaderSensorPlugin TryLoadPmcReaderPlugin()
+        {
+            try
+            {
+                var baseDir = AppContext.BaseDirectory;
+                var pluginPath = Path.Combine(baseDir, "CapFrameX.PmcReader.Plugin.dll");
+                if (!File.Exists(pluginPath))
+                {
+                    _logger.LogInformation("PmcReader plugin not present ({pluginPath}); PMC sensors disabled.", pluginPath);
+                    return null;
+                }
+                // Use UnsafeLoadFrom instead of LoadFrom: the plugin DLL ships inside
+                // the portable zip / installer download, so Windows tags it with the
+                // "Mark of the Web" (Zone.Identifier stream). On .NET Framework,
+                // Assembly.LoadFrom refuses such a local-but-remote-origin assembly with
+                // FileLoadException/NotSupportedException (HRESULT 0x80131515) unless
+                // loadFromRemoteSources is enabled. UnsafeLoadFrom loads the trusted
+                // local plugin while bypassing that remote-source check, so the plugin
+                // works without users having to unblock the file.
+                var assembly = Assembly.UnsafeLoadFrom(pluginPath);
+                var pluginType = assembly.GetTypes()
+                    .FirstOrDefault(t => typeof(IPmcReaderSensorPlugin).IsAssignableFrom(t)
+                        && t.IsClass
+                        && !t.IsAbstract);
+
+                if (pluginType == null)
+                {
+                    _logger.LogWarning("PmcReader plugin assembly loaded but no IPmcReaderSensorPlugin implementation was found.");
+                    return null;
+                }
+
+                _logger.LogInformation("PmcReader plugin loaded.");
+                return (IPmcReaderSensorPlugin)Activator.CreateInstance(pluginType);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load PmcReader plugin.");
+                return null;
+            }
+        }
+
+        private IEnumerable<ISensor> GetSensors()
+        {
+            List<ISensor> sensors;
+            GpuSensorCache gpuCache;
+            List<IHardware> hardware;
+            List<IHardware> gpuHardware;
+            var selectedAdapter = _appConfiguration.GraphicsAdapter;
+
+            lock (_lockSensorUpdate)
+            {
+                // Only protect the mutable Computer graph while taking a snapshot. Vendor and
+                // driver I/O must not run while holding _lockComputer, otherwise one stalled
+                // device blocks unrelated metadata/UI access and shutdown coordination.
+                lock (_lockComputer)
+                {
+                    hardware = _computer?.Hardware?.ToList() ?? new List<IHardware>();
+                }
+
+                sensors = new List<ISensor>(capacity: 1024);
+                gpuHardware = hardware.Where(hw => IsGpu(hw.HardwareType)).ToList();
+
+                foreach (var hw in hardware)
+                {
+                    bool shouldUpdate = ShouldUpdateHardware(hw, gpuHardware, selectedAdapter);
+                    if (shouldUpdate)
+                        hw.Update();
+
+                    CollectSensors(hw, sensors, shouldUpdate);
+                }
+
+                lock (_lockComputer)
+                {
+                    if (!string.Equals(_gpuSensorCacheAdapterSelection, selectedAdapter, StringComparison.Ordinal))
+                    {
+                        _gpuSensorCache = null;
+                        _gpuSensorCacheAdapterSelection = selectedAdapter;
+                    }
+
+                    // Cache GPU count + GPU sensors once while the Computer graph is stable.
+                    gpuCache = GetOrBuildGpuCacheLocked();
+                }
+            }
+
+            // If a specific adapter was selected, filter GPU sensors to that adapter name.
+            if (!string.Equals(selectedAdapter, "Auto", StringComparison.Ordinal))
+            {
+                if (gpuCache.SensorIdsByAdapterName.TryGetValue(selectedAdapter, out var allowedGpuIds))
+                {
+                    return sensors.Where(s =>
+                    {
+                        if (!IsGpu(s.Hardware.HardwareType))
+                            return true;
+
+                        // Only pay Identifier.ToString() for GPU sensors
+                        return allowedGpuIds.Contains(s.Identifier.ToString());
+                    });
+                }
+
+                // Selected adapter not found: keep non-GPU sensors, drop GPU sensors.
+                return sensors.Where(s => !IsGpu(s.Hardware.HardwareType));
+            }
+
+            // Auto behavior: if there is no discrete GPU to prefer, keep every detected GPU.
+            // Otherwise expose only discrete-GPU sensors, matching ShouldUpdateHardware().
+            if (gpuHardware.Count <= 1 || !gpuHardware.Any(IsDiscreteGpu))
+                return sensors;
+
+            // Auto behavior: filter iGPUs for GPU sensors only
+            return sensors.Where(s =>
+            {
+                if (!IsGpu(s.Hardware.HardwareType))
+                    return true;
+
+                // Use cached per-sensor GPU info when available (avoids repeated casts / name checks)
+                var id = s.Identifier.ToString();
+                if (gpuCache.SensorsById.TryGetValue(id, out var info))
+                {                   
+                    return info.IsDiscreteGpu;
+                }
+
+                // Fallback (should be rare)
+                return (s.Hardware as GenericGpu)?.IsDiscreteGpu ?? true;
+            });
+        }
+
+        private GpuSensorCache GetOrBuildGpuCacheLocked()
+        {
+            // Callers must hold _lockComputer
+            if (_gpuSensorCache != null)
+                return _gpuSensorCache;
+
+            var sensorsById = new Dictionary<string, GpuSensorInfo>(StringComparer.Ordinal);
+            var idsByAdapterName = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+
+            int gpuCount = 0;
+            foreach (var hw in _computer.Hardware)
+            {
+                if (!IsGpu(hw.HardwareType))
+                    continue;
+
+                gpuCount++;
+                AddGpuSensorsToCache(hw, sensorsById, idsByAdapterName);
+            }
+
+            _gpuSensorCache = new GpuSensorCache(gpuCount, sensorsById, idsByAdapterName);
+            return _gpuSensorCache;
+        }
+
+        private static void AddGpuSensorsToCache(
+            IHardware gpuHardware,
+            Dictionary<string, GpuSensorInfo> sensorsById,
+            Dictionary<string, HashSet<string>> idsByAdapterName)
+        {
+            var adapterName = gpuHardware.Name;
+            var isDiscrete = (gpuHardware as GenericGpu)?.IsDiscreteGpu ?? true;
+
+            void addSensor(ISensor s)
+            {
+                // Key requirement: Identifier.ToString()
+                var id = s.Identifier.ToString();
+
+                // Avoid exceptions on duplicates; first wins is fine for caching
+                if (!sensorsById.ContainsKey(id))
+                    sensorsById[id] = new GpuSensorInfo(s, adapterName, isDiscrete);
+
+                if (!idsByAdapterName.TryGetValue(adapterName, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    idsByAdapterName[adapterName] = set;
+                }
+                set.Add(id);
+            }
+
+            foreach (var s in gpuHardware.Sensors)
+                addSensor(s);
+
+            foreach (var sub in gpuHardware.SubHardware)
+            {
+                // sub.Update() is done by the caller during the main update pass,
+                // but harmless if called again; avoid repeating it here.
+                foreach (var s in sub.Sensors)
+                    addSensor(s);
+            }
+        }
+
+        private static void CollectSensors(IHardware hardware, List<ISensor> target, bool updateSubHardware)
+        {
+            // hardware.Sensors is typically an array, so AddRange is efficient
+            target.AddRange(hardware.Sensors);
+
+            foreach (var sub in hardware.SubHardware)
+            {
+                if (updateSubHardware)
+                    sub.Update();
+
+                target.AddRange(sub.Sensors);
+            }
+        }
+
+        internal static bool ShouldUpdateHardware(
+            IHardware hardware,
+            IReadOnlyCollection<IHardware> gpuHardware,
+            string selectedAdapter)
+        {
+            if (!IsGpu(hardware.HardwareType))
+                return true;
+
+            if (!string.Equals(selectedAdapter, "Auto", StringComparison.Ordinal))
+                return string.Equals(hardware.Name, selectedAdapter, StringComparison.Ordinal);
+
+            if (gpuHardware.Count <= 1 || !gpuHardware.Any(IsDiscreteGpu))
+                return true;
+
+            return IsDiscreteGpu(hardware);
+        }
+
+        private static bool IsDiscreteGpu(IHardware hardware) =>
+            (hardware as GenericGpu)?.IsDiscreteGpu ?? true;
+
+        private static bool IsGpu(HardwareType type) =>
+            type is HardwareType.GpuAmd || type is HardwareType.GpuNvidia || type is HardwareType.GpuIntel;
+
+        public void ShutdownSensorService()
+        {
+            _isServiceAlive = false;
+            _sensorPollTimerDisposable?.Dispose();
+            _sensorPoller?.Dispose();
+            _logDisposable?.Dispose();
+            _coreSensorSnapshotSubject?.OnCompleted();
+            _coreSensorSnapshotSubject?.Dispose();
+
+            // Initialization may still be running when the application closes. Dispose the plugin
+            // on the default scheduler once that one-time task finishes without blocking shutdown.
+            _ = _pmcReaderInitializationTask.ContinueWith(
+                task =>
+                {
+                    try
+                    {
+                        task.Result?.Dispose();
+                    }
+                    catch
+                    {
+                        // Ignore teardown exceptions during shutdown.
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnRanToCompletion,
+                TaskScheduler.Default);
+
+            // Close the LibreHardwareMonitor computer on a background thread bounded by a timeout.
+            // Vendor GPU libraries (AMD ADLX, Intel IGCL) tear down COM objects in Computer.Close();
+            // on some systems that teardown can deadlock (e.g. a COM/STA apartment mismatch, or a
+            // foreign vendor DLL that was loaded without an active GPU). Bounding it guarantees the
+            // application shutdown never hangs — if the teardown overruns, the stuck background
+            // thread is abandoned (IsBackground) and reclaimed when the process exits.
+            var closeThread = new Thread(() =>
+            {
+                try
+                {
+                    lock (_lockSensorUpdate)
+                    {
+                        lock (_lockComputer)
+                        {
+                            _computer?.Close();
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore teardown exceptions during shutdown.
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "SensorServiceShutdown"
+            };
+
+            closeThread.Start();
+
+            if (!closeThread.Join(_shutdownComputerTimeout))
+            {
+                _logger?.LogWarning("Sensor service teardown timed out after {Timeout} ms; abandoning " +
+                    "Computer.Close() (likely a GPU driver/COM deadlock) and continuing shutdown.",
+                    (int)_shutdownComputerTimeout.TotalMilliseconds);
+            }
+        }
+
+        public string GetGpuDriverVersion()
+        {
+            // Same adapter selection as the GPU sensor filter, so the reported driver
+            // matches the displayed adapter (auto mode: discrete GPU first).
+            var gpu = GetPrimaryGpuHardware();
+
+            // Driver I/O must not run under _lockComputer (see GetSensors).
+            return gpu != null ? gpu.GetDriverVersion() : "Unknown";
+        }
+
+        /// <summary>
+        /// Reads cached DIMM identities from the existing SPD discovery, including late retries.
+        /// Enumerating these properties performs no driver or SMBus I/O.
+        /// </summary>
+        public IReadOnlyList<string> GetMemoryManufacturers()
+        {
+            IHardware[] hardware;
+            lock (_lockComputer)
+            {
+                hardware = _computer?.Hardware.ToArray() ?? Array.Empty<IHardware>();
+            }
+
+            return hardware
+                .Where(item => item.HardwareType == HardwareType.Memory)
+                .Select(item => item.Properties.TryGetValue("Manufacturer", out var manufacturer)
+                    ? manufacturer : string.Empty)
+                .Where(manufacturer => !string.IsNullOrWhiteSpace(manufacturer))
+                .ToArray();
+        }
+
+        public string GetCpuName()
+        {
+            bool hasCustomInfo = _appConfiguration.HardwareInfoSource
+              .ConvertToEnum<EHardwareInfoSource>() == EHardwareInfoSource.Custom;
+
+            if (!hasCustomInfo)
+            {
+                IHardware cpu = null;
+                lock (_lockComputer)
+                {
+                    cpu = _computer?.Hardware
+                        .FirstOrDefault(hdw => hdw.HardwareType == HardwareType.Cpu);
+                }
+
+                return cpu != null ? cpu.Name : "Unknown";
+            }
+            else
+            {
+                return _appConfiguration.CustomCpuDescription;
+            }
+        }
+
+        public string GetGpuName()
+        {
+            bool hasCustomInfo = _appConfiguration.HardwareInfoSource
+                .ConvertToEnum<EHardwareInfoSource>() == EHardwareInfoSource.Custom;
+
+            if (!hasCustomInfo)
+            {
+                if(_appConfiguration.GraphicsAdapter != "Auto")
+                {
+                    return _appConfiguration.GraphicsAdapter;
+                }
+
+                // Same adapter selection as the GPU sensor filter (auto mode: discrete GPU first)
+                var gpu = GetPrimaryGpuHardware();
+                return gpu != null ? gpu.Name : "Unknown";
+            }
+            else
+            {
+                return _appConfiguration.CustomGpuDescription;
+            }
+        }
+
+        public ECpuVendor GetCpuVendor()
+        {
+            lock (_lockComputer)
+            {
+                var cpu = _computer?.Hardware
+                    .FirstOrDefault(hdw => hdw.HardwareType == HardwareType.Cpu);
+                if (cpu == null)
+                    return ECpuVendor.Unknown;
+
+                var identifier = cpu.Identifier.ToString().ToLowerInvariant();
+                if (identifier.Contains("amdcpu"))
+                    return ECpuVendor.Amd;
+                if (identifier.Contains("intelcpu"))
+                    return ECpuVendor.Intel;
+
+                return ECpuVendor.Unknown;
+            }
+        }
+
+        public EGpuVendor GetGpuVendor()
+        {
+            var gpu = GetPrimaryGpuHardware();
+            if (gpu == null)
+                return EGpuVendor.Unknown;
+
+            switch (gpu.HardwareType)
+            {
+                case HardwareType.GpuNvidia:
+                    return EGpuVendor.Nvidia;
+                case HardwareType.GpuAmd:
+                    return EGpuVendor.Amd;
+                case HardwareType.GpuIntel:
+                    return EGpuVendor.Intel;
+                default:
+                    return EGpuVendor.Unknown;
+            }
+        }
+
+        private IHardware GetPrimaryGpuHardware()
+        {
+            lock (_lockComputer)
+            {
+                var gpus = _computer?.Hardware
+                    .Where(hdw => hdw.HardwareType == HardwareType.GpuAmd
+                        || hdw.HardwareType == HardwareType.GpuNvidia
+                        || hdw.HardwareType == HardwareType.GpuIntel)
+                    .ToList();
+
+                if (gpus == null || gpus.Count == 0)
+                    return null;
+
+                var selectedAdapter = _appConfiguration.GraphicsAdapter;
+                if (!string.Equals(selectedAdapter, "Auto", StringComparison.Ordinal))
+                    return gpus.FirstOrDefault(gpu => string.Equals(gpu.Name, selectedAdapter, StringComparison.Ordinal));
+
+                if (gpus.Count == 1)
+                    return gpus[0];
+
+                var discreteGpu = gpus.FirstOrDefault(gpu => (gpu as GenericGpu)?.IsDiscreteGpu ?? true);
+                return discreteGpu ?? gpus[0];
+            }
+        }
+    }
+}

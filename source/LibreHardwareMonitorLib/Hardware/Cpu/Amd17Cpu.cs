@@ -1,0 +1,1285 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (C) LibreHardwareMonitor and Contributors.
+// All Rights Reserved.
+
+using LibreHardwareMonitor.PawnIo;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using CapFrameX.Monitoring.Contracts;
+
+namespace LibreHardwareMonitor.Hardware.Cpu;
+
+internal sealed class Amd17Cpu : AmdCpu
+{
+    // Keep raw SMU dump code available for diagnostics, but disabled by default.
+    // A field, not a const: the dump path stays compiled and the compiler does not report it
+    // as unreachable while the switch is off.
+    private static readonly bool EnableSmuRawDump = false;
+
+    private readonly Processor _processor;
+    private readonly Dictionary<SensorType, int> _sensorTypeIndex;
+    private readonly RyzenSMU _smu;
+    private readonly AmdFamily17 _pawnModule;
+    private readonly object _smuDumpLock = new();
+    private StreamWriter _smuDumpWriter;
+    private int _smuDumpColumnCount;
+    private long _smuDumpSampleId;
+
+    private static readonly Func<bool> _isCaptureActive = CreateCaptureStateAccessor();
+
+    public Amd17Cpu(int processorIndex, CpuId[][] cpuId, ISettings settings, ISensorConfig sensorConfig = null) : base(processorIndex, cpuId, settings, sensorConfig)
+    {
+        _pawnModule = new AmdFamily17();
+
+        _sensorTypeIndex = new Dictionary<SensorType, int>();
+        foreach (SensorType type in Enum.GetValues(typeof(SensorType)))
+        {
+            _sensorTypeIndex.Add(type, 0);
+        }
+
+        _sensorTypeIndex[SensorType.Load] = _active.Count(x => x.SensorType == SensorType.Load);
+
+        _smu = new RyzenSMU();
+
+        // Add all numa nodes.
+        // Register ..1E_2, [10:8] + 1
+        _processor = new Processor(this);
+
+        // Add all numa nodes.
+        int coreId = 0;
+        int lastCoreId = -1; // Invalid id.
+
+        // Ryzen 3000's skip some core ids.
+        // So start at 1 and count upwards when the read core changes.
+        foreach (CpuId[] cpu in cpuId.OrderBy(x => x[0].ExtData[0x1e, 1] & 0xFF))
+        {
+            // CPUID_Fn8000001E_EBX, Register ..1E_1, [7:0]
+            // threads per core =  CPUID_Fn8000001E_EBX[15:8] + 1
+            // CoreId: core ID =  CPUID_Fn8000001E_EBX[7:0]
+            int coreIdRead = (int)(cpu[0].ExtData[0x1e, 1] & 0xff);
+
+            // CPUID_Fn8000001E_ECX, Node Identifiers, Register ..1E_2
+            // NodesPerProcessor =  CPUID_Fn8000001E_ECX[10:8]
+            // nodeID =  CPUID_Fn8000001E_ECX[7:0]
+            int nodeId = (int)(cpu[0].ExtData[0x1e, 2] & 0xff);
+
+            if (coreIdRead != lastCoreId)
+            {
+                coreId++;
+            }
+
+            lastCoreId = coreIdRead;
+
+            // Add all threads (1 if SMT disabled, 2 if SMT enabled)
+            for (int i = 0; i < cpu.Length; i++)
+            {
+                _processor.AppendThread(cpu[i], nodeId, coreId);
+            }
+        }
+
+        _processor.InitializeCoreTypeClockSensors();
+
+        Update();
+    }
+
+    public override string GetReport()
+    {
+        StringBuilder r = new();
+        r.Append(base.GetReport());
+        r.Append(_smu.GetReport());
+        return r.ToString();
+    }
+
+    /// <inheritdoc />
+    public override void Close()
+    {
+        base.Close();
+        StopSmuDump();
+        _pawnModule.Close();
+        _smu.Close();
+    }
+
+    public override void Update()
+    {
+        base.Update();
+
+        _processor.UpdateSensors();
+        bool shouldPollCoreClocks = _processor.ShouldEvaluateCoreClocks();
+        bool shouldPollEffectiveClocks = _processor.ShouldEvaluateEffectiveClocks();
+
+        foreach (NumaNode node in _processor.Nodes)
+        {
+            NumaNode.UpdateSensors();
+
+            foreach (Core c in node.Cores)
+            {
+                c.UpdateSensors(shouldPollCoreClocks, shouldPollEffectiveClocks);
+            }
+        }
+
+        _processor.UpdateVirtualSensor(shouldPollCoreClocks, shouldPollEffectiveClocks);
+    }
+
+    private static Func<bool> CreateCaptureStateAccessor()
+    {
+        try
+        {
+            Type captureManagerType = Type.GetType("CapFrameX.Data.CaptureManager, CapFrameX.Data", false);
+            if (captureManagerType == null)
+                return () => false;
+
+            PropertyInfo isCapturingProperty = captureManagerType.GetProperty("IsCapturingStatic", BindingFlags.Public | BindingFlags.Static);
+            if (isCapturingProperty?.PropertyType == typeof(bool))
+                return () => (bool)isCapturingProperty.GetValue(null);
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return () => false;
+    }
+
+    private void LogSmuDataIfCapturing(float[] smuData)
+    {
+        if (!EnableSmuRawDump) return;
+
+        bool isCapturing = _isCaptureActive();
+
+        lock (_smuDumpLock)
+        {
+            if (!isCapturing)
+            {
+                StopSmuDumpNoLock();
+                return;
+            }
+
+            if (_smuDumpWriter == null)
+                StartSmuDumpNoLock();
+
+            if (_smuDumpWriter == null || smuData == null || smuData.Length == 0)
+                return;
+
+            if (_smuDumpColumnCount != smuData.Length)
+            {
+                WriteSmuDumpHeaderNoLock(smuData.Length);
+                _smuDumpColumnCount = smuData.Length;
+                _smuDumpSampleId = 0;
+            }
+
+            StringBuilder line = new();
+            line.Append(DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            line.Append(',');
+            line.Append((++_smuDumpSampleId).ToString(CultureInfo.InvariantCulture));
+            for (int i = 0; i < smuData.Length; i++)
+            {
+                line.Append(',');
+                line.Append(smuData[i].ToString("R", CultureInfo.InvariantCulture));
+            }
+
+            _smuDumpWriter.WriteLine(line.ToString());
+        }
+    }
+
+    private bool IsSmuRawDumpCaptureActive()
+    {
+        return EnableSmuRawDump && _isCaptureActive();
+    }
+
+    internal static bool ShouldPollSmuTable(
+        ISensorConfig sensorConfig,
+        IEnumerable<ISensor> smuSensors,
+        bool isRawDumpCaptureActive)
+    {
+        bool shouldPoll = SensorPolling.ShouldEvaluateAny(sensorConfig, smuSensors);
+        shouldPoll |= isRawDumpCaptureActive;
+        return shouldPoll;
+    }
+
+    private void StartSmuDumpNoLock()
+    {
+        try
+        {
+            string dumpDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "CapFrameX",
+                "Logs");
+            Directory.CreateDirectory(dumpDirectory);
+            string dumpPath = Path.Combine(dumpDirectory, $"RyzenSmuRaw_{DateTime.UtcNow:yyyyMMdd_HHmmss}.csv");
+
+            _smuDumpWriter = new StreamWriter(dumpPath, false, new UTF8Encoding(false))
+            {
+                AutoFlush = true
+            };
+            _smuDumpColumnCount = 0;
+            _smuDumpSampleId = 0;
+        }
+        catch
+        {
+            _smuDumpWriter = null;
+        }
+    }
+
+    private void StopSmuDump()
+    {
+        lock (_smuDumpLock)
+        {
+            StopSmuDumpNoLock();
+        }
+    }
+
+    private void StopSmuDumpNoLock()
+    {
+        _smuDumpWriter?.Dispose();
+        _smuDumpWriter = null;
+        _smuDumpColumnCount = 0;
+        _smuDumpSampleId = 0;
+    }
+
+    private void WriteSmuDumpHeaderNoLock(int columnCount)
+    {
+        if (_smuDumpWriter == null)
+            return;
+
+        StringBuilder header = new();
+        header.Append("timestamp_utc,sample_id");
+        for (int i = 0; i < columnCount; i++)
+            header.Append($",idx_{i}");
+
+        _smuDumpWriter.WriteLine(header.ToString());
+    }
+
+    private class Processor
+    {
+        private readonly Sensor _busClock;
+        private readonly Sensor _avgClock;
+        private readonly Sensor _avgClockEffcetive;
+        private readonly Sensor _maxClock;
+        private readonly Sensor _maxEffectiveClock;
+        private CoreTypeClockSensor[] _coreTypeMaxClocks = [];
+        private CoreTypeClockSensor[] _coreTypeMaxEffectiveClocks = [];
+
+        private readonly Sensor[] _ccdTemperatures;
+        private readonly Sensor _coreTemperatureTctl;
+        private readonly Sensor _coreTemperatureTctlTdie;
+        private readonly Sensor _coreTemperatureTdie;
+        private readonly Sensor _coreVoltage;
+        private readonly Amd17Cpu _cpu;
+        private readonly Sensor _packagePower;
+        private readonly Dictionary<KeyValuePair<uint, RyzenSMU.SmuSensorType>, Sensor> _smuSensors = new();
+        private readonly Sensor _socVoltage;
+
+        private Sensor _ccdsAverageTemperature;
+        private Sensor _ccdsMaxTemperature;
+        private bool _ccdTemperatureDiscoveryComplete;
+        private int? _detectedCcdCount;
+        private DateTime _lastSampleTime = new(0);
+        private uint _lastPwrValue;
+
+        public Processor(Hardware hardware)
+        {
+            _cpu = (Amd17Cpu)hardware;
+
+            //Clock 0
+            //Load 1
+            //Power 2
+            //Temperature 3
+            //Voltage 4
+            //Misc 5
+            //PMC 6
+
+            _packagePower = new Sensor("CPU Package", _cpu._sensorTypeIndex[SensorType.Power]++, SensorType.Power, _cpu, _cpu._settings)
+            { IsPresentationDefault = true, PresentationSortKey = "2_1_0" };
+            _coreTemperatureTctl = new Sensor("CPU (Tctl)", _cpu._sensorTypeIndex[SensorType.Temperature]++, SensorType.Temperature, _cpu, _cpu._settings)
+            { PresentationSortKey = "3_1_0" };
+            _coreTemperatureTdie = new Sensor("CPU (Tdie)", _cpu._sensorTypeIndex[SensorType.Temperature]++, SensorType.Temperature, _cpu, _cpu._settings)
+            { PresentationSortKey = "3_1_1" };
+            _coreTemperatureTctlTdie = new Sensor("CPU Package (Tctl/Tdie)", _cpu._sensorTypeIndex[SensorType.Temperature]++, SensorType.Temperature, _cpu, _cpu._settings)
+            { IsPresentationDefault = true, PresentationSortKey = "3_1_2" };
+            _ccdTemperatures = new Sensor[8]; // Hardcoded until there's a way to get max CCDs.
+            _coreVoltage = new Sensor("CPU Core (SVI2 TFN)", _cpu._sensorTypeIndex[SensorType.Voltage]++, SensorType.Voltage, _cpu, _cpu._settings)
+            { PresentationSortKey = "4_1_0" };
+            _socVoltage = new Sensor("CPU SoC (SVI2 TFN)", _cpu._sensorTypeIndex[SensorType.Voltage]++, SensorType.Voltage, _cpu, _cpu._settings)
+            { PresentationSortKey = "4_1_1" };
+            _busClock = new Sensor("CPU Bus", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = "0_1_0" };
+            _avgClock = new Sensor("CPU Clock", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = "0_1_1" };
+            _avgClockEffcetive = new Sensor("CPU Effective", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = "0_1_2" };
+            _maxClock = new Sensor("CPU Max", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = "0_1_3" };
+            _maxEffectiveClock = new Sensor("CPU Max Effective", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = "0_1_4" };
+
+            _cpu.ActivateSensor(_packagePower);
+            _cpu.ActivateSensor(_avgClock);
+            _cpu.ActivateSensor(_avgClockEffcetive);
+            _cpu.ActivateSensor(_maxClock);
+            _cpu.ActivateSensor(_maxEffectiveClock);
+
+            foreach (KeyValuePair<uint, RyzenSMU.SmuSensorType> sensor in _cpu._smu.GetPmTableStructure())
+            {
+                _smuSensors.Add(sensor, new Sensor(sensor.Value.Name, _cpu._sensorTypeIndex[sensor.Value.Type]++, sensor.Value.Type, _cpu, _cpu._settings)
+                {
+                    PresentationSortKey = $"5_{(int)sensor.Value.Type}_{sensor.Key}"
+                });
+
+            }
+        }
+
+        public List<NumaNode> Nodes { get; } = [];
+
+        public void InitializeCoreTypeClockSensors()
+        {
+            if (!_cpu.IsHybrid)
+                return;
+
+            // Core construction reorders the original CPUID arrays by AMD core/node ID.
+            // Match the actual CPUID entry so the type stays attached to the correct core.
+            Dictionary<CpuId, CpuCoreType> coreTypes = [];
+            for (int i = 0; i < _cpu._cpuId.Length; i++)
+                coreTypes.Add(_cpu._cpuId[i][0], _cpu.GetCoreType(i));
+
+            Core[] cores = Nodes.SelectMany(node => node.Cores).ToArray();
+            int sensorIndex = _cpu._sensorTypeIndex[SensorType.Clock];
+            _coreTypeMaxClocks = CoreTypeClockSensor.Create(
+                _cpu.IsHybrid,
+                _cpu,
+                _cpu._settings,
+                cores.Select(core => (coreTypes[core.Threads[0].Cpu], core.ClockSensor)),
+                false,
+                ref sensorIndex);
+            _coreTypeMaxEffectiveClocks = CoreTypeClockSensor.Create(
+                _cpu.IsHybrid,
+                _cpu,
+                _cpu._settings,
+                cores.SelectMany(core => core.EffectiveClockSensors.Select(sensor => (coreTypes[core.Threads[0].Cpu], sensor))),
+                true,
+                ref sensorIndex);
+            _cpu._sensorTypeIndex[SensorType.Clock] = sensorIndex;
+
+            foreach (CoreTypeClockSensor clock in _coreTypeMaxClocks.Concat(_coreTypeMaxEffectiveClocks))
+                _cpu.ActivateSensor(clock.Sensor);
+        }
+
+        public bool ShouldEvaluateCoreClocks()
+        {
+            bool evaluate = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _avgClock);
+            evaluate |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _maxClock);
+            evaluate |= SensorPolling.ShouldEvaluateAny(_cpu._sensorConfig, _coreTypeMaxClocks.Select(clock => clock.Sensor));
+
+            foreach (NumaNode node in Nodes)
+            {
+                foreach (Core core in node.Cores)
+                    evaluate |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, core.ClockSensor);
+            }
+
+            return evaluate;
+        }
+
+        public bool ShouldEvaluateEffectiveClocks()
+        {
+            bool evaluate = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _avgClockEffcetive);
+            evaluate |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _maxEffectiveClock);
+            evaluate |= SensorPolling.ShouldEvaluateAny(_cpu._sensorConfig, _coreTypeMaxEffectiveClocks.Select(clock => clock.Sensor));
+
+            foreach (NumaNode node in Nodes)
+            {
+                foreach (Core core in node.Cores)
+                    evaluate |= SensorPolling.ShouldEvaluateAny(_cpu._sensorConfig, core.EffectiveClockSensors);
+            }
+
+            return evaluate;
+        }
+
+        public void UpdateSensors()
+        {
+            NumaNode node = Nodes[0];
+            Core core = node?.Cores[0];
+            CpuId cpuId = core?.Threads.FirstOrDefault()?.Cpu;
+
+            if (cpuId == null)
+                return;
+
+            bool shouldPollPackagePower = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _packagePower);
+            bool shouldPollPackageTemperature = false;
+            shouldPollPackageTemperature |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _coreTemperatureTctl);
+            shouldPollPackageTemperature |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _coreTemperatureTdie);
+            shouldPollPackageTemperature |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _coreTemperatureTctlTdie);
+
+            bool shouldPollVoltage = false;
+            shouldPollVoltage |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _coreVoltage);
+            shouldPollVoltage |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _socVoltage);
+
+            bool shouldPollCcdTemperatures = !_ccdTemperatureDiscoveryComplete;
+            shouldPollCcdTemperatures |= SensorPolling.ShouldEvaluateAny(_cpu._sensorConfig, _ccdTemperatures);
+            shouldPollCcdTemperatures |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _ccdsMaxTemperature);
+            shouldPollCcdTemperatures |= SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _ccdsAverageTemperature);
+
+            bool shouldPollBusClock = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _busClock);
+            bool shouldPollPciSensors = shouldPollPackageTemperature || shouldPollVoltage || shouldPollCcdTemperatures;
+
+            GroupAffinity previousAffinity = ThreadAffinity.Set(cpuId.Affinity);
+
+            // MSRC001_0299
+            // TU [19:16]
+            // ESU [12:8] -> Unit 15.3 micro Joule per increment (default), 1/2^ESU micro Joule
+            // PU [3:0]
+            uint eax = 0;
+            double energyBaseUnit = 0;
+            DateTime sampleTime = new(0);
+            uint totalEnergy = 0;
+            if (shouldPollPackagePower)
+            {
+                _cpu._pawnModule.ReadMsr(MSR_PWR_UNIT, out eax, out uint _);
+                int esu = (int)((eax >> 8) & 0x1F);
+                energyBaseUnit = Math.Pow(0.5, esu);
+
+                // MSRC001_029B
+                // total_energy [31:0]
+                sampleTime = DateTime.UtcNow;
+                _cpu._pawnModule.ReadMsr(MSR_PKG_ENERGY_STAT, out eax, out _);
+                totalEnergy = eax;
+            }
+            else
+            {
+                _lastSampleTime = new(0);
+            }
+
+            uint smuSvi0Tfn = 0;
+            uint smuSvi0TelPlane0 = 0;
+            uint smuSvi0TelPlane1 = 0;
+            bool pciSensorsRead = false;
+
+            if (shouldPollPciSensors && Mutexes.WaitPciBus(10))
+            {
+                pciSensorsRead = true;
+                // THM_TCON_CUR_TMP
+                // CUR_TEMP [31:21]
+                uint temperature = shouldPollPackageTemperature
+                    ? _cpu._pawnModule.ReadSmn(F17H_M01H_THM_TCON_CUR_TMP)
+                    : 0;
+
+                // SVI0_TFN_PLANE0 [0]
+                // SVI0_TFN_PLANE1 [1]
+                if (shouldPollVoltage)
+                    smuSvi0Tfn = _cpu._pawnModule.ReadSmn(F17H_M01H_SVI + 0x8);
+
+                bool supportsPerCcdTemperatures = false;
+
+                // TODO: find a better way because these will probably keep changing in the future.
+
+                uint sviPlane0Offset;
+                uint sviPlane1Offset;
+                switch (cpuId.Model)
+                {
+                    case 0x31: // Threadripper 3000.
+                        sviPlane0Offset = F17H_M01H_SVI + 0x14;
+                        sviPlane1Offset = F17H_M01H_SVI + 0x10;
+                        supportsPerCcdTemperatures = true;
+                        break;
+
+                    case 0x71: // Zen 2.
+                    case 0x21: // Zen 3.
+                        sviPlane0Offset = F17H_M01H_SVI + 0x10;
+                        sviPlane1Offset = F17H_M01H_SVI + 0xC;
+                        supportsPerCcdTemperatures = true;
+                        break;
+
+                    case 0x61: //Zen 4
+                    case 0x44: //Zen 5
+                    case 0xE0: //Zen 6 Olympic Ridge (Desktop). Mobile MP1/MP2 (0x88/0xE4) and
+                               //Family 0x1B parts (Medusa Point 3, Rosenhorn) untested — leave on default.
+                        sviPlane0Offset = F17H_M01H_SVI + 0x10;
+                        sviPlane1Offset = F17H_M01H_SVI + 0xC;
+                        supportsPerCcdTemperatures = true;
+                        break;
+
+                    default: // Zen and Zen+.
+                        sviPlane0Offset = F17H_M01H_SVI + 0xC;
+                        sviPlane1Offset = F17H_M01H_SVI + 0x10;
+                        break;
+                }
+
+                // SVI0_PLANE0_VDDCOR [24:16]
+                // SVI0_PLANE0_IDDCOR [7:0]
+                if (shouldPollVoltage)
+                    smuSvi0TelPlane0 = _cpu._pawnModule.ReadSmn(sviPlane0Offset);
+
+                // SVI0_PLANE1_VDDCOR [24:16]
+                // SVI0_PLANE1_IDDCOR [7:0]
+                if (shouldPollVoltage)
+                    smuSvi0TelPlane1 = _cpu._pawnModule.ReadSmn(sviPlane1Offset);
+
+                if (shouldPollPackageTemperature)
+                {
+                    // current temp Bit [31:21]
+                    // If bit 19 of the Temperature Control register is set, there is an additional offset of 49 degrees C.
+                    bool tempOffsetFlag = (temperature & F17H_TEMP_OFFSET_FLAG) != 0;
+                    temperature = (temperature >> 21) * 125;
+
+                    float offset = 0.0f;
+
+                    // Offset table: https://github.com/torvalds/linux/blob/master/drivers/hwmon/k10temp.c#L78
+                    if (string.IsNullOrWhiteSpace(cpuId.Name))
+                        offset = 0;
+                    else if (cpuId.Name.Contains("1600X") || cpuId.Name.Contains("1700X") || cpuId.Name.Contains("1800X"))
+                        offset = -20.0f;
+                    else if (cpuId.Name.Contains("Threadripper 19") || cpuId.Name.Contains("Threadripper 29"))
+                        offset = -27.0f;
+                    else if (cpuId.Name.Contains("2700X"))
+                        offset = -10.0f;
+
+                    float t = temperature * 0.001f;
+                    if (tempOffsetFlag)
+                        t += -49.0f;
+
+                    if (offset < 0)
+                    {
+                        _coreTemperatureTctl.Value = t;
+                        _coreTemperatureTdie.Value = t + offset;
+
+                        _cpu.ActivateSensor(_coreTemperatureTctl);
+                        _cpu.ActivateSensor(_coreTemperatureTdie);
+                    }
+                    else
+                    {
+                        // Zen 2 doesn't have an offset so Tdie and Tctl are the same.
+                        _coreTemperatureTctlTdie.Value = t;
+                        _cpu.ActivateSensor(_coreTemperatureTctlTdie);
+                    }
+                }
+
+                // Tested only on R5 3600 & Threadripper 3960X, 5900X, 7900X
+                if (supportsPerCcdTemperatures && shouldPollCcdTemperatures)
+                {
+                    for (uint i = 0; i < _ccdTemperatures.Length; i++)
+                    {
+                        uint ccd1Offset = 0;
+                        if (cpuId.Model is 0x61 or 0x44 or 0xE0) // Raphael, GraniteRidge or OlympicRidge
+                            ccd1Offset = F17H_M61H_CCD1_TEMP + i * 0x4;
+                        else
+                            ccd1Offset = F17H_M70H_CCD1_TEMP + i * 0x4;
+                        uint ccdRawTemp = _cpu._pawnModule.ReadSmn(ccd1Offset);
+
+                        ccdRawTemp &= 0xFFF;
+                        float ccdTemp = ((ccdRawTemp * 125) - 305000) * 0.001f;
+                        if (ccdRawTemp > 0 && ccdTemp < 125) // Zen 2 reports 95 degrees C max, but it might exceed that.
+                        {
+                            if (_ccdTemperatures[i] == null)
+                            {
+                                _cpu.ActivateSensor(_ccdTemperatures[i] = new Sensor($"CCD{i + 1} (Tdie)",
+                                    _cpu._sensorTypeIndex[SensorType.Temperature]++,
+                                    SensorType.Temperature,
+                                    _cpu,
+                                    _cpu._settings)
+                                { PresentationSortKey = $"3_2_{i}" });
+                            }
+
+                            _ccdTemperatures[i].Value = ccdTemp;
+                        }
+                    }
+
+                    Sensor[] activeCcds = _ccdTemperatures.Where(x => x != null).ToArray();
+                    _detectedCcdCount = activeCcds.Length;
+                    if (activeCcds.Length > 1)
+                    {
+                        // No need to get the max / average ccds temp if there is only one CCD.
+
+                        if (_ccdsMaxTemperature == null)
+                        {
+                            _cpu.ActivateSensor(_ccdsMaxTemperature = new Sensor("CCDs Max (Tdie)",
+                                _cpu._sensorTypeIndex[SensorType.Temperature]++,
+                                SensorType.Temperature,
+                                _cpu,
+                                _cpu._settings)
+                            { PresentationSortKey = "3_3_1" });
+                        }
+
+                        if (_ccdsAverageTemperature == null)
+                        {
+                            _cpu.ActivateSensor(_ccdsAverageTemperature = new Sensor("CCDs Average (Tdie)",
+                                _cpu._sensorTypeIndex[SensorType.Temperature]++,
+                                SensorType.Temperature,
+                                _cpu,
+                                _cpu._settings)
+                            { PresentationSortKey = "3_3_2" });
+                        }
+
+                        _ccdsMaxTemperature.Value = activeCcds.Max(x => x.Value);
+                        _ccdsAverageTemperature.Value = activeCcds.Average(x => x.Value);
+                    }
+                }
+
+                if (shouldPollCcdTemperatures)
+                    _ccdTemperatureDiscoveryComplete = true;
+
+                Mutexes.ReleasePciBus();
+            }
+
+            ThreadAffinity.Set(previousAffinity);
+
+            if (shouldPollPackagePower)
+            {
+                TimeSpan deltaTime = sampleTime - _lastSampleTime;
+                if (_lastSampleTime.Ticks == 0)
+                {
+                    deltaTime = new(0);
+                    _lastPwrValue = totalEnergy;
+                }
+
+                _lastSampleTime = sampleTime;
+
+                long pwr;
+                if (_lastPwrValue <= totalEnergy)
+                    pwr = totalEnergy - _lastPwrValue;
+                else
+                    pwr = (0xffffffff - _lastPwrValue) + totalEnergy;
+
+                _lastPwrValue = totalEnergy;
+
+                if (deltaTime.Ticks > 0)
+                {
+                    double energy = energyBaseUnit * pwr;
+                    energy /= deltaTime.TotalSeconds;
+
+                    if (!double.IsNaN(energy))
+                        _packagePower.Value = (float)energy;
+                }
+            }
+
+            if (shouldPollVoltage && pciSensorsRead)
+            {
+                // voltage
+                const double vidStep = 0.00625;
+                double vcc;
+                uint svi0PlaneXVddCor;
+
+                if (cpuId.Model is 0x61 or 0x44 or 0xE0) // Readout not working for Ryzen 7000/9000; assumed same for Olympic Ridge (Zen 6 Desktop).
+                    smuSvi0Tfn |= 0x01 | 0x02;
+
+                // Core (0x01).
+                if ((smuSvi0Tfn & 0x01) == 0)
+                {
+                    svi0PlaneXVddCor = (smuSvi0TelPlane0 >> 16) & 0xff;
+                    vcc = 1.550 - (vidStep * svi0PlaneXVddCor);
+                    _coreVoltage.Value = (float)vcc;
+
+                    _cpu.ActivateSensor(_coreVoltage);
+                }
+
+                // SoC (0x02), not every Zen cpu has this voltage.
+                if (cpuId.Model is 0x11 or 0x21 or 0x71 or 0x31 || (smuSvi0Tfn & 0x02) == 0)
+                {
+                    svi0PlaneXVddCor = (smuSvi0TelPlane1 >> 16) & 0xff;
+                    vcc = 1.550 - (vidStep * svi0PlaneXVddCor);
+                    _socVoltage.Value = (float)vcc;
+
+                    _cpu.ActivateSensor(_socVoltage);
+                }
+            }
+
+            if (shouldPollBusClock)
+            {
+                double timeStampCounterMultiplier = GetTimeStampCounterMultiplier();
+                if (timeStampCounterMultiplier > 0)
+                {
+                    _busClock.Value = (float)(_cpu.TimeStampCounterFrequency / timeStampCounterMultiplier);
+                    _cpu.ActivateSensor(_busClock);
+                }
+            }
+
+            bool shouldPollSmuTable = ShouldPollSmuTable(
+                _cpu._sensorConfig,
+                _smuSensors.Values,
+                _cpu.IsSmuRawDumpCaptureActive());
+
+            if (_cpu._smu.IsPmTableLayoutDefined() && shouldPollSmuTable)
+            {
+                float[] smuData = _cpu._smu.GetPmTable();
+                _cpu.LogSmuDataIfCapturing(smuData);
+
+                foreach (KeyValuePair<KeyValuePair<uint, RyzenSMU.SmuSensorType>, Sensor> sensor in _smuSensors)
+                {
+                    if (_detectedCcdCount == 1 && sensor.Key.Value.Name == "L3 (CCD2)")
+                        continue;
+
+                    if (smuData.Length > sensor.Key.Key)
+                    {
+                        sensor.Value.Value = smuData[sensor.Key.Key] * sensor.Key.Value.Scale;
+                        if (sensor.Value.Value != 0)
+                            _cpu.ActivateSensor(sensor.Value);
+                    }
+                }
+            }
+        }
+
+        public void UpdateVirtualSensor(bool updateCoreClocks, bool updateEffectiveClocks)
+        {
+            if (Nodes == null || Nodes.Count == 0)
+                return;
+
+            if (updateCoreClocks)
+            {
+                // Average and max clock
+                double clock = Nodes.Average(x => x.CoreClock);
+                _avgClock.Value = (float)Math.Round(clock, 0);
+
+                clock = Nodes.SelectMany(x => x.Cores).Max(c => c.CoreClock);
+                _maxClock.Value = (float)Math.Round(clock, 0);
+
+                foreach (CoreTypeClockSensor coreTypeClock in _coreTypeMaxClocks)
+                    coreTypeClock.Update();
+            }
+
+            if (updateEffectiveClocks)
+            {
+                double[] effectiveClocks = Nodes.SelectMany(x => x.EffectiveClocks).ToArray();
+                if (effectiveClocks.Length > 0)
+                {
+                    _avgClockEffcetive.Value = (float)Math.Round(effectiveClocks.Average(), 0);
+                    _maxEffectiveClock.Value = (float)Math.Round(effectiveClocks.Max(), 0);
+                }
+                else
+                {
+                    _avgClockEffcetive.Value = null;
+                    _maxEffectiveClock.Value = null;
+                }
+
+                foreach (CoreTypeClockSensor coreTypeClock in _coreTypeMaxEffectiveClocks)
+                    coreTypeClock.Update();
+            }
+        }
+
+        private double GetTimeStampCounterMultiplier()
+        {
+            _cpu._pawnModule.ReadMsr(MSR_PSTATE_0, out uint eax, out _);
+
+            if (_cpu._family == 0x1a)
+            {
+                //zen 5
+                uint cpuFid = eax & 0xfff;
+                return (cpuFid * 5) / 100.0;
+            }
+            else
+            {
+                uint cpuDfsId = (eax >> 8) & 0x3f;
+                uint cpuFid = eax & 0xff;
+                return 2.0 * cpuFid / cpuDfsId;
+            }
+        }
+
+        public void AppendThread(CpuId thread, int numaId, int coreId)
+        {
+            NumaNode node = null;
+            foreach (NumaNode n in Nodes)
+            {
+                if (n.NodeId == numaId)
+                {
+                    node = n;
+                    break;
+                }
+            }
+
+            if (node == null)
+            {
+                node = new NumaNode(_cpu, numaId);
+                Nodes.Add(node);
+            }
+
+            if (thread != null)
+                node.AppendThread(thread, coreId);
+        }
+    }
+
+    private class NumaNode
+    {
+        private readonly Amd17Cpu _cpu;
+
+        public NumaNode(Amd17Cpu cpu, int id)
+        {
+            Cores = new List<Core>();
+            NodeId = id;
+            _cpu = cpu;
+        }
+
+        public List<Core> Cores { get; }
+
+        public int NodeId { get; }
+
+        public double CoreClock
+        {
+            get
+            {
+                if (Cores == null)
+                    return 0;
+
+                return Cores.Average(x => x.CoreClock);
+            }
+        }
+
+        public double[] EffectiveClocks
+        {
+            get
+            {
+                if (Cores == null)
+                    return Array.Empty<double>();
+
+                return Cores.SelectMany(x => x.EffectiveClocks).ToArray();
+            }
+        }
+
+
+        public void AppendThread(CpuId thread, int coreId)
+        {
+            Core core = null;
+            foreach (Core c in Cores)
+            {
+                if (c.CoreId == coreId)
+                    core = c;
+            }
+
+            if (core == null)
+            {
+                // Append the hybrid core-type suffix (P/D/LP on Zen 6+) so all "Core #N"
+                // sensors (clock/power/VID/effective) carry the same label as the load sensors.
+                string coreLabel = thread != null ? _cpu.GetCoreLabel(thread) : string.Empty;
+                core = new Core(_cpu, coreId, coreLabel);
+                Cores.Add(core);
+            }
+
+            if (thread != null)
+                core.AppendThread(thread);
+        }
+
+        public static void UpdateSensors() { }
+    }
+
+    private class CpuThread
+    {
+        private DateTime _sampleTime = new(0);
+        private DateTime _lastSampleTime = new(0);
+        private ulong _mperf = 0;
+        private ulong _aperf = 0;
+        private ulong _mperfLast = 0;
+        private ulong _aperfLast = 0;
+        private ulong _mperfDelta = 0;
+        private ulong _aperfDelta = 0;
+
+        private CpuId _cpuId;
+        private Amd17Cpu _cpu;
+        public CpuId Cpu { get { return _cpuId; } }
+
+        public TimeSpan SampleDuration { get; private set; } = TimeSpan.Zero;
+        public double EffectiveClock { get; private set; } = 0;
+
+        public ulong MperfDelta { get { return _mperfDelta; } }
+        public ulong AperfDelta { get { return _aperfDelta; } }
+
+        public CpuThread(Amd17Cpu cpu, CpuId cpuId)
+        {
+            _cpu = cpu;
+            _cpuId = cpuId;
+        }
+
+        public void ReadPerformanceCounter()
+        {
+            ThreadAffinity.Set(Cpu.Affinity);
+
+            _sampleTime = DateTime.UtcNow;
+
+            // performance counter
+            // MSRC000_00E7, P0 state counter
+            _cpu._pawnModule.ReadMsr(MSR_MPERF_RO, out ulong edxeax);
+            _mperf = edxeax;
+            // MSRC000_00E8, C0 state counter
+            _cpu._pawnModule.ReadMsr(MSR_APERF_RO, out edxeax);
+            _aperf = edxeax;
+        }
+
+        public void UpdateMeasurements()
+        {
+            if (_mperf < _mperfLast || _aperf < _aperfLast)
+            {
+                // current measurment is invalid when _mperf or _aperf overflow
+                _lastSampleTime = new(0);
+            }
+
+            if (_lastSampleTime.Ticks == 0)
+            {
+                _lastSampleTime = _sampleTime;
+                _mperfLast = _mperf;
+                _aperfLast = _aperf;
+
+                _mperfDelta = 0;
+                _aperfDelta = 0;
+                return;
+            }
+
+            SampleDuration = _sampleTime - _lastSampleTime;
+            _lastSampleTime = _sampleTime;
+
+            _mperfDelta = _mperf - _mperfLast;
+            _aperfDelta = _aperf - _aperfLast;
+            _mperfLast = _mperf;
+            _aperfLast = _aperf;
+
+            if (_mperfDelta > 20000e6)
+                _mperfDelta = 0;
+            if (_aperfDelta > 20000e6)
+                _aperfDelta = 0;
+
+            if (_aperfDelta == 0 || _mperfDelta == 0)
+            {
+                //overflow possible, numbers are > 20 GHz
+                _lastSampleTime = new(0);
+                return;
+            }
+
+            //effective clock
+            double freq = (double)_aperfDelta / (SampleDuration.TotalMilliseconds * 1000.0);
+            EffectiveClock = Math.Round(freq);
+        }
+
+        public bool HasValidCounters()
+        {
+            return _mperfDelta > 0 && _aperfDelta > 0 && SampleDuration.Ticks > 0;
+        }
+
+        public void ResetPerformanceCounter()
+        {
+            _sampleTime = default;
+            _lastSampleTime = default;
+            _mperf = 0;
+            _aperf = 0;
+            _mperfLast = 0;
+            _aperfLast = 0;
+            _mperfDelta = 0;
+            _aperfDelta = 0;
+            SampleDuration = TimeSpan.Zero;
+            EffectiveClock = 0;
+        }
+    }
+
+    private class Core
+    {
+        private readonly Sensor _clock;
+        private readonly List<Sensor> _clocksEffective = [];
+        private readonly Amd17Cpu _cpu;
+        // private readonly Sensor _multiplier;
+        private readonly Sensor _power;
+        private readonly Sensor _vcore;
+        private ISensor _busClock;
+        private DateTime _lastSampleTime = new(0);
+        private uint _lastPwrValue = 0;
+        private bool _effectiveClockPollingActive;
+
+        public double CoreClock { get; set; } = 0;
+        public double[] EffectiveClocks { get; set; } = [];
+
+        // "Core #N" plus the hybrid type suffix (e.g. "Core #3 LP"); empty suffix on non-hybrid parts.
+        private readonly string _coreName;
+
+        public Core(Amd17Cpu cpu, int id, string coreLabel = "")
+        {
+            _cpu = cpu;
+            CoreId = id;
+            _coreName = "Core #" + CoreId + (string.IsNullOrEmpty(coreLabel) ? string.Empty : " " + coreLabel);
+            _clock = new Sensor(_coreName, _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, cpu, cpu._settings)
+            { IsPresentationDefault = true, PresentationSortKey = $"0_0_0_{id}" };
+            // _multiplier = new Sensor(_coreName, cpu._sensorTypeIndex[SensorType.Factor]++, SensorType.Factor, cpu, cpu._settings);
+            _power = new Sensor(_coreName + " (SMU)", cpu._sensorTypeIndex[SensorType.Power]++, SensorType.Power, cpu, cpu._settings)
+            { PresentationSortKey = $"2_0_{id}" };
+            _vcore = new Sensor(_coreName + " VID", cpu._sensorTypeIndex[SensorType.Voltage]++, SensorType.Voltage, cpu, cpu._settings)
+            { PresentationSortKey = $"4_0_{id}" };
+
+            cpu.ActivateSensor(_clock);
+            // cpu.ActivateSensor(_multiplier);
+            cpu.ActivateSensor(_power);
+            cpu.ActivateSensor(_vcore);
+        }
+
+        public int CoreId { get; }
+
+        public ISensor ClockSensor => _clock;
+
+        public IEnumerable<ISensor> EffectiveClockSensors => _clocksEffective;
+
+        public List<CpuThread> Threads { get; } = [];
+
+        public void AppendThread(CpuId cpuId)
+        {
+            int threadIndex = Threads.Count;
+            CpuThread t = new(_cpu, cpuId);
+            Threads.Add(t);
+
+            // Create effective clock sensor for this thread
+            var sensor = new Sensor($"{_coreName} Thread #{threadIndex + 1} (Effective)", _cpu._sensorTypeIndex[SensorType.Clock]++, SensorType.Clock, _cpu, _cpu._settings)
+            { PresentationSortKey = $"0_0_1_{CoreId}_{threadIndex}" };
+            _clocksEffective.Add(sensor);
+            _cpu.ActivateSensor(sensor);
+        }
+
+        public void UpdateSensors(bool updateCoreClocks, bool updateEffectiveClocks)
+        {
+            if (Threads.Count == 0)
+                return;
+
+            bool updatePower = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _power);
+            bool updateVoltage = SensorPolling.ShouldEvaluate(_cpu._sensorConfig, _vcore);
+            bool updateClockCounters = updateCoreClocks || updateEffectiveClocks;
+
+            if (!updateClockCounters && !updatePower && !updateVoltage)
+            {
+                foreach (CpuThread currentThread in Threads)
+                    currentThread.ResetPerformanceCounter();
+
+                EffectiveClocks = [];
+                _effectiveClockPollingActive = false;
+                _lastSampleTime = new(0);
+                return;
+            }
+
+            bool effectiveClockPollingStarted = updateEffectiveClocks && !_effectiveClockPollingActive;
+            if (effectiveClockPollingStarted)
+            {
+                EffectiveClocks = [];
+                foreach (Sensor sensor in _clocksEffective)
+                    sensor.Value = null;
+            }
+
+            CpuThread thread = Threads[0];
+            GroupAffinity previousAffinity = ThreadAffinity.Set(thread.Cpu.Affinity);
+
+            uint eax = 0;
+            double energyBaseUnit = 0;
+            DateTime sampleTime = new(0);
+            uint totalEnergy = 0;
+
+            // MSRC001_0299
+            // TU [19:16]
+            // ESU [12:8] -> Unit 15.3 micro Joule per increment (default), 1/2^ESU micro Joule
+            // PU [3:0]
+            if (updatePower)
+            {
+                _cpu._pawnModule.ReadMsr(MSR_PWR_UNIT, out eax, out uint _);
+                int esu = (int)((eax >> 8) & 0x1F);
+                energyBaseUnit = Math.Pow(0.5, esu);
+
+                // MSRC001_029A
+                // total_energy [31:0]
+                sampleTime = DateTime.UtcNow;
+                _cpu._pawnModule.ReadMsr(MSR_CORE_ENERGY_STAT, out eax, out _);
+                totalEnergy = eax;
+            }
+            else
+            {
+                _lastSampleTime = new(0);
+            }
+
+            // MSRC001_0293
+            // CurHwPstate [24:22]
+            // CurCpuVid [21:14]
+            // CurCpuDfsId [13:8]
+            // CurCpuFid [7:0] zen1..4
+            // CurCpuFid [11:0] zen5
+            uint msrPstate = 0;
+            int curCpuVid = 0;
+            if (updateClockCounters || updateVoltage)
+            {
+                _cpu._pawnModule.ReadMsr(MSR_HARDWARE_PSTATE_STATUS, out eax, out _);
+                msrPstate = eax;
+                curCpuVid = (int)((eax >> 14) & 0xff);
+            }
+
+            for (int i = 0; i < Threads.Count; i++)
+            {
+                CpuThread currentThread = Threads[i];
+                if (updateEffectiveClocks || (updateCoreClocks && i == 0))
+                    currentThread.ReadPerformanceCounter();
+                else
+                    currentThread.ResetPerformanceCounter();
+            }
+
+            // MSRC001_0063[P - state Status](PStateStat)
+            // Ring0.ReadMsr(MSR_PSTATE_STATUS, out eax, out _);
+            // int curPstateStaus = (int)(eax & 0x7);
+
+            // MSRC001_0064 + x
+            // PstateEn[63], 1 == enabled
+            // IddDiv [31:30]
+            // IddValue [29:22]
+            // CpuVid [21:14]
+            // CpuDfsId [13:8]
+            // CpuFid [7:0] zen1..4
+            // CpuFid [11:0] zen5
+            // Ring0.ReadMsr(MSR_PSTATE_0 + curPstateStaus, out eax, out uint edx);
+            // uint curPstate = eax;
+            // int PstateEn = (int)(edx >> 31);
+
+            ThreadAffinity.Set(previousAffinity);
+
+            // Update only counters which were sampled. The first thread is shared with the
+            // normal core-clock calculation; additional SMT threads are effective-clock-only.
+            for (int i = 0; i < Threads.Count; i++)
+            {
+                if (updateEffectiveClocks || (updateCoreClocks && i == 0))
+                    Threads[i].UpdateMeasurements();
+            }
+
+            if (updateClockCounters && thread.HasValidCounters())
+            {
+                double coreClock = 0;
+                double busClock = 100.0; //bus speed in MHz
+                _busClock ??= _cpu.Sensors.FirstOrDefault(x => x.Name == "CPU Bus");
+                if (_busClock?.Value.HasValue == true && _busClock.Value > 0)
+                    busClock = (double)_busClock.Value;
+
+                if (thread.Cpu.Family == 0x1A || thread.Cpu.Family == 0x1B)
+                {
+                    // zen5 (0x1A) + zen6 MP3 / zen7 (0x1B) — inherit CpuFid[11:0] layout
+                    // 57896-B0-PUB_3.00.pdf, CoreCOF
+                    // CoreCOF is Core current operating frequency in MHz.CoreCOF = Core::X86::Msr::PStateDef[CpuFid[11:0]] * 5MHz
+                    // CpuFid[11:0]: core frequency ID.Read - write.Reset: XXXh.Specifies the core frequency multiplier.The core
+                    // COF is a function of CpuFid and CpuDid, and defined by CoreCOF.
+                    int curCpuFid = (int)(msrPstate & 0xfff);
+                    coreClock = curCpuFid * 5d * busClock / 100d;
+
+                    // multiplier, clock speed with 100Mhz as Multiplier Reference
+                    // _multiplier.Value = (float)((curCpuFid * 5) / busClock);
+                }
+                else
+                {
+                    // clock zen 0x17 and 0x19
+                    // 55570-B1-3.16_PUB_NRV.pdf, CoreCOF
+                    // CoreCOF is (Core::X86::Msr::PStateDef[CpuFid[7:0]] / Core::X86::Msr::PStateDef[CpuDfsId]) * 200
+                    // CpuFid[7:0]: core frequency ID.Read - write.Reset: XXh.Specifies the core frequency multiplier.The core
+                    // COF is a function of CpuFid and CpuDid, and defined by CoreCOF.
+                    int curCpuDfsId = (int)((msrPstate >> 8) & 0x3f);
+                    int curCpuFid = (int)(msrPstate & 0xff);
+
+                    coreClock = (curCpuFid / (double)curCpuDfsId * (busClock * 2));
+
+                    // multiplier
+                    // _multiplier.Value = (float)(curCpuFid / (double)curCpuDfsId * 2.0);
+                }
+
+                //clock values valid when AperfDelta < MperfDelta (ratio is < 1.0)
+                if (thread.AperfDelta < thread.MperfDelta)
+                    coreClock = ((double)thread.AperfDelta / (double)thread.MperfDelta) * coreClock;
+
+                CoreClock = Math.Round(coreClock);
+                _clock.Value = (float)CoreClock;
+
+                if (updateEffectiveClocks && !effectiveClockPollingStarted)
+                {
+                    List<double> validEffectiveClocks = [];
+                    for (int i = 0; i < _clocksEffective.Count && i < Threads.Count; i++)
+                    {
+                        if (Threads[i].HasValidCounters())
+                        {
+                            // Clamping must consider BCLK oc (max 10%) and Spread Spectrum Clocking (SSC) (1-2%)
+                            double effectiveClock = Math.Max(0, Math.Min(Threads[i].EffectiveClock, CoreClock * 1.12));
+                            _clocksEffective[i].Value = (float)effectiveClock;
+                            validEffectiveClocks.Add(effectiveClock);
+                        }
+                        else
+                        {
+                            _clocksEffective[i].Value = null;
+                        }
+                    }
+
+                    EffectiveClocks = [.. validEffectiveClocks];
+                }
+            }
+            else
+            {
+                if (updateCoreClocks)
+                    _clock.Value = null;
+
+                if (updateEffectiveClocks)
+                {
+                    EffectiveClocks = [];
+                    foreach (Sensor sensor in _clocksEffective)
+                        sensor.Value = null;
+                }
+            }
+
+            if (!updateEffectiveClocks)
+                EffectiveClocks = [];
+
+            _effectiveClockPollingActive = updateEffectiveClocks;
+
+            if (updateVoltage)
+            {
+                // Vcore voltage
+                const double vidStep = 0.00625;
+                double vcc = 1.550 - (vidStep * curCpuVid);
+                _vcore.Value = (float)vcc;
+            }
+
+            // core power consumption
+            //current delta time
+            if (updatePower)
+            {
+                TimeSpan deltaTime = sampleTime - _lastSampleTime;
+                if (_lastSampleTime.Ticks == 0)
+                {
+                    deltaTime = new(0);
+                    _lastSampleTime = sampleTime;
+                    _lastPwrValue = totalEnergy;
+                }
+                _lastSampleTime = sampleTime;
+
+                if (deltaTime.Ticks > 0)
+                {
+                    // power.Value = (float) ((double)pu * 0.125);
+                    // energyBaseUnit = micro Joule per increment, from [ESU]
+                    // ticks diff
+                    long pwr;
+                    if (_lastPwrValue <= totalEnergy)
+                        pwr = totalEnergy - _lastPwrValue;
+                    else
+                        pwr = (0xffffffff - _lastPwrValue) + totalEnergy;
+
+                    // update for next sample
+                    _lastPwrValue = totalEnergy;
+
+                    double energy = energyBaseUnit * pwr;
+                    energy /= deltaTime.TotalSeconds;
+
+                    if (!double.IsNaN(energy))
+                        _power.Value = (float)energy;
+                }
+            }
+        }
+    }
+
+    // ReSharper disable InconsistentNaming
+    private const uint COFVID_STATUS = 0xC0010071;
+    private const uint F17H_M01H_SVI = 0x0005A000;
+    private const uint F17H_M01H_THM_TCON_CUR_TMP = 0x00059800;
+    private const uint F17H_M70H_CCD1_TEMP = 0x00059954;
+    private const uint F17H_M61H_CCD1_TEMP = 0x00059b08;
+    private const uint F17H_TEMP_OFFSET_FLAG = 0x80000;
+    private const uint FAMILY_17H_PCI_CONTROL_REGISTER = 0x60;
+    private const uint HWCR = 0xC0010015;
+    private const uint MSR_CORE_ENERGY_STAT = 0xC001029A;
+    private const uint MSR_HARDWARE_PSTATE_STATUS = 0xC0010293;
+    private const uint MSR_PKG_ENERGY_STAT = 0xC001029B;
+    private const uint MSR_PSTATE_STATUS = 0xC0010063;
+    private const uint MSR_PSTATE_0 = 0xC0010064;
+    private const uint MSR_PWR_UNIT = 0xC0010299;
+    private const uint MSR_MPERF_RO = 0xC000_00E7;
+    private const uint MSR_APERF_RO = 0xC000_00E8;
+    private const uint PERF_CTL_0 = 0xC0010000;
+    private const uint PERF_CTR_0 = 0xC0010004;
+    // ReSharper restore InconsistentNaming
+}

@@ -1,0 +1,536 @@
+﻿using CapFrameX.Statistics.NetStandard.Contracts;
+using System;
+using System.Collections.Generic;
+using LibreHardwareMonitor.Hardware.Simulation;
+
+namespace CapFrameX.Contracts.Configuration
+{
+    public interface IAppConfiguration : IFrametimeStatisticProviderOptions, IPmdServiceConfiguration
+	{
+		IObservable<(string key, object value)> OnValueChanged { get; }
+
+		double StutteringFactor { get; set; }
+
+		double StutteringThreshold { get; set; }
+
+		string ObservedDirectory { get; set; }
+
+		string ScreenshotDirectory { get; set; }
+
+		bool UseSingleRecordMaxStatisticParameter { get; set; }
+
+		bool UseSingleRecord99QuantileStatisticParameter { get; set; }
+
+		bool UseSingleRecordP95QuantileStatisticParameter { get; set; }
+
+		bool UseSingleRecordAverageStatisticParameter { get; set; }
+
+        bool UseSingleRecordGpuActiveAverageStatisticParameter { get; set; }
+
+        bool UseSingleRecordMedianStatisticParameter { get; set; }
+
+		bool UseSingleRecordP5QuantileStatisticParameter { get; set; }
+
+		bool UseSingleRecordP1QuantileStatisticParameter { get; set; }
+
+        bool UseSingleRecordGpuActiveP1QuantileStatisticParameter { get; set; }
+
+        bool UseSingleRecordP0Dot1QuantileStatisticParameter { get; set; }
+
+		bool UseSingleRecordP0Dot2QuantileStatisticParameter { get; set; }
+
+		bool UseSingleRecordP1LowAverageStatisticParameter { get; set; }
+
+        bool UseSingleRecordGpuActiveP1LowAverageStatisticParameter { get; set; }
+
+        bool UseSingleRecordP0Dot1LowAverageStatisticParameter { get; set; }
+
+        bool UseSingleRecordP1LowIntegralStatisticParameter { get; set; }
+
+        bool UseSingleRecordP0Dot1LowIntegralStatisticParameter { get; set; }
+
+        bool UseSingleRecordMinStatisticParameter { get; set; }
+
+		bool UseSingleRecordAdaptiveSTDStatisticParameter { get; set; }
+
+		bool UseSingleRecordCpuFpsPerWattParameter { get; set; }
+
+		bool UseSingleRecordGpuFpsPerWattParameter { get; set; }
+
+		bool UseSingleRecordAnimationErrorAverageStatisticParameter { get; set; }
+
+		bool UseSingleRecordAnimationErrorP99StatisticParameter { get; set; }
+
+		string CaptureHotKey { get; set; }
+
+		string OverlayHotKey { get; set; }
+
+		string OverlayConfigHotKey { get; set; }
+
+		string OverlayPositionHotkey { get; set; }
+
+		string ThreadAffinityHotkey { get; set; }
+
+		string ResetMetricsHotkey { get; set; }
+
+		bool UseThreadAffinity { get; set; }
+
+		bool AutoDisableOverlay { get; set; }
+
+		bool OSDCustomPosition { get; set; }
+
+		int OSDPositionX { get; set; }
+
+		int OSDPositionY { get; set; }
+
+		bool ToggleGlobalRTSSOSD { get; set; }
+
+		string HotkeySoundMode { get; set; }
+
+		string UiLanguage { get; set; }
+
+		string OverlayLanguage { get; set; }
+
+		double CaptureTime { get; set; }
+
+		bool UseGlobalCaptureTime { get; set; }
+
+		double CaptureDelay { get; set; }
+
+		double VoiceSoundLevel { get; set; }
+
+		double SimpleSoundLevel { get; set; }
+
+		string ComparisonFirstMetric { get; set; }
+
+		string ComparisonSecondMetric { get; set; }
+
+		string ComparisonThirdMetric { get; set; }
+
+		string RunHistorySecondMetric { get; set; }
+
+		string RunHistoryThirdMetric { get; set; }
+
+		string ComparisonContext { get; set; }
+
+		string SecondComparisonContext { get; set; }
+
+		string RecordingListSortMemberPath { get; set; }
+
+		string RecordingListSortDirection { get; set; }
+
+		string SyncRangeLower { get; set; }
+
+		string SyncRangeUpper { get; set; }
+
+		bool ShowOutlierWarning { get; set; }
+
+		string HardwareInfoSource { get; set; }
+
+		string CustomCpuDescription { get; set; }
+
+		string CustomGpuDescription { get; set; }
+
+		string CustomRamDescription { get; set; }
+
+		string CustomMainboardDescription { get; set; }
+
+		bool IsOverlayActive { get; set; }
+
+		string ResetHistoryHotkey { get; set; }
+
+		bool UseRunHistory { get; set; }
+
+		bool UseAggregation { get; set; }
+
+		string OutlierHandling { get; set; }
+
+		int SelectedHistoryRuns { get; set; }
+
+		int OSDRefreshPeriod { get; set; }
+
+		int MetricInterval { get; set; }
+
+
+		string CloudDownloadDirectory { get; set; }
+		
+		bool SaveAggregationOnly { get; set; }
+
+		int OutlierPercentageOverlay { get; set; }
+
+		string RelatedMetricOverlay { get; set; }
+		/// <summary>
+		/// Set to disable RTSS output but keeping the overlay service up and running to pull values via webservice
+		/// </summary>
+		bool HideOverlay { get; set; }
+
+		/// <summary>
+		/// The selected overlay renderer. <see cref="EnableHookOverlay"/> and
+		/// <see cref="EnableHookFreeOverlay"/> follow it and are stored as its mirror for builds
+		/// that only know the flags; see <see cref="OverlayRendererSelection"/>. A change raises
+		/// <see cref="OnValueChanged"/> for this key first and then for each flag that changed,
+		/// all after the new selection is in place.
+		/// </summary>
+		EOverlayRenderer OverlayRenderer { get; set; }
+
+		/// <summary>
+		/// Use the hook-free DWM/DirectComposition overlay (CapFrameX.OSD). True exactly while
+		/// <see cref="OverlayRenderer"/> is <see cref="EOverlayRenderer.HookFree"/>; writing it
+		/// selects a renderer through <see cref="OverlayRendererSelection.WithHookFreeOverlay"/>.
+		/// </summary>
+		bool EnableHookFreeOverlay { get; set; }
+
+		/// <summary>
+		/// Windows display device name used by the hook-free overlay, for example
+		/// <c>\\.\DISPLAY1</c>. An empty or unavailable device falls back to the primary display.
+		/// </summary>
+		string HookFreeDisplayDeviceName { get; set; }
+
+		/// <summary>
+		/// Maximum visible refresh rate of the hook-free overlay charts in Hz.
+		/// Supported values are 1, 2, 5, 10, 20, 30, 60, and 120; default is 1.
+		/// </summary>
+		int HookFreeRefreshRate { get; set; }
+
+		/// <summary>
+		/// Inject the in-game hook overlay (cfx_osd_hook.dll) into the detected game process for smooth
+		/// in-swapchain graphs. The default renderer; injection targets the PID CapFrameX already
+		/// detected via <see cref="CapFrameX.Monitoring.Contracts.IProcessService.ProcessIdStream"/>.
+		/// True exactly while <see cref="OverlayRenderer"/> is <see cref="EOverlayRenderer.InGame"/>;
+		/// writing it selects a renderer through <see cref="OverlayRendererSelection.WithHookOverlay"/>.
+		/// </summary>
+		bool EnableHookOverlay { get; set; }
+
+		/// <summary>
+		/// In-game hook overlay graph data source. false (default) = the hook's own local
+		/// present-to-present ring (low latency, frametime only). true = CapFrameX's PresentMon
+		/// frame-data stream (frametime AND display-time), delivered via a shared-memory ring and
+		/// replayed by the renderer's buffer/replay clock. The two sources are kept strictly
+		/// separate: PresentMon data carries pipeline latency and isn't comparable to the in-game ring.
+		/// </summary>
+		bool HookOverlayUsePresentMonFrametimes { get; set; }
+
+		/// <summary>
+		/// Explicit opt-in to sending overlay compatibility reports to the update server.
+		/// Local learning is always active and does not depend on this consent.
+		/// </summary>
+		bool ShareOverlayCompatibilityProfiles { get; set; }
+
+		/// <summary>
+		/// Minimum buffer duration in milliseconds for replaying the bursty PresentMon frame
+		/// stream in the hook-free and in-game CapFrameX renderers. Larger values tolerate wider
+		/// delivery gaps at the cost of additional graph latency. Range 500..10000; default 2500.
+		/// The renderer may still increase the delay when it detects a wider delivery wave.
+		/// </summary>
+		int OsdReplayBufferSize { get; set; }
+
+		/// <summary>
+		/// OSD background (panel + chart area) opacity in percent, 0..100. Applies to BOTH
+		/// cfx-OSD backends: the hook-free window overlay (directly via the C API) and the
+		/// in-game hook overlay (published through the metrics shared-memory header flags).
+		/// Text and graph lines are unaffected. Default 97 matches the theme's built-in look.
+		/// </summary>
+		int OsdBackgroundOpacity { get; set; }
+
+		/// <summary>
+		/// Uniform size of the CapFrameX overlay in percent (50..200, default 100). Reaches the
+		/// same two cfx-OSD backends as <see cref="OsdBackgroundOpacity"/> — the hook-free window
+		/// overlay directly through the C API, the in-game hook through the metrics shared-memory
+		/// header flags. Scales fonts, paddings, row gaps and the graphs alike; it does NOT affect
+		/// the RTSS renderer, which has its own zoom in the RTSS settings.
+		/// </summary>
+		int OsdZoom { get; set; }
+
+		/// <summary>
+		/// Scales the CapFrameX overlay with the target's height relative to 1080 pixels, on top of
+		/// <see cref="OsdZoom"/>, and the anchor margins with it (default off: fixed pixel sizes).
+		/// The target is the game's back buffer for the in-game hook and the Vulkan layer, and the
+		/// monitor for the hook-free overlay. Does not affect RTSS.
+		/// </summary>
+		bool OsdScaleWithResolution { get; set; }
+
+		/// <summary>
+		/// Font family of the classic layout in the CapFrameX renderers (hook-free, in-game hook,
+		/// Vulkan layer): its rows and graphs. Default "Segoe UI"; an empty value restores it. A
+		/// design keeps the fonts set in the overlay editor. Does not affect RTSS.
+		/// </summary>
+		string OsdFontFamily { get; set; }
+
+		/// <summary>Saved designer profile used by the CapFrameX renderers; empty retains the classic overlay.</summary>
+		string ActiveOverlayDesignProfileId { get; set; }
+
+        /// <summary>Last successfully selected tile profile, retained while Row overlay or RTSS is active.</summary>
+        string LastOverlayDesignProfileId { get; set; }
+
+		/// <summary>
+		/// Corner the CapFrameX overlay is anchored to, as <c>cfx_osd_anchor</c>:
+		/// 0 = top left, 1 = top right, 2 = bottom left, 3 = bottom right, 4 = top center.
+		/// Applies to all three CapFrameX renderers (hook-free, in-game hook, Vulkan layer);
+		/// RTSS is positioned by its own settings.
+		/// </summary>
+		int OsdAnchor { get; set; }
+
+		/// <summary>Horizontal distance from the anchored corner in px (0..2000).</summary>
+		int OsdMarginX { get; set; }
+
+		/// <summary>Vertical distance from the anchored corner in px (0..2000).</summary>
+		int OsdMarginY { get; set; }
+
+		/// <summary>
+		/// OLED pixel orbit for every overlay design and the classic rows: the CapFrameX
+		/// renderers move by one pixel per interval within the radius (see <see cref="OsdPixelOrbit"/>).
+		/// A design that requests its own orbit applies it even while this is off.
+		/// </summary>
+		bool OsdPixelOrbitEnabled { get; set; }
+
+		/// <summary>Seconds between two pixel orbit steps (10..3600).</summary>
+		int OsdPixelOrbitInterval { get; set; }
+
+		/// <summary>Largest pixel orbit offset from the configured margins in px (1..32).</summary>
+		int OsdPixelOrbitRadius { get; set; }
+
+		/// <summary>
+		/// Smooth numeric values between OSD data updates. When disabled, the CapFrameX
+		/// renderers display each newly published value immediately without generated
+		/// intermediate values. Enabled by default for backward compatibility.
+		/// </summary>
+		bool UseOsdValueSmoothing { get; set; }
+
+		bool ShowSystemTimeSeconds { get; set; }
+
+		int InputLagOffset { get; set; }
+
+		string SecondMetricAggregation { get; set; }
+
+		string ThirdMetricAggregation { get; set; }
+
+		string RelatedMetricAggregation { get; set; }
+
+		int OutlierPercentageAggregation { get; set; }
+
+		bool AreThresholdsReversed { get; set; }
+
+		string CaptureRootDirectory { get; set; }
+
+		bool ShareProcessListEntries { get; set; }
+
+		bool AutoUpdateProcessList { get; set; }
+
+		bool UseSensorLogging { get; set; }
+
+		SimulationConfiguration HardwareSimulationConfiguration { get; set; }
+
+		/// <summary>
+		/// Toggle between absolute and percentage values for threshold bar charts
+		/// </summary>
+		bool AreThresholdValuesAbsolute { get; set; }
+
+        bool AnalysisRangeSliderRealTime { get; set; }
+
+        bool AnalysisShowCpuLoad { get; set; }
+
+        bool AnalysisShowCpuMaxThreadLoad { get; set; }
+
+        bool AnalysisShowGpuLoad { get; set; }
+
+        bool AnalysisShowGpuPowerLimit { get; set; }
+
+        bool AnalysisShowPcLatency { get; set; }
+
+        bool AnalysisShowAnimationError { get; set; }
+
+        bool AnalysisShowGpuActiveChart { get; set; }
+
+        bool AnalysisShowCpuActiveChart { get; set; }
+
+        bool ComparisonRangeSliderRealTime { get; set; }
+
+        int OverlayEntryConfigurationFile { get; set; }
+
+        int SelectedOverlayTemplate { get; set; }
+
+		int SensorLoggingRefreshPeriod { get; set; }
+
+		bool ShowThresholdTimes { get; set; }
+
+		string CaptureFileMode { get; set; }
+
+		bool StartMinimized { get; set; }
+        bool MinimizeToTray { get; set; }
+
+        bool Autostart { get; set; }
+
+		bool IsGpuAccelerationActive { get; set; }
+
+		int HorizontalGraphExportRes { get; set; }
+
+		int VerticalGraphExportRes { get; set; }
+
+		string GraphicsAdapter { get; set; }
+
+        bool ReportShowAverageRow { get; set; }
+
+        bool ReportUsePMDValues { get; set; }
+
+        IReportDataGridColumnSettings ReportDataGridColumnSettings { get; set; }
+
+		string SensorReportEvaluationMethod { get; set; }
+
+		bool UseDarkMode { get; set; }
+
+		bool FixedExpanderPosition { get; set; }
+
+		bool IsRecordInfoExpanded { get; set; }
+
+		bool RecordListShowCreationTime { get; set; }
+
+		bool RecordListShowComment { get; set; }
+
+		bool RecordListShowIsAggregated { get; set; }
+
+		bool RecordListShowCpuName { get; set; }
+
+		bool RecordListShowGpuName { get; set; }
+
+		bool RecordListShowRamName { get; set; }
+
+		int[] RecordListHeaderOrder { get; set; }
+		/// <summary>
+		/// Time, when the app notification was last closed. When older than the timestamp of current squidex notification, a notification is shown again.
+		/// </summary>
+		DateTime LastAppNotificationTimestamp { get; set; }
+
+		bool AppNotificationsActive { get; set; }
+
+		/// <summary>
+		/// Whether the update service asks the update server for a newer version on app start.
+		/// The manual check in the options popup works regardless of this setting.
+		/// </summary>
+		bool AutoUpdateCheckActive { get; set; }
+
+		string WebservicePort { get; set; }
+
+		bool CaptureRTSSFrameTimes { get; set; }
+		/// <summary>
+		/// When available, use the simulated TBP value instead of the normal "GPU Total" value for analysis like FPS/W
+		/// </summary>
+		bool UseTBPSim { get; set; }
+
+		bool BenchlabUpdateCharts { get; set; }
+
+		bool PoweneticsUpdateCharts { get; set; }
+
+		bool BenchlabAutoStartPmd { get; set; }
+
+		bool UseDisplayChangeMetrics { get; set; }
+
+		bool UsePcLatency { get; set; }
+
+		/// <summary>
+		/// Size of PresentMon's present event circular buffer (--set_circular_buffer_size).
+		/// PresentMon only accepts powers of two; CapFrameX offers 2048, 4096 and 8192.
+		/// </summary>
+		int PresentMonCircularBufferSize { get; set; }
+
+        bool UseAdlFallback { get; set; }
+
+		string FirstMetricBarColor { get; set; }
+
+		string SecondMetricBarColor { get; set; }
+
+		string ThirdMetricBarColor { get; set; }
+
+        List<string> ComparisonLineGraphColors { get; set; }
+
+        string PingURL { get; set; }
+
+        bool SuppressFrameViewServiceWarning { get; set; }
+
+        string DeclinedPortableVulkanLayerSignature { get; set; }
+
+        bool McpEnabled { get; set; }
+    }
+
+	public interface IReportDataGridColumnSettings
+    {
+		bool ReportShowCreationDate { get; set; }
+
+		bool ReportShowCreationTime { get; set; }
+
+		bool ReportShowNumberOfSamples { get; set; }
+
+		bool ReportShowRecordTime { get; set; }
+
+		bool ReportShowCpuName { get; set; }
+
+		bool ReportShowGpuName { get; set; }
+
+		bool ReportShowRamName { get; set; }
+
+		bool ReportShowComment { get; set; }
+
+		bool ReportShowMaxFPS { get; set; }
+
+		bool ReportShowP99FPS { get; set; }
+
+		bool ReportShowP95FS { get; set; }
+
+		bool ReportShowMedianFPS { get; set; }
+
+		bool ReportShowAverageFPS { get; set; }
+
+        bool ReportShowGpuActiveTimeAverage { get; set; }
+
+        bool ReportShowP5FPS { get; set; }
+
+		bool ReportShowP1FPS { get; set; }
+
+        bool ReportShowP0Dot2FPS { get; set; }
+
+		bool ReportShowP0Dot1FPS { get; set; }
+
+		bool ReportShowP1LowAverageFPS { get; set; }
+
+        bool ReportShowP0Dot1LowAverageFPS { get; set; }
+
+        bool ReportShowP1LowIntegralFPS { get; set; }
+
+        bool ReportShowP0Dot1LowIntegralFPS { get; set; }
+
+        bool ReportShowMinFPS { get; set; }
+
+        bool ReportShowAnimationErrorP99 { get; set; }
+
+        bool ReportShowAnimationErrorAverage { get; set; }
+
+		bool ReportShowAdaptiveSTD { get; set; }
+
+		bool ReportShowCpuFpsPerWatt { get; set; }
+
+		bool ReportShowGpuFpsPerWatt { get; set; }
+
+        bool ReportShowAppLatency { get; set; }
+
+        bool ReportShowGpuActiveTimeDeviation { get; set; }
+
+        bool ReportShowCpuMaxUsage { get; set; }
+
+		bool ReportShowCpuPower { get; set; }
+
+		bool ReportShowCpuMaxClock { get; set; }
+
+		bool ReportShowCpuTemp{ get; set; }
+
+		bool ReportShowGpuUsage { get; set; }
+
+		bool ReportShowGpuPower { get; set; }
+
+		bool ReportShowGpuTBPSim { get; set; }
+
+		bool ReportShowGpuClock { get; set; }
+
+		bool ReportShowGpuTemp { get; set; }
+
+		IReportDataGridColumnSettings Clone();
+	}
+}

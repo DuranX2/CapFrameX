@@ -1,0 +1,21 @@
+﻿namespace CapFrameX.Contracts.Sensor
+{
+    public interface ISensorEntry
+    {
+        string Identifier { get; set; }
+
+        string SortKey { get; set; }    
+
+        string Name { get; set; } 
+
+        object Value { get; set; }
+
+        string HardwareType { get; set; }
+
+        string SensorType { get; set; }
+
+        bool IsPresentationDefault { get; set; }
+
+        string HardwareName { get; set; }
+    }
+}

@@ -1,0 +1,1124 @@
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Logging;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Extensions;
+using CapFrameX.Extensions.NetStandard;
+using CapFrameX.Hotkey;
+using CapFrameX.Monitoring.Contracts;
+using CapFrameX.Overlay;
+using CapFrameX.PresentMonInterface;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using Microsoft.Extensions.Logging;
+using OxyPlot;
+using OxyPlot.Axes;
+using OxyPlot.Legends;
+using Prism.Commands;
+using Prism.Events;
+using Prism.Mvvm;
+using Prism.Navigation.Regions;
+using System;
+using System.ComponentModel;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Reactive.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+
+namespace CapFrameX.ViewModel
+{
+    public partial class CaptureViewModel : BindableBase, INavigationAware
+    {
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IEventAggregator _eventAggregator;
+        private readonly IRecordManager _recordManager;
+        private readonly IOverlayService _overlayService;
+        private readonly IOverlayEntryProvider _overlayEntryProvider;
+        private readonly ISensorService _sensorService;
+        private readonly IOnlineMetricService _onlineMetricService;
+        private readonly IStatisticProvider _statisticProvider;
+        private readonly ILogger<CaptureViewModel> _logger;
+        private readonly ProcessList _processList;
+        private readonly SoundManager _soundManager;
+        private readonly CaptureManager _captureManager;
+        private readonly ISensorConfig _sensorConfig;
+        private readonly IRTSSService _rTSSService;
+        private readonly ILogEntryManager _logEntryManager;
+
+        private IDisposable _disposableHeartBeat;
+        private string _selectedProcessToCapture;
+        private string _selectedProcessToIgnore;
+        // Built on demand so the text follows the interface language, including after a switch.
+        private Func<string> _captureStateInfo = () => string.Empty;
+        private string _captureTimeString = "0";
+        private string _captureDelayString = "0";
+        private string _captureStartDelayString = "0";
+        private PlotModel _frametimeModel;
+        private string _lastCapturedProcess;
+        private string _currentGameNameToCapture = string.Empty;
+        private string _currentProcessToCapture = string.Empty;
+        private int _lastPublishedProcessId;
+        private bool _isLoggerOutputEmpty = true;
+        private bool _isUpdatingProcessList;
+        private bool _areButtonsActive = true;
+        private Dictionary<string, string> _gameFileDescriptionCache = new Dictionary<string, string>();
+        // Bumped by every change of the process list, from any thread; see RefreshProcessListCaches.
+        private int _processListGeneration;
+        private int _cachedProcessListGeneration;
+        private HashSet<string> _ignoredProcessFilter;
+
+        private PubSubEvent<ViewMessages.CurrentProcessToCapture> _updateCurrentProcess;
+
+        public string SelectedProcessToCapture
+        {
+            get { return _selectedProcessToCapture; }
+            set
+            {
+                _selectedProcessToCapture = value;
+                RaisePropertyChanged();
+                if (!_isUpdatingProcessList)
+                {
+                    // The automatic target is not kept up to date while a selection decides.
+                    if (string.IsNullOrWhiteSpace(value))
+                        UpdateAutoTarget();
+                    OnSelectedProcessToCaptureChanged();
+                }
+            }
+        }
+
+        public string SelectedProcessToIgnore
+        {
+            get { return _selectedProcessToIgnore; }
+            set
+            {
+                _selectedProcessToIgnore = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool AreButtonsActive
+        {
+            get => _areButtonsActive;
+            set
+            {
+                if (SetProperty(ref _areButtonsActive, value))
+                    RaisePropertyChanged(nameof(CanRememberGameCaptureTime));
+            }
+        }
+
+        public bool IsLoggerOutputEmpty
+        {
+            get { return _isLoggerOutputEmpty; }
+            set
+            {
+                _isLoggerOutputEmpty = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CaptureStateInfo => _captureStateInfo();
+
+        private void SetCaptureStateInfo(Func<string> text)
+        {
+            _captureStateInfo = text ?? (() => string.Empty);
+            RaisePropertyChanged(nameof(CaptureStateInfo));
+        }
+
+        public string CaptureDelayString
+        {
+            get { return _captureDelayString; }
+            set
+            {
+                _captureDelayString = value;
+
+                if (double.TryParse(_captureDelayString, out _))
+                    _appConfiguration.CaptureDelay = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CaptureStartDelayString
+        {
+            get { return _captureStartDelayString; }
+            set
+            {
+                _captureStartDelayString = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CaptureHotkeyString
+        {
+            get { return _appConfiguration.CaptureHotKey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.CaptureHotKey = value;
+                UpdateCaptureStateInfo();
+                SetGlobalHookEventCaptureHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public PlotModel FrametimeModel
+        {
+            get { return _frametimeModel; }
+            set
+            {
+                _frametimeModel = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SelectedSoundMode
+        {
+            get => Enum.GetName(typeof(SoundMode), _soundManager.SoundMode);
+            set
+            {
+                _soundManager.SoundMode = (SoundMode)Enum.Parse(typeof(SoundMode), value);
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(SliderSoundLevel));
+                RaisePropertyChanged(nameof(ShowVolumeController));
+            }
+        }
+
+        public bool ShowVolumeController => _soundManager.SoundMode != SoundMode.None;
+
+        public double SliderSoundLevel
+        {
+            get => Math.Round(_soundManager.Volume * 100, 0, MidpointRounding.AwayFromZero);
+            set
+            {
+                _soundManager.Volume = value / 100;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowBasicInfo
+        {
+            get => _logEntryManager.ShowBasicInfo;
+            set
+            {
+                _logEntryManager.ShowBasicInfo = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowAdvancedInfo
+        {
+            get => _logEntryManager.ShowAdvancedInfo;
+            set
+            {
+                _logEntryManager.ShowAdvancedInfo = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowErrors
+        {
+            get => _logEntryManager.ShowErrors;
+            set
+            {
+                _logEntryManager.ShowErrors = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // Run history and aggregation options
+        public string ResetHistoryHotkeyString
+        {
+            get { return _appConfiguration.ResetHistoryHotkey; }
+            set
+            {
+                if (!CXHotkey.IsValidSetting(value))
+                    return;
+
+                _appConfiguration.ResetHistoryHotkey = value;
+                SetGlobalHookEventResetHistoryHotkey();
+                RaisePropertyChanged();
+            }
+        }
+
+        public EMetric SelectedSecondMetric
+        {
+            get
+            {
+                return _appConfiguration
+                  .RunHistorySecondMetric
+                  .ConvertToEnum<EMetric>();
+            }
+            set
+            {
+                _appConfiguration.RunHistorySecondMetric =
+                    value.ConvertToString();
+                _overlayService.SecondMetric = value.ConvertToString();
+                RaisePropertyChanged();
+            }
+        }
+
+        public EMetric SelectedThirdMetric
+        {
+            get
+            {
+                return _appConfiguration
+                  .RunHistoryThirdMetric
+                  .ConvertToEnum<EMetric>();
+            }
+            set
+            {
+                _appConfiguration.RunHistoryThirdMetric =
+                    value.ConvertToString();
+                _overlayService.ThirdMetric = value.ConvertToString();
+                RaisePropertyChanged();
+            }
+        }
+
+        public int SelectedNumberOfRuns
+        {
+            get
+            {
+                return _appConfiguration
+                  .SelectedHistoryRuns;
+            }
+            set
+            {
+                _appConfiguration.SelectedHistoryRuns =
+                    value;
+
+                _overlayService.UpdateNumberOfRuns(value);
+                if (value == 1)
+                    UseAggregation = false;
+                RaisePropertyChanged(nameof(AggregationButtonEnabled));
+                RaisePropertyChanged();
+            }
+        }
+
+        public int SelectedOutlierPercentage
+        {
+            get
+            {
+                return _appConfiguration
+                  .OutlierPercentageOverlay;
+            }
+            set
+            {
+                _appConfiguration.OutlierPercentageOverlay =
+                    value;
+                _overlayService.ResetHistory();
+                RaisePropertyChanged();
+            }
+        }
+
+        public EOutlierHandling SelectedOutlierHandling
+        {
+            get
+            {
+                return _appConfiguration
+                  .OutlierHandling
+                  .ConvertToEnum<EOutlierHandling>();
+            }
+            set
+            {
+                _appConfiguration.OutlierHandling =
+                    value.ConvertToString();
+                _overlayService.ResetHistory();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UseRunHistory
+        {
+            get
+            {
+                return _appConfiguration
+                  .UseRunHistory;
+            }
+            set
+            {
+                _appConfiguration.UseRunHistory = value;
+                _rTSSService.SetShowRunHistory(value);
+                OnUseRunHistoryChanged();
+                RaisePropertyChanged(nameof(AggregationButtonEnabled));
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool UseAggregation
+        {
+            get
+            {
+                return _appConfiguration
+                  .UseAggregation;
+            }
+            set
+            {
+                _appConfiguration.UseAggregation =
+                    value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool AggregationButtonEnabled => UseRunHistory && SelectedNumberOfRuns > 1;
+
+        public bool SaveAggregationOnly
+        {
+            get
+            {
+                return _appConfiguration
+                  .SaveAggregationOnly;
+            }
+            set
+            {
+                _appConfiguration.SaveAggregationOnly =
+                    value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SelectedRelatedMetric
+        {
+            get
+            {
+                return _appConfiguration.RelatedMetricOverlay;
+            }
+            set
+            {
+                _appConfiguration.RelatedMetricOverlay = value;
+                _overlayService.ResetHistory();
+                RaisePropertyChanged();
+            }
+        }
+
+        public Array SecondMetricItems => Enum.GetValues(typeof(EMetric))
+            .Cast<EMetric>()
+            .Where(metric => metric != EMetric.Average && metric != EMetric.None)
+            .ToArray();
+        public Array ThirdMetricItems => Enum.GetValues(typeof(EMetric))
+            .Cast<EMetric>()
+            .Where(metric => metric != EMetric.Average)
+            .ToArray();
+
+        public Array NumberOfRunsItemsSource => Enumerable.Range(1, 20).ToArray();
+
+        public Array OutlierPercentageItemsSource => Enumerable.Range(1, 9).ToArray();
+
+        public Array OutlierHandlingItems => Enum.GetValues(typeof(EOutlierHandling))
+            .Cast<EOutlierHandling>()
+            .ToArray();
+
+        public Array RelatedMetricItemsSource => new[] { "Average", "Second", "Third" };
+
+        // End of run history and aggregation options
+
+        public string[] SoundModes => _soundManager.AvailableSoundModes;
+
+        public IAppConfiguration AppConfiguration => _appConfiguration;
+
+        // Process discovery is observed on the UI dispatcher. Synchronous collection
+        // notifications keep selection changes inside the guarded refresh below.
+        public ObservableCollection<string> ProcessesToCapture { get; }
+            = new ObservableCollection<string>();
+
+        public ObservableConcurrentCollection<(string, int)> ProcessesInfo { get; }
+            = new ObservableConcurrentCollection<(string, int)>();
+
+        public ObservableCollection<string> ProcessesToIgnore { get; }
+            = new ObservableCollection<string>();
+
+        public ObservableCollection<ILogEntry> LoggerOutput
+            => _logEntryManager.LogEntryOutput;
+
+        public ICommand AddToIgonreListCommand { get; }
+
+        public ICommand AddToProcessListCommand { get; }
+
+        public ICommand ResetPresentMonCommand { get; }
+
+        public ICommand UpdateLogCommand { get; }
+
+        public ICommand ClearLogCommand { get; }
+
+        public ICommand ShowProcessDetailsCommand { get; }
+
+        public Array LoggingPeriodItemsSource => new[] { 250, 500 };
+
+        public CaptureViewModel(IAppConfiguration appConfiguration,
+            IEventAggregator eventAggregator,
+            IRecordManager recordManager,
+            IOverlayService overlayService,
+            IOverlayEntryProvider overlayEntryProvider,
+            ISensorService sensorService,
+            IOnlineMetricService onlineMetricService,
+            IStatisticProvider statisticProvider,
+            ILogger<CaptureViewModel> logger,
+            ProcessList processList,
+            SoundManager soundManager,
+            CaptureManager captureManager,
+            ISensorConfig sensorConfig,
+            IRTSSService rTSSService,
+            ILogEntryManager logEntryManager)
+        {
+            _appConfiguration = appConfiguration;
+            _eventAggregator = eventAggregator;
+            _recordManager = recordManager;
+            _overlayService = overlayService;
+            _overlayEntryProvider = overlayEntryProvider;
+            _sensorService = sensorService;
+            _onlineMetricService = onlineMetricService;
+            _statisticProvider = statisticProvider;
+            _logger = logger;
+            _processList = processList;
+            _soundManager = soundManager;
+            _captureManager = captureManager;
+            _sensorConfig = sensorConfig;
+            _rTSSService = rTSSService;
+            _logEntryManager = logEntryManager;
+
+            AddToIgonreListCommand = new DelegateCommand(OnAddToIgonreList);
+            AddToProcessListCommand = new DelegateCommand(OnAddToProcessList);
+            ResetPresentMonCommand = new DelegateCommand(OnResetCaptureProcess);
+            ShowProcessDetailsCommand = new DelegateCommand(ShowProcessDetails);
+            UpdateLogCommand = new DelegateCommand(() => _logEntryManager?.UpdateFilter());
+            ClearLogCommand = new DelegateCommand(() => _logEntryManager?.ClearLog());
+            UseGlobalCaptureTimeCommand = new DelegateCommand(UseGlobalCaptureDuration, () => AreButtonsActive)
+                .ObservesProperty(() => AreButtonsActive);
+            RememberGameCaptureTimeCommand = new DelegateCommand(RememberGameCaptureDuration, () => CanRememberGameCaptureTime)
+                .ObservesProperty(() => CanRememberGameCaptureTime);
+
+            LoggerOutput.CollectionChanged += (e, x) =>
+            {
+                IsLoggerOutputEmpty = (x.NewItems?.Count ?? 0) == 0;
+            };
+
+            _rTSSService.SetShowRunHistory(UseRunHistory);
+
+            _captureManager
+                .CaptureStatusChange
+                .ObserveOnDispatcher()
+                .Subscribe(status =>
+            {
+                if (status.Status != null)
+                {
+                    AreButtonsActive = status.Status == ECaptureStatus.Stopped;
+
+                    if (status.Status == ECaptureStatus.Processing)
+                    {
+                        SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_CreatingCaptureFile") + Environment.NewLine);
+                        _overlayService.SetCaptureServiceStatus("Processing data");
+                    }
+                    else if (status.Status == ECaptureStatus.StartedDelay)
+                    {
+                        var delay = CaptureDelayString;
+                        SetCaptureStateInfo(() => CxLang.Format("CaptureViewModel_CaptureStartingWithDelay", delay) + Environment.NewLine);
+                        _overlayService.SetCaptureServiceStatus("Capture starting in");
+                    }
+                    else
+                    {
+                        if (status.Status == ECaptureStatus.Stopped)
+                            UpdateCaptureStateInfo();
+                    }
+
+                    if (status.Status == ECaptureStatus.StartedTimer)
+                    {
+                        var captureTime = CaptureTimeString;
+                        SetCaptureStateInfo(() => CxLang.Format("CaptureViewModel_CapturingInProgressSetTime", captureTime) + Environment.NewLine
+                          + GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_Press0ToStopCapture", hotkey)));
+                    }
+                    else if (status.Status == ECaptureStatus.StartedRemote)
+                    {
+                        SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_RemoteCapturingInProgress") + Environment.NewLine);
+                    }
+                    else if (status.Status == ECaptureStatus.Started)
+                    {
+                        SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_CapturingInProgress") + Environment.NewLine
+                          + GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_Press0ToStopCapture", hotkey)));
+                    }
+                }
+            });
+
+            CxLang.Instance.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(CxLang.UiLanguage))
+                {
+                    RaisePropertyChanged(nameof(CaptureTimeScopeLabel));
+                    RaisePropertyChanged(nameof(CaptureTimeScopeToolTip));
+                    RaisePropertyChanged(nameof(CaptureTimeProcessLabel));
+                    RaisePropertyChanged(nameof(GlobalCaptureTimeDescription));
+                    RaisePropertyChanged(nameof(GameCaptureTimeDescription));
+                    RaisePropertyChanged(nameof(CaptureStateInfo));
+                }
+            };
+
+            _logger.LogDebug("{viewName} Ready", this.GetType().Name);
+            SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_ServiceReady") + Environment.NewLine +
+                GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_Press0ToStartCaptureOfRunningProcess", hotkey)));
+            SelectedSoundMode = _appConfiguration.HotkeySoundMode;
+            RestoreCaptureTime();
+            CaptureDelayString = _appConfiguration.CaptureDelay.ToString(CultureInfo.InvariantCulture);
+            _disposableHeartBeat?.Dispose();
+            _disposableHeartBeat = GetListUpdateHeartBeat();
+            _updateCurrentProcess = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.CurrentProcessToCapture>>(); ;
+
+            SubscribeToUpdateProcessIgnoreList();
+            SubscribeToGlobalCaptureHookEvent();
+            SetGlobalHookEventResetHistoryHotkey();
+
+            bool captureServiceStarted = _captureManager.RestartCaptureService();
+
+            if (captureServiceStarted)
+                _overlayService.SetCaptureServiceStatus("Capture service ready...");
+
+
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.OverlayConfigChanged>>()
+                .Subscribe(msg =>
+                {
+                    OnUseRunHistoryChanged();
+                });
+
+
+            InitializeFrametimeModel();
+        }
+
+        public bool IsNavigationTarget(NavigationContext navigationContext)
+        {
+            return true;
+        }
+
+        public void OnNavigatedFrom(NavigationContext navigationContext)
+        {
+        }
+
+        public void OnNavigatedTo(NavigationContext navigationContext)
+        {
+        }
+
+        public void OnSoundLevelChanged()
+        {
+            _soundManager.PlaySound(Sound.CaptureStarted);
+        }
+
+        private void SubscribeToUpdateProcessIgnoreList()
+        {
+            // Synchronous on the thread of the change, so the next list update never reads a
+            // cache that is older than the change.
+            _processList.ProcessesUpdate
+                .Subscribe(_ => System.Threading.Interlocked.Increment(ref _processListGeneration));
+
+            _processList.ProcessesUpdate
+                .StartWith(default(int))
+                .ObserveOnDispatcher()
+                .Subscribe(_ =>
+                {
+                    ProcessesToIgnore.Clear();
+                    ProcessesToIgnore.AddRange(_processList.GetIgnoredProcessNames());
+                    if (!_isCaptureTimeEdited && AreButtonsActive)
+                        RestoreCaptureTime();
+                });
+        }
+
+        private void SubscribeToGlobalCaptureHookEvent()
+        {
+            SetGlobalHookEventCaptureHotkey();
+        }
+
+        private void SetGlobalHookEventCaptureHotkey()
+        {
+            // No local re-trigger lock: key repeat is filtered centrally for every hotkey now
+            // (KeyRepeatFilter). The 500 ms lock this replaces also swallowed deliberate double
+            // presses; a start immediately followed by a stop is legitimate and is already
+            // guarded by LockCaptureService and the capture state checks in SetCaptureMode.
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.Capture,
+                () =>
+                {
+                    _logger.LogDebug("Hotkey ({captureHotkeyString}) callback triggered. Lock capture service state is {lockCaptureServiceState}.", CaptureHotkeyString, _captureManager.LockCaptureService);
+                    _logger.LogDebug("IsCapturing state: {isCapturingState}", _captureManager.IsCapturing);
+                    if (!_captureManager.LockCaptureService)
+                    {
+                        SetCaptureMode();
+                    }
+                });
+        }
+
+        /// <summary>
+        /// Runs a capture start/stop on a thread of its own. Task.Run queues onto the thread pool,
+        /// and when the pool is saturated by blocking work (sensor polling, WMI, PresentMon I/O) it
+        /// adds threads at roughly one per second, so the hotkey action sat in that queue for
+        /// seconds while nothing in the log said why. LongRunning starts a dedicated thread now.
+        /// </summary>
+        private static void StartCaptureWork(Func<Task> work)
+        {
+            Task.Factory.StartNew(work, System.Threading.CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        private void SetCaptureMode()
+        {
+            if (!ProcessesToCapture.Any())
+            {
+                _soundManager.PlaySound(Sound.NoProcess);
+                _logEntryManager.AddLogEntry("Capture triggered, but no process was detected", ELogMessageType.BasicInfo, true);
+                return;
+            }
+            else if (!_captureManager.IsCapturing && !_captureManager.DelayCountdownRunning)
+            {
+                // Resolved for starts only: a stop must never depend on the list.
+                var processInfo = GetCaptureRequestTarget();
+                if (processInfo.Item1 == null)
+                {
+                    _soundManager.PlaySound(Sound.MoreThanOneProcess);
+                    _logEntryManager.AddLogEntry("Capture triggered, but multiple proccesses were detected", ELogMessageType.BasicInfo, true);
+                    return;
+                }
+
+                string processToCapture = processInfo.Item1;
+
+                if (!CommitCaptureTime())
+                {
+                    _logEntryManager.AddLogEntry("Enter a valid capture duration before starting a capture (0 = no limit).", ELogMessageType.Error, true);
+                    return;
+                }
+
+                // Freeze the selected process and its settings before starting the worker.
+                var captureOptions = new CaptureOptions()
+                {
+                    CaptureTime = GetEffectiveCaptureTime(processToCapture),
+                    CaptureDelay = _appConfiguration.CaptureDelay,
+                    CaptureFileMode = AppConfiguration.CaptureFileMode,
+                    ProcessInfo = processInfo,
+                    Remote = false
+                };
+
+                StartCaptureWork(async () =>
+                {
+                    try
+                    {
+                        await _captureManager.StartCapture(captureOptions);
+                    }
+                    catch (Exception e)
+                    {
+                        _logEntryManager.AddLogEntry($"Error: {e.Message}", ELogMessageType.Error, false);
+                    }
+                });
+
+                _lastCapturedProcess = processToCapture;
+            }
+            else
+            {
+                StartCaptureWork(async () =>
+                {
+                    try
+                    {
+                        await _captureManager.StopCapture();
+                    }
+                    catch (Exception e)
+                    {
+                        _logEntryManager.AddLogEntry($"Error: {e.Message}", ELogMessageType.Error, false);
+                    }
+                    finally
+                    {
+                        Application.Current.Dispatcher.Invoke(() =>
+                        {
+                            UpdateCaptureStateInfo();
+                        });
+                    }
+                });
+            }
+        }
+
+        // The ignore list reaches PresentMon as --exclude arguments, so every change to it has to
+        // go through a restart of the capture service - which reads the list back in.
+        private void OnAddToIgonreList()
+        {
+            if (SelectedProcessToCapture == null)
+                return;
+
+            var process = _processList.Processes
+                .FirstOrDefault(p => p.Name == SelectedProcessToCapture);
+            if (process is null)
+            {
+                _processList.AddEntry(SelectedProcessToCapture, null, true);
+            }
+            else if (process is CXProcess)
+            {
+                process.Blacklist();
+            }
+            _processList?.Save();
+
+            SelectedProcessToCapture = null;
+            _captureManager.RestartCaptureService();
+        }
+
+        private void OnAddToProcessList()
+        {
+            if (SelectedProcessToIgnore == null)
+                return;
+
+            var process = _processList.Processes
+                .FirstOrDefault(p => p.Name == SelectedProcessToIgnore);
+
+            if (process is CXProcess)
+            {
+                process.Whitelist();
+                _processList?.Save();
+            }
+
+            _captureManager.RestartCaptureService();
+        }
+
+        private void OnResetCaptureProcess()
+        {
+            SelectedProcessToCapture = null;
+            _captureManager.RestartCaptureService();
+        }
+
+        private IDisposable GetListUpdateHeartBeat()
+        {
+            return Observable
+                .Timer(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(1))
+                .ObserveOnDispatcher()
+                .Where(x => AreButtonsActive && !_captureManager.IsCapturing && !_captureManager.DelayCountdownRunning)
+                .Subscribe(x => UpdateProcessToCaptureList());
+        }
+
+        private void UpdateProcessToCaptureList()
+        {
+            var selectedProcessToCapture = SelectedProcessToCapture;
+
+            RefreshProcessListCaches();
+            var processesInfo = _captureManager.GetAllFilteredProcesses(_ignoredProcessFilter).ToArray();
+            var processList = processesInfo.Select(info => info.Item1).ToArray();
+
+            // A ListView clears its selection while its items are replaced. Do not treat
+            // that intermediate state as a real process/scope change or commit an edit.
+            _isUpdatingProcessList = true;
+            try
+            {
+                foreach (var process in ProcessesToCapture.Where(process => !processList.Contains(process)).ToArray())
+                    ProcessesToCapture.Remove(process);
+                foreach (var process in processList.Where(process => !ProcessesToCapture.Contains(process)))
+                    ProcessesToCapture.Add(process);
+                ProcessesInfo.Clear();
+                ProcessesInfo.AddFromEnumerable(processesInfo);
+                SelectedProcessToCapture = processList.Contains(selectedProcessToCapture)
+                    ? selectedProcessToCapture : null;
+            }
+            finally
+            {
+                _isUpdatingProcessList = false;
+            }
+
+            if (ProcessesToCapture.Any() && !string.IsNullOrWhiteSpace(_lastCapturedProcess))
+            {
+                if (!ProcessesToCapture.Contains(_lastCapturedProcess) ||
+                    (selectedProcessToCapture != null &&
+                    selectedProcessToCapture != _lastCapturedProcess))
+                {
+                    _overlayService.ResetHistory();
+                }
+            }
+
+            // The capture hotkey is deliberately NOT re-registered here. Its action is a closure
+            // over this view model and always reads the current process list, so a detected
+            // process never invalidated the registration — while re-registering once per process
+            // change used to tear down and re-install the global hook, which drops keystrokes.
+
+            UpdateAutoTarget();
+            OnSelectedProcessToCaptureChanged();
+        }
+
+        /// <summary>
+        /// Rebuilds what the once-per-second list update derives from the process list, only after
+        /// the list changed: the ignore filter (a copy of all entries and a sort of the ignored
+        /// names) and the known-game lookups of the automatic target selection.
+        /// </summary>
+        private void RefreshProcessListCaches()
+        {
+            // Read first: a change during the rebuild bumps it again and the next call rebuilds.
+            int generation = System.Threading.Volatile.Read(ref _processListGeneration);
+            if (_ignoredProcessFilter != null && generation == _cachedProcessListGeneration)
+                return;
+
+            _cachedProcessListGeneration = generation;
+            _ignoredProcessFilter = _processList.GetIgnoredProcessNames().ToHashSet();
+            _knownGameCache.Clear();
+        }
+
+        private void OnSelectedProcessToCaptureChanged()
+        {
+            UpdateProcessToCapture();
+            UpdateCaptureStateInfo();
+        }
+
+        private void UpdateProcessToCapture()
+        {
+            string currentProcess = null;
+            int processId = 0;
+            // explicit hook
+            if (!string.IsNullOrWhiteSpace(SelectedProcessToCapture))
+            {
+                currentProcess = SelectedProcessToCapture;
+                processId = ProcessesInfo.FirstOrDefault(info => info.Item1 == currentProcess).Item2;
+            }
+            // auto hook, see CaptureTargetResolver
+            else if (_autoTarget.Target != null)
+            {
+                currentProcess = _autoTarget.Target.Name;
+                processId = _autoTarget.Target.ProcessId;
+            }
+
+            if (_currentProcessToCapture != currentProcess)
+            {
+                // An automatic process switch also finishes a valid edit for the old target.
+                CommitCaptureTime();
+                GetGameNameFromProcessList(currentProcess);
+                _currentProcessToCapture = currentProcess;
+                RestoreCaptureTime();
+            }
+
+            if (processId != _lastPublishedProcessId)
+            {
+                // Every overlay renderer keys its frame feed on this PID; a flicker to 0 silences
+                // the hook-free graph and renames its <APP> group, so each change is logged once
+                // while extended OSD logging is on.
+                if (ExtendedOsdLoggingController.IsVerboseLoggingEnabledInProcess())
+                {
+                    _logger.LogInformation(
+                        "Overlay target process: '{process}' PID {previous} -> {current} (detected {count}, selected '{selected}')",
+                        currentProcess ?? "<none>", _lastPublishedProcessId, processId,
+                        ProcessesToCapture.Count, SelectedProcessToCapture ?? "<auto>");
+                }
+                _lastPublishedProcessId = processId;
+            }
+            _rTSSService.ProcessIdStream.OnNext(processId);
+            // The PID stays 0 while several processes wait for a selection; the hook-free overlay
+            // only shows itself while the list has entries, so it needs the count as well.
+            _rTSSService.ProcessCountStream.OnNext(ProcessesToCapture.Count);
+
+            _updateCurrentProcess?.Publish(new ViewMessages.CurrentProcessToCapture(currentProcess, processId));
+        }
+
+        private void ShowProcessDetails()
+        {
+            if (!string.IsNullOrEmpty(SelectedProcessToCapture))
+            {
+                var info = ProcessesInfo.FirstOrDefault(x => x.Item1 == SelectedProcessToCapture);
+                if (info.Item1 != null)
+                {
+                    System.Windows.MessageBox.Show(
+                        $"Name: {info.Item1}\nProcess-ID (PID): {info.Item2}",
+                        "Process details",
+                        System.Windows.MessageBoxButton.OK,
+                        System.Windows.MessageBoxImage.Information);
+                }
+            }
+        }
+
+        private void GetGameNameFromProcessList(string processName)
+        {
+            if (processName == _currentProcessToCapture)
+                return;
+
+            string gameName = string.Empty;
+            if (!string.IsNullOrWhiteSpace(processName))
+                gameName = GetGameNameFromFileDescription(processName);
+
+            if (!string.IsNullOrWhiteSpace(gameName))
+                _currentGameNameToCapture = gameName;
+            else
+                _currentGameNameToCapture = processName;
+        }
+
+        private string GetGameNameFromFileDescription(string processName)
+        {
+            if (string.IsNullOrWhiteSpace(processName))
+            {
+                return "Unknown";
+            }
+
+            var processNameStripped = processName.StripExeExtension();
+
+            if (_gameFileDescriptionCache.ContainsKey(processName))
+            {
+                return _gameFileDescriptionCache[processName];
+            }
+            else
+            {
+                Process[] processes = Process.GetProcessesByName(processNameStripped);
+
+                if (processes.Any())
+                {
+                    // prefer getting game name from process list
+                    var gameName = _processList.FindProcessByName(processName)?.DisplayName;
+
+                    if (gameName != null)
+                    {
+                        _gameFileDescriptionCache.Add(processName, gameName);
+                        return gameName;
+                    }
+
+                    try
+                    {
+                        string mainWindoTitle = processes.First()?.MainWindowTitle?.TrimEnd();
+                        // From the file: protected processes (Ricochet) deny MainModule.
+                        string fileDescription = ProcessHelper.GetFileDescription(processes.First().Id);
+
+                        // prefer file description
+                        if (!fileDescription.IsNullOrEmpty())
+                        {
+                            if (processNameStripped != fileDescription)
+                            {
+                                _gameFileDescriptionCache.Add(processName, fileDescription);
+                                return fileDescription;
+                            }
+                        }
+                        else if (!mainWindoTitle.IsNullOrEmpty())
+                        {
+                            if (processNameStripped != mainWindoTitle)
+                            {
+                                _gameFileDescriptionCache.Add(processName, mainWindoTitle);
+                                return mainWindoTitle;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error getting game name from process info");
+                    }
+                }
+            }
+
+            return _processList.FindProcessByName(processName)?.DisplayName ?? processNameStripped;
+        }
+
+        /// <summary>
+        /// The hint built by <paramref name="hint"/> from the current hotkey, or the
+        /// "hotkey disabled" text when no hotkey is set.
+        /// </summary>
+        private string GetCaptureHotkeyHint(Func<string, string> hint)
+        {
+            var hotkey = CaptureHotkeyString;
+            return string.IsNullOrEmpty(hotkey)
+                ? CxLang.T("CaptureViewModel_CaptureHotkeyDisabled")
+                : hint(hotkey);
+        }
+
+        private void UpdateCaptureStateInfo()
+        {
+            if (string.IsNullOrWhiteSpace(SelectedProcessToCapture))
+            {
+                if (!ProcessesToCapture.Any())
+                {
+                    SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_ProcessListClear") + Environment.NewLine
+                        + GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_StartAnyGameAndPress0", hotkey)));
+                    _overlayService.SetCaptureServiceStatus("Scanning for process...");
+                }
+                else if (_autoTarget.Target != null)
+                {
+                    if (!_captureManager.DelayCountdownRunning)
+                    {
+                        var game = _currentGameNameToCapture;
+                        int detected = ProcessesToCapture.Count;
+                        SetCaptureStateInfo(() => (detected > 1
+                                ? CxLang.Format("CaptureViewModel_0AutoSelectedFrom1Processes", game, detected)
+                                : CxLang.Format("CaptureViewModel_0AutoDetected", game)) + Environment.NewLine
+                            + GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_Press0ToStartCapture", hotkey)));
+                        _overlayService.SetCaptureServiceStatus($"\"{_currentGameNameToCapture}\" ready to capture...");
+                    }
+                }
+                else if (ProcessesToCapture.Count > 1)
+                {
+                    //Multiple processes detected, select the one to capture or move unwanted processes to ignore list.
+                    SetCaptureStateInfo(() => CxLang.T("CaptureViewModel_MultipleProcessesDetected") + Environment.NewLine
+                        + CxLang.T("CaptureViewModel_SelectOneOrMoveUnwanted"));
+                    _overlayService.SetCaptureServiceStatus("Multiple processes detected");
+                }
+                return;
+            }
+
+            if (!_captureManager.DelayCountdownRunning)
+            {
+                var game = _currentGameNameToCapture;
+                SetCaptureStateInfo(() => CxLang.Format("CaptureViewModel_0Selected", game) + Environment.NewLine
+                    + GetCaptureHotkeyHint(hotkey => CxLang.Format("CaptureViewModel_Press0ToStartCapture", hotkey)));
+                _overlayService.SetCaptureServiceStatus($"\"{_currentGameNameToCapture}\" ready to capture...");
+            }
+        }
+
+        private void InitializeFrametimeModel()
+        {
+            FrametimeModel = new PlotModel
+            {
+                PlotMargins = new OxyThickness(40, 0, 0, 40),
+                PlotAreaBorderColor = OxyColor.FromArgb(64, 204, 204, 204)
+            };
+
+            FrametimeModel.Legends.Add(new Legend()
+            {
+                LegendPosition = LegendPosition.TopCenter,
+                LegendOrientation = LegendOrientation.Horizontal
+            });
+
+            //Axes
+            //X
+            FrametimeModel.Axes.Add(new LinearAxis()
+            {
+                Key = "xAxis",
+                Position = AxisPosition.Bottom,
+                Title = CxLang.T("CaptureViewModel_Samples"),
+                MajorGridlineStyle = LineStyle.Solid,
+                MajorGridlineThickness = 1,
+                MajorGridlineColor = OxyColor.FromArgb(64, 204, 204, 204),
+                MinorTickSize = 0,
+                MajorTickSize = 0
+            });
+
+            //Y
+            FrametimeModel.Axes.Add(new LinearAxis()
+            {
+                Key = "yAxis",
+                Position = AxisPosition.Left,
+                Title = CxLang.T("CaptureViewModel_FrametimeMs"),
+                MajorGridlineStyle = LineStyle.Solid,
+                MajorGridlineThickness = 1,
+                MajorGridlineColor = OxyColor.FromArgb(64, 204, 204, 204),
+                MinorTickSize = 0,
+                MajorTickSize = 0
+            });
+        }
+
+
+        //Run history and aggregation options
+        private void OnUseRunHistoryChanged()
+        {
+            var historyEntry = _overlayEntryProvider.GetOverlayEntry("RunHistory");
+
+            // temp. fix for disabled run history checkbox from previous versions
+            if (historyEntry != null)
+            {
+                historyEntry.ShowOnOverlayIsEnabled = true;
+            }
+
+            if (!UseRunHistory)
+            {
+                UseAggregation = false;
+            }
+        }
+
+        private void SetGlobalHookEventResetHistoryHotkey()
+        {
+            HotkeyDictionaryBuilder.SetHotkey(AppConfiguration, HotkeyAction.ResetHistory, () => _overlayService.ResetHistory());
+        }
+    }
+}

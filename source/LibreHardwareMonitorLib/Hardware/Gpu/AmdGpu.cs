@@ -1,0 +1,481 @@
+using System;
+using System.Globalization;
+using System.Text;
+
+using CapFrameX.Monitoring.Contracts;
+using LibreHardwareMonitor.Interop;
+using Microsoft.Win32;
+
+namespace LibreHardwareMonitor.Hardware.Gpu;
+
+internal sealed class AmdGpu : GenericGpu
+{
+    private readonly uint _adapterIndex;
+    private readonly ADLX.AdlxDeviceInfo _deviceInfo;
+    private readonly object _telemetrySupportLock = new();
+    private bool _telemetrySupportChecked;
+    private bool _telemetryAvailable;
+
+    // Temperature sensors
+    private readonly Sensor _temperatureCore;
+    private readonly Sensor _temperatureHotSpot;
+    private readonly Sensor _temperatureMemory;
+    private readonly Sensor _temperatureIntake;
+
+    // Clock sensors
+    private readonly Sensor _coreClock;
+    private readonly Sensor _memoryClock;
+    private readonly Sensor _npuClock;
+
+    // Voltage sensors
+    private readonly Sensor _coreVoltage;
+
+    // Load sensors
+    private readonly Sensor _coreLoad;
+    private readonly Sensor _npuLoad;
+
+    // Fan sensor
+    private readonly Sensor _fan;
+    private readonly Sensor _fanDuty;
+
+    // Power sensors
+    private readonly Sensor _powerTotal;
+    private readonly Sensor _powerTotalBoardPower;
+
+    // Memory sensors (VRAM)
+    private readonly Sensor _memoryUsed;
+    private readonly Sensor _memoryTotal;
+    private readonly Sensor _sharedMemory;
+
+    // System-wide AMD SmartShift; only on the adapter chosen by AmdGpuGroup, null elsewhere
+    private readonly Sensor _smartShift;
+    private bool _smartShiftUnsupported;
+
+    public AmdGpu(uint adapterIndex, ADLX.AdlxDeviceInfo deviceInfo, ISettings settings, ISensorConfig sensorConfig = null,
+        bool reportsSystemMetrics = false)
+        : base(deviceInfo.GpuName?.Trim() ?? "AMD GPU",
+               new Identifier("gpu-amd", adapterIndex.ToString(CultureInfo.InvariantCulture)),
+               settings,
+               sensorConfig: sensorConfig,
+               dedicatedMemoryPresentationSortKey: $"{adapterIndex}_6_0",
+               sharedMemoryPresentationSortKey: $"{adapterIndex}_6_1")
+    {
+        _adapterIndex = adapterIndex;
+        _deviceInfo = deviceInfo;
+
+        // Determine if discrete GPU based on GpuType
+        IsDiscreteGpu = deviceInfo.GpuType == (uint)ADLX.GpuType.Discrete;
+
+        int index = (int)adapterIndex;
+
+        // Temperature sensors
+        _temperatureCore = new Sensor("GPU Core", 0, SensorType.Temperature, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_2_0" };
+        _temperatureMemory = new Sensor("GPU Memory", 1, SensorType.Temperature, this, settings)
+        { PresentationSortKey = $"{index}_2_1" };
+        _temperatureHotSpot = new Sensor("GPU Hot Spot", 2, SensorType.Temperature, this, settings)
+        { PresentationSortKey = $"{index}_2_2" };
+        _temperatureIntake = new Sensor("GPU Intake", 3, SensorType.Temperature, this, settings)
+        { PresentationSortKey = $"{index}_2_3" };
+
+        // Clock sensors
+        _coreClock = new Sensor("GPU Core", 0, SensorType.Clock, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_0_0" };
+        _memoryClock = new Sensor("GPU Memory", 1, SensorType.Clock, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_0_1" };
+        _npuClock = new Sensor("NPU", 2, SensorType.Clock, this, settings)
+        { PresentationSortKey = $"{index}_0_2" };
+
+        // Fan sensor
+        _fan = new Sensor("GPU Fan", 0, SensorType.Fan, this, settings)
+        { PresentationSortKey = $"{index}_5_0" };
+        _fanDuty = new Sensor("GPU Fan", 0, SensorType.Control, this, settings)
+        { PresentationSortKey = $"{index}_5_1" };
+
+        // Voltage sensor
+        _coreVoltage = new Sensor("GPU Core", 0, SensorType.Voltage, this, settings)
+        { PresentationSortKey = $"{index}_4_0" };
+
+        // Load sensors
+        _coreLoad = new Sensor("GPU Core", 0, SensorType.Load, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_1_0" };
+        _npuLoad = new Sensor("NPU", 1, SensorType.Load, this, settings)
+        { PresentationSortKey = $"{index}_1_1" };
+
+        // Power sensors
+        _powerTotal = new Sensor("GPU Power", 0, SensorType.Power, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_3_0" };
+        _powerTotalBoardPower = new Sensor("GPU TBP", 1, SensorType.Power, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_3_1" };
+
+        // Memory sensors
+        _memoryUsed = new Sensor("GPU Memory Dedicated", 0, SensorType.Data, this, settings)
+        { IsPresentationDefault = true, PresentationSortKey = $"{index}_6_0" };
+        _memoryTotal = new Sensor("GPU Memory Total", 2, SensorType.Data, this, settings)
+        { PresentationSortKey = $"{index}_6_2" };
+        _sharedMemory = new Sensor("GPU Memory Shared", 3, SensorType.Data, this, settings)
+        { PresentationSortKey = $"{index}_6_1" };
+
+        // Capacity is static device information and does not depend on telemetry support.
+        if (deviceInfo.TotalVramMB > 0)
+        {
+            _memoryTotal.Value = deviceInfo.TotalVramMB / 1024f;
+            ActivateSensor(_memoryTotal);
+        }
+
+        // SmartShift: -100 (power shifted to the CPU) .. +100 (shifted to the GPU)
+        if (reportsSystemMetrics)
+        {
+            _smartShift = new Sensor("GPU SmartShift", 0, SensorType.Factor, this, settings)
+            { PresentationSortKey = $"{index}_10_0" };
+        }
+
+        if (TryResolveWddmDevice(deviceInfo, out string deviceId, out D3DDisplayDevice.D3DDeviceInfo wddmDeviceInfo))
+        {
+            bool hasDedicatedMemory = IsDiscreteGpu ||
+                                      wddmDeviceInfo.GpuDedicatedLimit > 0 ||
+                                      wddmDeviceInfo.GpuVideoMemoryLimit > 0;
+            InitializeWddmDevice(
+                deviceId,
+                wddmDeviceInfo.AdapterLuidInstanceName,
+                hasDedicatedMemory ? 4 : null,
+                $"{index}_6_0_1");
+        }
+
+    }
+
+    /// <summary>
+    /// Initializes ADLX telemetry once, when this adapter is first selected for polling.
+    /// A failed query leaves the adapter on the WDDM-only fallback path.
+    /// </summary>
+    private bool EnsureTelemetrySupport()
+    {
+        lock (_telemetrySupportLock)
+        {
+            if (_telemetrySupportChecked)
+                return _telemetryAvailable;
+
+            _telemetrySupportChecked = true;
+
+            ADLX.AdlxTelemetrySupport support = new();
+            if (!ADLX.GetTelemetrySupport(_adapterIndex, ref support))
+                return false;
+
+            ActivateSensorsFromSupportFlags(support);
+            _telemetryAvailable = true;
+            return true;
+        }
+    }
+
+    private void ActivateSensorsFromSupportFlags(ADLX.AdlxTelemetrySupport support)
+    {
+
+        // Temperature sensors
+        if (support.GpuTemperatureSupported)
+            ActivateSensor(_temperatureCore);
+        if (support.GpuHotspotTemperatureSupported)
+            ActivateSensor(_temperatureHotSpot);
+        if (support.GpuMemoryTemperatureSupported)
+            ActivateSensor(_temperatureMemory);
+        if (support.GpuIntakeTemperatureSupported)
+            ActivateSensor(_temperatureIntake);
+
+        // Clock sensors
+        if (support.GpuClockSpeedSupported)
+            ActivateSensor(_coreClock);
+        if (support.GpuVRAMClockSpeedSupported)
+            ActivateSensor(_memoryClock);
+        if (support.NpuFrequencySupported)
+            ActivateSensor(_npuClock);
+
+        // Fan sensor
+        if (support.GpuFanSpeedSupported)
+            ActivateSensor(_fan);
+        if (support.GpuFanDutySupported)
+            ActivateSensor(_fanDuty);
+
+        // Voltage sensor
+        if (support.GpuVoltageSupported)
+            ActivateSensor(_coreVoltage);
+
+        // Load sensors
+        if (support.GpuUsageSupported)
+            ActivateSensor(_coreLoad);
+        if (support.NpuActivityLevelSupported)
+            ActivateSensor(_npuLoad);
+
+        // Power sensors
+        if (support.GpuPowerSupported)
+            ActivateSensor(_powerTotal);
+        if (support.GpuTotalBoardPowerSupported)
+            ActivateSensor(_powerTotalBoardPower);
+
+        // Memory sensors
+        if (support.GpuVramSupported)
+            ActivateSensor(_memoryUsed);
+        if (support.GpuSharedMemorySupported)
+            ActivateSensor(_sharedMemory);
+    }
+
+    public override string DeviceId
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(WddmDeviceId))
+                return D3DDisplayDevice.GetActualDeviceIdentifier(WddmDeviceId);
+
+            return !string.IsNullOrEmpty(_deviceInfo.PnpString)
+                ? _deviceInfo.PnpString
+                : _deviceInfo.DriverPath ?? string.Empty;
+        }
+    }
+
+    public override HardwareType HardwareType => HardwareType.GpuAmd;
+
+    public override void Update()
+    {
+        UpdateProcessMemorySensors();
+        TryUpdateWddmMemorySensors(false, out _);
+
+        // System metrics have their own ADLX query and do not depend on this adapter's telemetry.
+        UpdateSmartShift();
+
+        // ADLX is initialized lazily so merely detecting an unselected AMD iGPU does not enter
+        // its driver telemetry path. A failed support query disables ADLX for this adapter while
+        // the vendor-neutral WDDM sensors above remain available.
+        if (!EnsureTelemetrySupport())
+            return;
+
+        // Get ADLX telemetry data
+        ADLX.AdlxTelemetryData telemetry = new();
+        if (ADLX.GetTelemetry(_adapterIndex, 1000, ref telemetry))
+        {
+            // Temperature sensors
+            _temperatureCore.Value = telemetry.GpuTemperatureSupported ? (float)telemetry.GpuTemperatureValue : null;
+            _temperatureHotSpot.Value = telemetry.GpuHotspotTemperatureSupported ? (float)telemetry.GpuHotspotTemperatureValue : null;
+            _temperatureMemory.Value = telemetry.GpuMemoryTemperatureSupported ? (float)telemetry.GpuMemoryTemperatureValue : null;
+            _temperatureIntake.Value = telemetry.GpuIntakeTemperatureSupported ? (float)telemetry.GpuIntakeTemperatureValue : null;
+
+            // Clock sensors
+            _coreClock.Value = telemetry.GpuClockSpeedSupported ? (float)telemetry.GpuClockSpeedValue : null;
+            _memoryClock.Value = telemetry.GpuVRAMClockSpeedSupported ? (float)telemetry.GpuVRAMClockSpeedValue : null;
+            _npuClock.Value = telemetry.NpuFrequencySupported ? (float)telemetry.NpuFrequencyValue : null;
+
+            // Fan sensor
+            _fan.Value = telemetry.GpuFanSpeedSupported ? (float)telemetry.GpuFanSpeedValue : null;
+            _fanDuty.Value = telemetry.GpuFanDutySupported ? (float)telemetry.GpuFanDutyValue : null;
+
+            // Voltage sensor (ADLX returns voltage in mV, convert to V)
+            _coreVoltage.Value = telemetry.GpuVoltageSupported ? (float)(telemetry.GpuVoltageValue / 1000.0) : null;
+
+            // Load sensors
+            _coreLoad.Value = telemetry.GpuUsageSupported ? (float)Math.Min(telemetry.GpuUsageValue, 100) : null;
+            _npuLoad.Value = telemetry.NpuActivityLevelSupported ? (float)Math.Min(telemetry.NpuActivityLevelValue, 100) : null;
+
+            // Power sensors
+            _powerTotal.Value = telemetry.GpuPowerSupported ? (float)telemetry.GpuPowerValue : null;
+            _powerTotalBoardPower.Value = telemetry.GpuTotalBoardPowerSupported ? (float)telemetry.GpuTotalBoardPowerValue : null;
+
+            // VRAM usage from ADLX (in MB, convert to GB)
+            _memoryUsed.Value = telemetry.GpuVramSupported ? (float)(telemetry.GpuVramValue / 1024.0) : null;
+
+            // Shared memory from ADLX (in MB, convert to GB)
+            _sharedMemory.Value = telemetry.GpuSharedMemorySupported ? (float)(telemetry.GpuSharedMemoryValue / 1024.0) : null;
+        }
+    }
+
+    private void UpdateSmartShift()
+    {
+        if (_smartShift == null || _smartShiftUnsupported)
+            return;
+
+        ADLX.AdlxSystemMetrics systemMetrics = new();
+        if (!ADLX.GetSystemMetrics(1000, ref systemMetrics))
+        {
+            _smartShift.Value = null;
+            return;
+        }
+
+        if (!systemMetrics.SmartShiftSupported)
+        {
+            // A platform capability: stop querying systems without SmartShift.
+            _smartShiftUnsupported = true;
+            _smartShift.Value = null;
+            return;
+        }
+
+        _smartShift.Value = systemMetrics.SmartShiftValue;
+        ActivateSensor(_smartShift);
+    }
+
+    public override void Close()
+    {
+        base.Close();
+    }
+
+    public override string GetDriverVersion()
+    {
+        // First, try to get Radeon Software version from AMD's standard registry location
+        try
+        {
+            using RegistryKey amdKey = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\AMD\CN");
+            if (amdKey != null)
+            {
+                var sv = amdKey.GetValue("RadeonSoftwareVersion");
+                if (sv != null && !string.IsNullOrEmpty(sv.ToString()))
+                {
+                    return $"Adrenalin {sv}";
+                }
+            }
+        }
+        catch
+        {
+            // Ignore registry access errors
+        }
+
+        // Fall back to getting driver version from device class registry key
+        if (!string.IsNullOrEmpty(_deviceInfo.DriverPath))
+        {
+            try
+            {
+                // DriverPath is typically "{GUID}\NNNN" - prepend the Control\Class path
+                string driverPath = _deviceInfo.DriverPath;
+
+                // Remove any "\Registry\Machine\" prefix if present
+                const string registryPrefix = @"\Registry\Machine\";
+                if (driverPath.StartsWith(registryPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    driverPath = driverPath.Substring(registryPrefix.Length);
+                }
+
+                // If it starts with a GUID brace, prepend the Control\Class path
+                if (driverPath.StartsWith("{", StringComparison.Ordinal))
+                {
+                    driverPath = @"SYSTEM\CurrentControlSet\Control\Class\" + driverPath;
+                }
+
+                using RegistryKey deviceKey = Registry.LocalMachine.OpenSubKey(driverPath);
+                if (deviceKey != null)
+                {
+                    // Try RadeonSoftwareVersion first (in case it's stored here)
+                    var radeonVersion = deviceKey.GetValue("RadeonSoftwareVersion");
+                    if (radeonVersion != null && !string.IsNullOrEmpty(radeonVersion.ToString()))
+                    {
+                        return $"Adrenalin {radeonVersion}";
+                    }
+
+                    // Fall back to Windows driver version
+                    var driverVersion = deviceKey.GetValue("DriverVersion");
+                    if (driverVersion != null && !string.IsNullOrEmpty(driverVersion.ToString()))
+                    {
+                        return driverVersion.ToString();
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore registry access errors
+            }
+        }
+
+        return null;
+    }
+
+    public override string GetReport()
+    {
+        var r = new StringBuilder();
+
+        r.AppendLine("AMD GPU (ADLX)");
+        r.AppendLine();
+
+        r.Append("AdapterIndex: ");
+        r.AppendLine(_adapterIndex.ToString(CultureInfo.InvariantCulture));
+        r.Append("GpuName: ");
+        r.AppendLine(_deviceInfo.GpuName);
+        r.Append("GpuType: ");
+        r.AppendLine(((ADLX.GpuType)_deviceInfo.GpuType).ToString());
+        r.Append("VendorId: ");
+        r.AppendLine(_deviceInfo.VendorId);
+        r.Append("DriverPath: ");
+        r.AppendLine(_deviceInfo.DriverPath);
+        r.Append("PnpString: ");
+        r.AppendLine(_deviceInfo.PnpString);
+        r.Append("Luid: ");
+        r.AppendLine(_deviceInfo.LuidValid != 0
+            ? D3DDisplayDevice.GetAdapterLuidInstanceName(_deviceInfo.LuidHighPart, _deviceInfo.LuidLowPart)
+            : "Unavailable");
+        r.Append("UniqueId: ");
+        r.AppendLine(_deviceInfo.Id.ToString(CultureInfo.InvariantCulture));
+        r.Append("Total VRAM (MB): ");
+        r.AppendLine(_deviceInfo.TotalVramMB > 0
+            ? _deviceInfo.TotalVramMB.ToString(CultureInfo.InvariantCulture)
+            : "Unavailable");
+        r.AppendLine();
+
+        r.AppendLine("ADLX Telemetry Support");
+        r.AppendLine();
+
+        ADLX.AdlxTelemetryData telemetry = new();
+        if (EnsureTelemetrySupport() && ADLX.GetTelemetry(_adapterIndex, 1000, ref telemetry))
+        {
+            r.AppendFormat(" GPU Usage: Supported={0}, Value={1}%{2}", telemetry.GpuUsageSupported, telemetry.GpuUsageValue, Environment.NewLine);
+            r.AppendFormat(" GPU Clock Speed: Supported={0}, Value={1} MHz{2}", telemetry.GpuClockSpeedSupported, telemetry.GpuClockSpeedValue, Environment.NewLine);
+            r.AppendFormat(" GPU VRAM Clock Speed: Supported={0}, Value={1} MHz{2}", telemetry.GpuVRAMClockSpeedSupported, telemetry.GpuVRAMClockSpeedValue, Environment.NewLine);
+            r.AppendFormat(" GPU Temperature: Supported={0}, Value={1}°C{2}", telemetry.GpuTemperatureSupported, telemetry.GpuTemperatureValue, Environment.NewLine);
+            r.AppendFormat(" GPU Hotspot Temperature: Supported={0}, Value={1}°C{2}", telemetry.GpuHotspotTemperatureSupported, telemetry.GpuHotspotTemperatureValue, Environment.NewLine);
+            r.AppendFormat(" GPU Intake Temperature: Supported={0}, Value={1}°C{2}", telemetry.GpuIntakeTemperatureSupported, telemetry.GpuIntakeTemperatureValue, Environment.NewLine);
+            r.AppendFormat(" GPU Memory Temperature: Supported={0}, Value={1}°C{2}", telemetry.GpuMemoryTemperatureSupported, telemetry.GpuMemoryTemperatureValue, Environment.NewLine);
+            r.AppendFormat(" GPU Power: Supported={0}, Value={1} W{2}", telemetry.GpuPowerSupported, telemetry.GpuPowerValue, Environment.NewLine);
+            r.AppendFormat(" GPU Total Board Power: Supported={0}, Value={1} W{2}", telemetry.GpuTotalBoardPowerSupported, telemetry.GpuTotalBoardPowerValue, Environment.NewLine);
+            r.AppendFormat(" GPU Fan Speed: Supported={0}, Value={1} RPM{2}", telemetry.GpuFanSpeedSupported, telemetry.GpuFanSpeedValue, Environment.NewLine);
+            r.AppendFormat(" GPU VRAM: Supported={0}, Value={1} MB{2}", telemetry.GpuVramSupported, telemetry.GpuVramValue, Environment.NewLine);
+            r.AppendFormat(" GPU Voltage: Supported={0}, Value={1} mV{2}", telemetry.GpuVoltageSupported, telemetry.GpuVoltageValue, Environment.NewLine);
+            r.AppendFormat(" NPU Frequency: Supported={0}, Value={1} MHz{2}", telemetry.NpuFrequencySupported, telemetry.NpuFrequencyValue, Environment.NewLine);
+            r.AppendFormat(" NPU Activity Level: Supported={0}, Value={1}%{2}", telemetry.NpuActivityLevelSupported, telemetry.NpuActivityLevelValue, Environment.NewLine);
+            r.AppendFormat(" GPU Shared Memory: Supported={0}, Value={1} MB{2}", telemetry.GpuSharedMemorySupported, telemetry.GpuSharedMemoryValue, Environment.NewLine);
+            r.AppendFormat(" GPU Fan Duty: Supported={0}, Value={1}%{2}", telemetry.GpuFanDutySupported, telemetry.GpuFanDutyValue, Environment.NewLine);
+        }
+        else
+        {
+            r.AppendLine(" Failed to get telemetry data");
+        }
+
+        r.AppendLine();
+
+        if (WddmDeviceId != null)
+        {
+            r.AppendLine("D3D");
+            r.AppendLine();
+            r.AppendLine(" Id: " + WddmDeviceId);
+        }
+
+        return r.ToString();
+    }
+
+    private static bool TryResolveWddmDevice(
+        ADLX.AdlxDeviceInfo deviceInfo,
+        out string deviceId,
+        out D3DDisplayDevice.D3DDeviceInfo wddmDeviceInfo)
+    {
+        if (deviceInfo.LuidValid != 0)
+        {
+            string adapterLuidInstanceName = D3DDisplayDevice.GetAdapterLuidInstanceName(
+                deviceInfo.LuidHighPart,
+                deviceInfo.LuidLowPart);
+            if (D3DDisplayDevice.TryGetDeviceInfoByAdapterLuid(
+                adapterLuidInstanceName,
+                "VEN_1002",
+                out deviceId,
+                out wddmDeviceInfo))
+            {
+                return true;
+            }
+        }
+
+        return D3DDisplayDevice.TryGetDeviceInfoByPnpIdentifier(
+            deviceInfo.PnpString,
+            "VEN_1002",
+            out deviceId,
+            out wddmDeviceInfo);
+    }
+}

@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Extended.Wpf.Toolkit" />
+    <PackageReference Include="gong-wpf-dragdrop" />
+    <PackageReference Include="Jot" />
+    <PackageReference Include="MahApps.Metro" />
+    <PackageReference Include="MaterialDesignColors" />
+    <PackageReference Include="MaterialDesignThemes" />
+    <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="Microsoft.Xaml.Behaviors.Wpf" />
+    <PackageReference Include="OxyPlot.Wpf" />
+    <PackageReference Include="Prism.Core" />
+    <PackageReference Include="Prism.Wpf" />
+    <PackageReference Include="System.Reactive" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.Capture.Contracts\CapFrameX.Capture.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.OSD.Integration\CapFrameX.OSD.Integration.csproj" />
+    <ProjectReference Include="..\CapFrameX.Charts\Core40\Core.csproj" />
+    <ProjectReference Include="..\CapFrameX.Charts\WpfView\WpfView.csproj" />
+    <ProjectReference Include="..\CapFrameX.Configuration\CapFrameX.Configuration.csproj" />
+    <ProjectReference Include="..\CapFrameX.Contracts\CapFrameX.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Data\CapFrameX.Data.csproj" />
+    <ProjectReference Include="..\CapFrameX.EventAggregation\CapFrameX.EventAggregation.csproj" />
+    <ProjectReference Include="..\CapFrameX.Extensions.NetStandard\CapFrameX.Extensions.NetStandard.csproj" />
+    <ProjectReference Include="..\CapFrameX.Extensions\CapFrameX.Extensions.csproj" />
+    <ProjectReference Include="..\CapFrameX.Hotkey\CapFrameX.Hotkey.csproj" />
+    <ProjectReference Include="..\CapFrameX.MVVM\CapFrameX.MVVM.csproj" />
+    <ProjectReference Include="..\CapFrameX.Overlay\CapFrameX.Overlay.csproj" />
+    <ProjectReference Include="..\CapFrameX.PresentMonInterface\CapFrameX.PresentMonInterface.csproj" />
+    <ProjectReference Include="..\CapFrameX.RTSSInterface\CapFrameX.RTSSInterface.vcxproj" />
+    <ProjectReference Include="..\CapFrameX.Statistics.NetStandard\CapFrameX.Statistics.NetStandard.csproj" />
+    <ProjectReference Include="..\CapFrameX.Updater\CapFrameX.Updater.csproj" />
+    <ProjectReference Include="..\CapFrameX.ViewModel\CapFrameX.ViewModel.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The prebuilt editor also needs its managed SVG-import dependencies at runtime. -->
+    <PackageReference Include="SharpVectors.Wpf" />
+  </ItemGroup>
+
+  <!-- The reusable editor is owned by the optional OSD repository. Public builds use the
+       same prebuilt fallback as the native renderer and its interop assembly. -->
+  <PropertyGroup>
+    <ShouldUnsetParentConfigurationAndPlatform Condition="'$(CfxOsdFromSource)' == 'true' And '$(ShouldUnsetParentConfigurationAndPlatform)' == ''">false</ShouldUnsetParentConfigurationAndPlatform>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CfxOsdFromSource)' == 'true'">
+    <ProjectReference Include="$(_CfxOsdSourceDir)CapFrameX.OSD.Controls\CapFrameX.OSD.Controls.csproj">
+      <SetPlatform>Platform=x64</SetPlatform>
+      <CfxOptionalOsd>true</CfxOptionalOsd>
+      <AdditionalProperties>ShouldUnsetParentConfigurationAndPlatform=false</AdditionalProperties>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(CfxOsdFromSource)' != 'true'">
+    <Reference Include="CapFrameX.OSD.Controls">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\net10.0-windows\CapFrameX.OSD.Controls.dll</HintPath>
+    </Reference>
+    <Reference Include="CapFrameX.OSD.Interop">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\external\CapFrameX.OSD-prebuilt\net10.0-windows\CapFrameX.OSD.Interop.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

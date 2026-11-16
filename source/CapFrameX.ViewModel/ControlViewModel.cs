@@ -1,0 +1,1081 @@
+using CapFrameX.Capture.Contracts;
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Data;
+using CapFrameX.Data.Session.Contracts;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Extensions;
+using CapFrameX.MVVM.Dialogs;
+using DynamicData;
+using Microsoft.Extensions.Logging;
+using Microsoft.VisualBasic.FileIO;
+using Prism.Commands;
+using Prism.Events;
+using Prism.Mvvm;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reactive;
+using System.Reactive.Concurrency;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Input;
+
+namespace CapFrameX.ViewModel
+{
+    public class ControlViewModel : BindableBase
+    {
+        private readonly IRecordDirectoryObserver _recordObserver;
+        private readonly IEventAggregator _eventAggregator;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IPathService _pathService;
+        private readonly IRecordManager _recordManager;
+        private readonly ISystemInfo _systemInfo;
+        private readonly ProcessList _processList;
+        private readonly ILogger<ControlViewModel> _logger;
+        private readonly ApplicationState _applicationState;
+        private readonly RecordWriteQueue _recordWriteQueue;
+        private PubSubEvent<ViewMessages.UpdateSession> _updateSessionEvent;
+        private PubSubEvent<ViewMessages.SelectSession> _selectSessionEvent;
+        private PubSubEvent<ViewMessages.UpdateRecordInfos> _updateRecordInfosEvent;
+        private IFileRecordInfo _selectedRecordInfo;
+        private string _customCpuDescription;
+        private string _customGpuDescription;
+        private string _customRamDescription;
+        private string _customMainboardDescription;
+        private string _customGameName;
+        private string _customComment;
+        private int _recordDataGridSelectedIndex;
+        private List<IFileRecordInfo> _selectedRecordings;
+        public bool _directoryLoading;
+        private CreateFolderDialog _createFolderDialogContent;
+        private bool _createFolderDialogIsOpen;
+        private string _treeViewSubFolderName = string.Empty;
+        private bool _customCpuDescriptionChanged = false;
+        private bool _customGpuDescriptionChanged = false;
+        private bool _customRamDescriptionChanged = false;
+        private bool _customMainboardDescriptionChanged = false;
+        private bool _customGameNameChanged = false;
+        private bool _customCommentChanged = false;
+        private string _customResolution;
+        private bool _customResolutionChanged = false;
+        private readonly SemaphoreSlim _selectionLoadSemaphore = new SemaphoreSlim(1, 1);
+        private Task<ISession> _selectedSessionTask = Task.FromResult<ISession>(null);
+        private CancellationTokenSource _selectionLoadCancellation = new CancellationTokenSource();
+        private int _selectionVersion;
+
+        public bool ShowCreationDate
+        {
+            get { return _appConfiguration.RecordListShowCreationTime; }
+            set
+            {
+                _appConfiguration.RecordListShowCreationTime = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowComment
+        {
+            get { return _appConfiguration.RecordListShowComment; }
+            set
+            {
+                _appConfiguration.RecordListShowComment = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowIsAggregated
+        {
+            get { return _appConfiguration.RecordListShowIsAggregated; }
+            set
+            {
+                _appConfiguration.RecordListShowIsAggregated = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowCpuName
+        {
+            get { return _appConfiguration.RecordListShowCpuName; }
+            set
+            {
+                _appConfiguration.RecordListShowCpuName = value;
+                RaisePropertyChanged();
+            }
+        }
+        public bool ShowGpuName
+        {
+            get { return _appConfiguration.RecordListShowGpuName; }
+            set
+            {
+                _appConfiguration.RecordListShowGpuName = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool ShowRamName
+        {
+            get { return _appConfiguration.RecordListShowRamName; }
+            set
+            {
+                _appConfiguration.RecordListShowRamName = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public IFileRecordInfo SelectedRecordInfo
+        {
+            get { return _selectedRecordInfo; }
+            set
+            {
+                if (ReferenceEquals(_selectedRecordInfo, value))
+                    return;
+
+                _selectedRecordInfo = value;
+                OnSelectedRecordInfoChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public IList SelectedRecordInfos
+        {
+            get { return _applicationState.SelectedRecords as IList; }
+            set
+            {
+                _applicationState.SelectedRecords = value.Cast<IFileRecordInfo>().ToList();
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool HasValidSource { set; get; }
+
+        public string CustomCpuDescription
+        {
+            get { return _customCpuDescription; }
+            set
+            {
+                _customCpuDescription = value;
+                _customCpuDescriptionChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomGpuDescription
+        {
+            get { return _customGpuDescription; }
+            set
+            {
+                _customGpuDescription = value;
+                _customGpuDescriptionChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomRamDescription
+        {
+            get { return _customRamDescription; }
+            set
+            {
+                _customRamDescription = value;
+                _customRamDescriptionChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomMainboardDescription
+        {
+            get { return _customMainboardDescription; }
+            set
+            {
+                _customMainboardDescription = value;
+                _customMainboardDescriptionChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomGameName
+        {
+            get { return _customGameName; }
+            set
+            {
+                _customGameName = value;
+                _customGameNameChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomComment
+        {
+            get { return _customComment; }
+            set
+            {
+                _customComment = value;
+                _customCommentChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string CustomResolution
+        {
+            get { return _customResolution; }
+            set
+            {
+                _customResolution = value;
+                _customResolutionChanged = true;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int RecordDataGridSelectedIndex
+        {
+            get { return _recordDataGridSelectedIndex; }
+            set
+            {
+                _recordDataGridSelectedIndex = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool DirectoryLoading
+        {
+            get { return _directoryLoading; }
+            set
+            {
+                _directoryLoading = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(DirectoryIsEmpty));
+                RaisePropertyChanged(nameof(ShowLoadingHint));
+            }
+        }
+
+        // The hint covers the list, so it only shows until the first records are in.
+        public bool ShowLoadingHint => DirectoryLoading && !RecordInfoList.Any();
+
+        public bool FixedExpanderPosition
+        {
+            get { return _appConfiguration.FixedExpanderPosition; }
+            set
+            {
+                _appConfiguration.FixedExpanderPosition = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string RootDirectory
+        {
+            get { return _appConfiguration.CaptureRootDirectory; }
+            set
+            {
+                _appConfiguration.CaptureRootDirectory = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public CreateFolderDialog CreateFolderDialogContent
+        {
+            get { return _createFolderDialogContent; }
+            set
+            {
+                _createFolderDialogContent = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool CreateFolderDialogIsOpen
+        {
+            get { return _createFolderDialogIsOpen; }
+            set
+            {
+                _createFolderDialogIsOpen = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string TreeViewSubFolderName
+        {
+            get { return _treeViewSubFolderName; }
+            set
+            {
+                _treeViewSubFolderName = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string SearchBarText
+        {
+            get
+            {
+                // Same rule as PathLeafConverter: the default "Captures" folder is shown translated.
+                var folder = new DirectoryInfo(_appConfiguration.ObservedDirectory).Name;
+                if (string.Equals(folder, "Captures", StringComparison.OrdinalIgnoreCase))
+                    folder = CxLang.T("ControlView_Captures");
+                return string.Format(CxLang.T("ControlViewModel_SearchIn01Items"), folder, RecordInfoList.Count);
+            }
+        }
+
+        public string ObservedDirectory { get; private set; }
+
+        public bool DirectoryIsEmpty => !DirectoryLoading && !RecordInfoList.Any();
+
+        public ObservableCollection<IFileRecordInfo> RecordInfoList { get; }
+            = new ObservableCollection<IFileRecordInfo>();
+
+        public IAppConfiguration AppConfiguration => _appConfiguration;
+
+        public IRecordDirectoryObserver RecordObserver => _recordObserver;
+
+        public ICommand DeleteRecordFileCommand { get; }
+
+        public ICommand MoveRecordFileCommand { get; }
+
+        public ICommand DuplicateRecordFileCommand { get; }
+
+        public ICommand RefreshDirectoryCommand { get; }
+
+        public ICommand AcceptEditingDialogCommand { get; }
+
+        public ICommand DeleteRecordCommand { get; }
+
+        public ICommand OpenObservedFolderCommand { get; }
+
+        public ICommand DeleteFolderCommand { get; }
+
+        public ICommand OpenCreateSubFolderDialogCommand { get; }
+
+        public ICommand SelectedRecordingsCommand { get; }
+
+        public ICommand CreateFolderCommand { get; }
+
+        public ICommand CloseCreateFolderDialogCommand { get; }
+
+        public ICommand ReloadRootFolderCommand { get; }
+
+        public ISubject<string> TreeViewItemCreatedStream = new Subject<string>();
+
+        public ISubject<string> TreeViewItemDeletedStream = new Subject<string>();
+
+        public ISubject<Unit> TreeViewUpdateStream = new Subject<Unit>();
+
+        public ISubject<bool> CreateFolderdialogIsOpenStream = new BehaviorSubject<bool>(false);
+
+        // A rewrite raises several Changed events; a record is read again once its file has been
+        // quiet for this long.
+        internal static readonly TimeSpan FileChangeQuietTime = TimeSpan.FromMilliseconds(500);
+
+        internal IScheduler FileChangeScheduler { get; set; } = DefaultScheduler.Instance;
+
+        // The list fills in batches while a folder is read, instead of all at once at the end.
+        internal static readonly TimeSpan RecordListBatchTime = TimeSpan.FromMilliseconds(250);
+        internal const int RecordListBatchSize = 200;
+
+        internal IScheduler RecordListScheduler { get; set; } = DefaultScheduler.Instance;
+
+        private int _recordListVersion;
+
+        public string ResolveDocumentsPath(string path) => _pathService.ResolveDocumentsPlaceholder(path);
+
+        public string DefaultCapturesPath => _pathService.CapturesFolder;
+
+        public ControlViewModel(IRecordDirectoryObserver recordObserver, IEventAggregator eventAggregator, IAppConfiguration appConfiguration,
+            IPathService pathService, RecordManager recordManager, ISystemInfo systemInfo, ProcessList processList, ILogger<ControlViewModel> logger, ApplicationState applicationState,
+            RecordWriteQueue recordWriteQueue)
+        {
+            _recordObserver = recordObserver;
+            _eventAggregator = eventAggregator;
+            _appConfiguration = appConfiguration;
+            _pathService = pathService;
+            _recordManager = recordManager;
+            _systemInfo = systemInfo;
+            _processList = processList;
+            _logger = logger;
+            _applicationState = applicationState;
+            _recordWriteQueue = recordWriteQueue;
+
+            //Commands
+            DeleteRecordFileCommand = new DelegateCommand(OnDeleteRecordFile);
+            MoveRecordFileCommand = new DelegateCommand(() => OnMoveRecordFile(null));
+            DuplicateRecordFileCommand = new DelegateCommand(OnDuplicateRecordFile);
+            RefreshDirectoryCommand = new DelegateCommand(OnRefreshDirectory);
+            AcceptEditingDialogCommand = new DelegateCommand(OnAcceptEditingDialog);
+            DeleteRecordCommand = new DelegateCommand(OnPressDeleteKey);
+            OpenObservedFolderCommand = new DelegateCommand(OnOpenObservedFolder);
+            DeleteFolderCommand = new DelegateCommand(OnDeleteFolder);
+            OpenCreateSubFolderDialogCommand = new DelegateCommand(() =>
+            {
+                CreateFolderDialogIsOpen = true;
+                TreeViewSubFolderName = string.Empty;
+                CreateFolderdialogIsOpenStream.OnNext(true);
+            });
+            SelectedRecordingsCommand = new DelegateCommand<object>(OnSelectedRecordings);
+            CreateFolderCommand = new DelegateCommand(OnCreateSubFolder);
+            CloseCreateFolderDialogCommand = new DelegateCommand(() =>
+            {
+                CreateFolderDialogIsOpen = false;
+                CreateFolderdialogIsOpenStream.OnNext(false);
+            }
+            );
+            ReloadRootFolderCommand = new DelegateCommand(() => TreeViewUpdateStream.OnNext(default));
+
+            RecordDataGridSelectedIndex = -1;
+
+            CreateFolderDialogContent = new CreateFolderDialog(() => OnCreateSubFolder());
+
+            SetAggregatorEvents();
+            SubscribeToCloudFolderChanged();
+            SubscribeToCloudFolderSelected();
+            SubscribeToResetRecord();
+            SubscribeToSetFileRecordInfoExternal();
+
+            RecordInfoList.CollectionChanged += (sender, args) =>
+            {
+                RaisePropertyChanged(nameof(DirectoryIsEmpty));
+                RaisePropertyChanged(nameof(SearchBarText));
+                RaisePropertyChanged(nameof(ShowLoadingHint));
+            };
+
+            CxLang.Instance.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(CxLang.UiLanguage))
+                {
+                    RaisePropertyChanged(nameof(SearchBarText));
+                    RaisePropertyChanged(nameof(RootDirectory));
+                }
+            };
+
+            SetupObservers(SynchronizationContext.Current);
+        }
+
+        private void OnCreateSubFolder()
+        {
+            if (!_appConfiguration.ObservedDirectory.Any())
+                return;
+
+            try
+            {
+                var resolvedObservedDirectory = ResolveDocumentsPath(_appConfiguration.ObservedDirectory);
+                var path = Path.Combine(resolvedObservedDirectory, TreeViewSubFolderName);
+                FileSystem.CreateDirectory(path);
+                _appConfiguration.ObservedDirectory = path;
+                TreeViewUpdateStream.OnNext(default);
+                CreateFolderdialogIsOpenStream.OnNext(false);
+                CreateFolderDialogIsOpen = false;
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Error while creating subfolder."); }
+        }
+
+        private void OnDeleteFolder()
+        {
+            if (_appConfiguration.ObservedDirectory.IsNullOrEmpty())
+                return;
+
+            try
+            {
+                var resolvedObservedDirectory = ResolveDocumentsPath(_appConfiguration.ObservedDirectory);
+                var parentFolder = Directory.GetParent(resolvedObservedDirectory);
+                FileSystem.DeleteDirectory(resolvedObservedDirectory, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+
+                _updateSessionEvent.Publish(new ViewMessages.UpdateSession(null, null));
+                _appConfiguration.ObservedDirectory = parentFolder.FullName;
+                TreeViewUpdateStream.OnNext(default);
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Error while deleting folder."); }
+        }
+
+        public bool OnSelectRootFolder()
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog();
+
+            if (dialog.ShowDialog() == true)
+            {
+                RootDirectory = dialog.FolderName;
+                _appConfiguration.ObservedDirectory = RootDirectory;
+                return true;
+            }
+            return false;
+        }
+
+        private void OnOpenObservedFolder()
+        {
+            try
+            {
+                var path = _pathService.ResolveDocumentsPlaceholder(_appConfiguration.ObservedDirectory);
+                // UseShellExecute is required to open a folder in Explorer on .NET Core+
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Error while opening observed folder."); }
+        }
+
+        private void SetupObservers(SynchronizationContext context)
+        {
+            IObservable<IFileRecordInfo> GetFileRecordInfo(FileInfo fi, bool fileMayStillBeWritten) =>
+                Observable.FromAsync(() => _recordManager.GetFileRecordInfo(fi, fileMayStillBeWritten))
+                    .Catch<IFileRecordInfo, Exception>(e => Observable.Return<IFileRecordInfo>(null));
+
+            _recordObserver.ObservingDirectoryStream
+                .ObserveOn(context)
+                .Subscribe(directory =>
+                {
+                    HasValidSource = directory?.Exists ?? false;
+                    RaisePropertyChanged(nameof(HasValidSource));
+                });
+
+            _recordObserver.DirectoryFilesStream
+                .ObserveOn(context)
+                .Select(fileInfos =>
+                {
+                    // A new listing replaces the list. Batches of the listing it replaces may
+                    // already be on their way to the UI thread; the version tells them apart.
+                    int version = ++_recordListVersion;
+                    RecordInfoList.Clear();
+                    DirectoryLoading = true;
+
+                    return Observable.Merge(fileInfos.Select(fi => GetFileRecordInfo(fi, fileMayStillBeWritten: false)), 30)
+                        .Where(recordFileInfo => recordFileInfo is IFileRecordInfo)
+                        .Distinct(recordFileInfo => recordFileInfo.Hash)
+                        .Buffer(RecordListBatchTime, RecordListBatchSize, RecordListScheduler)
+                        .Where(batch => batch.Count > 0)
+                        .Select(batch => (Version: version, Batch: batch, Complete: false))
+                        .Concat(Observable.Return((Version: version, Batch: (IList<IFileRecordInfo>)Array.Empty<IFileRecordInfo>(), Complete: true)));
+                })
+                .Switch()
+                .ObserveOn(context)
+                .Subscribe(update =>
+                {
+                    if (update.Version != _recordListVersion)
+                        return;
+
+                    AddRecordInfos(update.Batch);
+                    if (update.Complete)
+                        DirectoryLoading = false;
+                });
+
+            _recordObserver.FileCreatedStream
+                .SelectMany(fi => GetFileRecordInfo(fi, fileMayStillBeWritten: true))
+                .Where(recordInfo => recordInfo is IFileRecordInfo)
+                .ObserveOn(context)
+                .Subscribe(recordInfo => AddRecordInfos(new[] { recordInfo }));
+
+            _recordObserver.FileDeletedStream
+                .ObserveOn(context)
+                .Subscribe(fileInfo =>
+                {
+                    var item = RecordInfoList.FirstOrDefault(ri => ri.FullPath.Equals(fileInfo.FullName));
+                    if (item is IFileRecordInfo)
+                    {
+                        RecordInfoList.Remove(item);
+                    }
+                });
+
+            _recordObserver.FileChangedStream
+                .GroupByUntil(fi => fi.FullName,
+                    changes => changes.Throttle(FileChangeQuietTime, FileChangeScheduler),
+                    StringComparer.OrdinalIgnoreCase)
+                .SelectMany(changes => changes.LastAsync())
+                .SelectMany(fi => GetFileRecordInfo(fi, fileMayStillBeWritten: true))
+                .Where(recordInfo => recordInfo is IFileRecordInfo)
+                .ObserveOn(context)
+                .Subscribe(OnRecordFileChanged);
+        }
+
+        // A record created while its folder is read comes from the listing and from its Created
+        // event; it is listed once.
+        private void AddRecordInfos(IEnumerable<IFileRecordInfo> recordInfos)
+        {
+            var listed = new HashSet<string>(RecordInfoList.Select(recordInfo => recordInfo.FullPath),
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var recordInfo in recordInfos)
+            {
+                if (listed.Add(recordInfo.FullPath))
+                    RecordInfoList.Add(recordInfo);
+            }
+        }
+
+        private void OnRecordFileChanged(IFileRecordInfo recordInfo)
+        {
+            var itemToRemove = RecordInfoList.FirstOrDefault(ri => ri.FullPath.Equals(recordInfo.FullPath));
+            if (!(itemToRemove is IFileRecordInfo))
+                return;
+
+            // A metadata edit leaves the hash alone. The entry takes the new metadata in place, so
+            // the selection and the loaded session stay instead of being parsed and analysed again.
+            if (itemToRemove is FileRecordInfo entry && recordInfo is FileRecordInfo update
+                && entry.Hash != null && entry.Hash == update.Hash)
+            {
+                entry.UpdateFrom(update);
+                if (ReferenceEquals(_selectedRecordInfo, entry))
+                {
+                    // An edit made here has updated the loaded session; another writer's has not.
+                    if (!LoadedSessionShows(entry))
+                        OnSelectedRecordInfoChanged();
+                    _updateRecordInfosEvent.Publish(new ViewMessages.UpdateRecordInfos(entry));
+                }
+                return;
+            }
+
+            var selectedRecordId = _selectedRecordInfo?.Id;
+            var itemIndex = RecordInfoList.IndexOf(itemToRemove);
+            RecordInfoList[itemIndex] = recordInfo;
+            if (selectedRecordId?.Equals(itemToRemove.Id) ?? false)
+            {
+                SelectedRecordInfo = recordInfo;
+                _updateRecordInfosEvent.Publish(new ViewMessages.UpdateRecordInfos(itemToRemove));
+            }
+        }
+
+        private bool LoadedSessionShows(IFileRecordInfo recordInfo)
+        {
+            var sessionTask = _selectedSessionTask;
+            if (sessionTask == null || !sessionTask.IsCompletedSuccessfully
+                || !(sessionTask.Result?.Info is ISessionInfo info))
+                return false;
+
+            bool Same(string sessionValue, string recordValue)
+                => (sessionValue ?? string.Empty) == (recordValue ?? string.Empty);
+
+            return Same(info.Processor, recordInfo.ProcessorName)
+                && Same(info.GPU, recordInfo.GraphicCardName)
+                && Same(info.SystemRam, recordInfo.SystemRamInfo)
+                && Same(info.Motherboard, recordInfo.MotherboardName)
+                && Same(info.Comment, recordInfo.Comment);
+        }
+
+        private void OnDeleteRecordFile()
+        {
+            if (!RecordInfoList.Any())
+                return;
+
+            try
+            {
+                if (_selectedRecordings?.Count > 1)
+                {
+                    foreach (var item in _selectedRecordings)
+                    {
+                        FileSystem.DeleteFile(item.FullPath, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+                    }
+                }
+                else
+                {
+                    FileSystem.DeleteFile(SelectedRecordInfo.FullPath, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+                }
+
+                SelectedRecordInfo = null;
+                _selectedRecordings = null;
+
+                _updateSessionEvent.Publish(new ViewMessages.UpdateSession(null, null));
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Error while deleting file."); }
+        }
+
+        public void OnMoveRecordFile(string path)
+        {
+            if (!RecordInfoList.Any())
+                return;
+
+            string destinationfolder = string.Empty;
+
+            // when moving with D&D, skip file dialog and don't rebuild TreeView
+            bool wasDropped = !path.IsNullOrEmpty();
+
+            if (!wasDropped)
+            {
+
+                var dialog = new Microsoft.Win32.OpenFolderDialog();
+
+                if (dialog.ShowDialog() == true)
+                {
+                    destinationfolder = dialog.FolderName;
+                }
+            }
+            else
+            {
+                destinationfolder = path;
+            }
+
+            if (destinationfolder.IsNullOrEmpty())
+                return;
+
+            try
+            {
+
+                if (_selectedRecordings?.Count > 1)
+                {
+                    foreach (var item in _selectedRecordings)
+                    {
+                        string sourceFullPath = item.FullPath;
+                        string destinationFullPath = Path.Combine(destinationfolder, Path.GetFileName(sourceFullPath));
+
+                        FileSystem.CopyFile(sourceFullPath, destinationFullPath, true);
+                        if (File.Exists(destinationFullPath))
+                            FileSystem.DeleteFile(sourceFullPath);
+                        else
+                            _logger.LogWarning("Error while moving files.");
+                    }
+                }
+                else
+                {
+                    string sourceFullPath = SelectedRecordInfo.FullPath;
+                    string destinationFullPath = Path.Combine(destinationfolder, Path.GetFileName(sourceFullPath));
+
+                    FileSystem.CopyFile(sourceFullPath, destinationFullPath, true);
+                    if (File.Exists(destinationFullPath))
+                        FileSystem.DeleteFile(sourceFullPath);
+                    else
+                        _logger.LogWarning("Error while moving file.");
+                }
+
+                SelectedRecordInfo = null;
+                _selectedRecordings = null;
+
+                _updateSessionEvent.Publish(new ViewMessages.UpdateSession(null, null));
+
+            }
+            catch (Exception ex) { _logger.LogError(ex, "Error while moving file."); }
+
+            if (!wasDropped)
+                TreeViewUpdateStream.OnNext(default);
+        }
+
+        private void OnDuplicateRecordFile()
+        {
+            if (!RecordInfoList.Any())
+                return;
+
+            var dialog = new Microsoft.Win32.OpenFolderDialog();
+
+            if (dialog.ShowDialog() == true)
+            {
+                string destinationfolder = dialog.FolderName;
+                try
+                {
+
+                    if (_selectedRecordings?.Count > 1)
+                    {
+                        foreach (var item in _selectedRecordings)
+                        {
+                            string destinationFullPath = Path.Combine(destinationfolder, item.FileInfo.Name);
+                            FileSystem.CopyFile(item.FullPath, destinationFullPath);
+                        }
+                    }
+                    else
+                    {
+                        string destinationFullPath = Path.Combine(destinationfolder, SelectedRecordInfo.FileInfo.Name);
+                        FileSystem.CopyFile(SelectedRecordInfo.FullPath, destinationFullPath);
+                    }
+
+                    SelectedRecordInfo = null;
+                    _selectedRecordings = null;
+
+                    _updateSessionEvent.Publish(new ViewMessages.UpdateSession(null, null));
+
+                }
+                catch { }
+            }
+            TreeViewUpdateStream.OnNext(default);
+        }
+
+        private void OnRefreshDirectory()
+        {
+            if (_appConfiguration.ObservedDirectory.IsNullOrEmpty())
+                return;
+
+            DirectoryLoading = true;
+            _recordObserver.RefreshCurrentDirectory();
+        }
+
+        private void ResetInfoEditBoxes()
+        {
+            CustomCpuDescription = string.Empty;
+            CustomGpuDescription = string.Empty;
+            CustomRamDescription = string.Empty;
+            CustomMainboardDescription = string.Empty;
+            CustomGameName = string.Empty;
+            CustomComment = string.Empty;
+            CustomResolution = string.Empty;
+        }
+
+        private void ResetDescriptionChangedFlags()
+        {
+            _customCpuDescriptionChanged = false;
+            _customGpuDescriptionChanged = false;
+            _customRamDescriptionChanged = false;
+            _customMainboardDescriptionChanged = false;
+            _customGameNameChanged = false;
+            _customCommentChanged = false;
+            _customResolutionChanged = false;
+        }
+
+        private void OnAcceptEditingDialog() => SaveDescriptions();
+
+        public void SaveDescriptions()
+        {
+            if (!ObjectExtensions.IsAllNotNull(CustomCpuDescription,
+                CustomGpuDescription, CustomRamDescription, CustomMainboardDescription,
+                CustomGameName, CustomComment, _selectedRecordInfo, _applicationState.SelectedRecords))
+                return;
+
+            // The values are taken now; the files are rewritten off the UI thread, since each
+            // rewrite parses and serializes the whole record.
+            string cpu = CustomCpuDescription, gpu = CustomGpuDescription, ram = CustomRamDescription,
+                mainboard = CustomMainboardDescription, gameName = CustomGameName, comment = CustomComment,
+                resolution = CustomResolution;
+
+            if (_applicationState.SelectedRecords.Count == 1)
+            {
+                var recordInfo = _selectedRecordInfo;
+                bool gameNameChanged = _customGameNameChanged;
+                _recordWriteQueue.Enqueue(() =>
+                {
+                    // For a record without a game name of its own the box shows the process list's
+                    // name; it is only written when it was edited.
+                    string storedGameName = gameNameChanged
+                        ? gameName
+                        : _recordManager.LoadData(recordInfo.FullPath)?.Info?.GameName ?? gameName;
+                    _recordManager.UpdateCustomData(recordInfo,
+                        cpu, gpu, ram, mainboard, storedGameName, comment, resolution);
+                });
+            }
+            else if (_applicationState.SelectedRecords.Count > 1)
+            {
+                bool cpuChanged = _customCpuDescriptionChanged, gpuChanged = _customGpuDescriptionChanged,
+                    ramChanged = _customRamDescriptionChanged, mainboardChanged = _customMainboardDescriptionChanged,
+                    gameNameChanged = _customGameNameChanged, commentChanged = _customCommentChanged,
+                    resolutionChanged = _customResolutionChanged;
+
+                foreach (var recordInfo in _applicationState.SelectedRecords.OfType<IFileRecordInfo>().ToList())
+                {
+                    // Each record keeps its own values for the fields that were not edited.
+                    _recordWriteQueue.Enqueue(() =>
+                    {
+                        var session = _recordManager.LoadData(recordInfo.FullPath);
+                        if (session?.Info == null)
+                        {
+                            _logger.LogWarning("Metadata of {path} not saved: the record cannot be read", recordInfo.FullPath);
+                            return;
+                        }
+
+                        _recordManager.UpdateCustomData(recordInfo,
+                            cpuChanged ? cpu : session.Info.Processor,
+                            gpuChanged ? gpu : session.Info.GPU,
+                            ramChanged ? ram : session.Info.SystemRam,
+                            mainboardChanged ? mainboard : session.Info.Motherboard,
+                            gameNameChanged ? gameName : session.Info.GameName,
+                            commentChanged ? comment : session.Info.Comment,
+                            resolutionChanged ? resolution : session.Info.ResolutionInfo);
+                    });
+                }
+            }
+
+            AddOrUpdateProcess(_selectedRecordInfo.ProcessName, CustomGameName);
+            ResetDescriptionChangedFlags();
+        }
+
+        private void AddOrUpdateProcess(string processName, string gameName)
+        {
+            if (string.IsNullOrWhiteSpace(processName) || string.IsNullOrWhiteSpace(gameName)
+                || (processName.Replace(".exe", string.Empty) == gameName) || processName.Contains("??"))
+            {
+                return;
+            }
+
+            try
+            {
+                var process = _processList.FindProcessByName(processName);
+                if (process is null)
+                {
+                    _processList.AddEntry(processName, gameName);
+                    process = _processList.FindProcessByName(processName);
+                }
+                else
+                {
+                    var isNewDisplayName = process.DisplayName == null;
+                    process.UpdateDisplayName(gameName);
+
+                    if (isNewDisplayName)
+                    {
+                        _processList.UploadProcessInfo(processName, gameName);
+                    }
+                }
+                _processList?.Save();
+                RecordInfoList.Where(record => record.ProcessName == processName).ForEach(record =>
+                {
+                    record.GameName = process.DisplayName;
+                    ((FileRecordInfo)record).NotifyPropertyChanged(nameof(record.GameName));
+                });
+
+                RaisePropertyChanged(nameof(RecordInfoList));
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Error updating ProcessList");
+            }
+        }
+
+        public async void OnRecordSelectByDoubleClick()
+        {
+            var selectedRecordInfo = SelectedRecordInfo;
+            if (selectedRecordInfo != null && _selectSessionEvent != null)
+            {
+                try
+                {
+                    // Reuse the selection load and retain UpdateSession-before-SelectSession ordering.
+                    var session = await _selectedSessionTask;
+                    if (session != null && ReferenceEquals(_selectedRecordInfo, selectedRecordInfo))
+                    {
+                        _selectSessionEvent.Publish(new ViewMessages.SelectSession(session, selectedRecordInfo));
+                    }
+                }
+                catch (Exception exception)
+                {
+                    _logger.LogError(exception, "Error selecting record {RecordPath}.", selectedRecordInfo.FullPath);
+                }
+            }
+        }
+
+        private void OnSelectedRecordInfoChanged()
+        {
+            int selectionVersion = Interlocked.Increment(ref _selectionVersion);
+            var newCancellation = new CancellationTokenSource();
+            var previousCancellation = Interlocked.Exchange(ref _selectionLoadCancellation, newCancellation);
+            previousCancellation?.Cancel();
+            previousCancellation?.Dispose();
+            var selectedRecordInfo = _selectedRecordInfo;
+
+            if (selectedRecordInfo is null)
+            {
+                _selectedSessionTask = Task.FromResult<ISession>(null);
+                ResetInfoEditBoxes();
+                ResetDescriptionChangedFlags();
+            }
+            else
+            {
+                // FileRecordInfo already contains these fields, so the editor can update without
+                // waiting for the complete capture to be parsed on the background thread.
+                CustomCpuDescription = selectedRecordInfo.ProcessorName ?? string.Empty;
+                CustomGpuDescription = selectedRecordInfo.GraphicCardName ?? string.Empty;
+                CustomRamDescription = selectedRecordInfo.SystemRamInfo ?? string.Empty;
+                CustomMainboardDescription = selectedRecordInfo.MotherboardName ?? string.Empty;
+                CustomGameName = selectedRecordInfo.GameName ?? string.Empty;
+                CustomComment = selectedRecordInfo.Comment ?? string.Empty;
+                CustomResolution = selectedRecordInfo.Resolution ?? string.Empty;
+                ResetDescriptionChangedFlags();
+                _selectedSessionTask = LoadSelectedSessionAsync(selectedRecordInfo, selectionVersion,
+                    newCancellation.Token);
+            }
+        }
+
+        private async Task<ISession> LoadSelectedSessionAsync(IFileRecordInfo selectedRecordInfo,
+            int selectionVersion, CancellationToken cancellationToken)
+        {
+            bool lockTaken = false;
+            try
+            {
+                await _selectionLoadSemaphore.WaitAsync(cancellationToken);
+                lockTaken = true;
+
+                // Rapid navigation can queue several records behind an active HDD read. Only the
+                // newest queued selection is allowed to start another read.
+                if (cancellationToken.IsCancellationRequested
+                    || !IsCurrentSelection(selectedRecordInfo, selectionVersion))
+                {
+                    return null;
+                }
+
+                var session = await Task.Run(
+                    () => _recordManager.LoadData(selectedRecordInfo.FullPath), cancellationToken);
+                if (session != null && !cancellationToken.IsCancellationRequested
+                    && IsCurrentSelection(selectedRecordInfo, selectionVersion))
+                {
+                    if (_updateSessionEvent != null)
+                    {
+                        _updateSessionEvent.Publish(new ViewMessages.UpdateSession(session, selectedRecordInfo));
+                    }
+                    return session;
+                }
+
+                return null;
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogError(exception, "Error loading selected record {RecordPath}.", selectedRecordInfo.FullPath);
+                return null;
+            }
+            finally
+            {
+                if (lockTaken)
+                    _selectionLoadSemaphore.Release();
+            }
+        }
+
+        private bool IsCurrentSelection(IFileRecordInfo selectedRecordInfo, int selectionVersion)
+            => Volatile.Read(ref _selectionVersion) == selectionVersion
+                && ReferenceEquals(_selectedRecordInfo, selectedRecordInfo);
+
+        private void OnPressDeleteKey()
+            => OnDeleteRecordFile();
+
+        void OnSelectedRecordings(object selectedRecordings)
+        {
+            if (selectedRecordings == null)
+                return;
+
+            _selectedRecordings = new List<IFileRecordInfo>((selectedRecordings as IList).Cast<IFileRecordInfo>());
+        }
+
+        private void SetAggregatorEvents()
+        {
+            _updateSessionEvent = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.UpdateSession>>();
+            _selectSessionEvent = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.SelectSession>>();
+            _updateRecordInfosEvent = _eventAggregator.GetEvent<PubSubEvent<ViewMessages.UpdateRecordInfos>>();
+        }
+
+        private void SubscribeToResetRecord()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.ResetRecord>>()
+                .Subscribe(msg =>
+                {
+                    SelectedRecordInfo = null;
+                    _selectedRecordings = null;
+                });
+        }
+
+        private void SubscribeToSetFileRecordInfoExternal()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.SetFileRecordInfoExternal>>()
+                .Subscribe(msg =>
+                {
+                    SelectedRecordInfo = RecordInfoList
+                        .FirstOrDefault(info => info.Id == msg.RecordInfo.Id);
+                    _selectedRecordings = null;
+                });
+        }
+
+        private void SubscribeToCloudFolderChanged()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<AppMessages.CloudFolderChanged>>()
+                .Subscribe(msg =>
+                {
+                    TreeViewUpdateStream.OnNext(default);
+                });
+        }
+
+        private void SubscribeToCloudFolderSelected()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<AppMessages.SelectCloudFolder>>()
+                .Subscribe(msg =>
+                {
+                    TreeViewUpdateStream.OnNext(default);
+                });
+        }
+    }
+}

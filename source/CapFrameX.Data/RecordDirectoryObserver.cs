@@ -1,0 +1,191 @@
+﻿using CapFrameX.Capture.Contracts;
+using CapFrameX.Contracts.Configuration;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reactive;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Runtime.InteropServices;
+
+namespace CapFrameX.Data
+{
+    public class RecordDirectoryObserver : IRecordDirectoryObserver, IDisposable
+    {
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IPathService _pathService;
+        private readonly ILogger<RecordDirectoryObserver> _logger;
+        private readonly Func<FileInfo, bool> _validFileFilterFunc = (FileInfo fi) => fi.Extension == ".csv" || fi.Extension == ".json";
+        // Plain subjects: replay subjects kept every file event of the session in memory. A late
+        // subscriber gets the current files from DirectoryFilesStream instead.
+        private readonly ISubject<FileInfo> _fileCreatedSubject = new Subject<FileInfo>();
+        private readonly ISubject<FileInfo> _fileChangedSubject = new Subject<FileInfo>();
+        private readonly ISubject<FileInfo> _fileDeletedSubject = new Subject<FileInfo>();
+        // Signals a new listing. Each subscriber gets a copy of the files at that moment: the
+        // watcher thread changes the list while the record list is still reading the files.
+        private readonly ISubject<Unit> _directoryFilesSubject = new BehaviorSubject<Unit>(Unit.Default);
+        private readonly object _filesLock = new object();
+        private readonly ISubject<DirectoryInfo> _observingDirectorySubject = new BehaviorSubject<DirectoryInfo>(null);
+
+        public IObservable<FileInfo> FileCreatedStream => _fileCreatedSubject.AsObservable();
+        public IObservable<FileInfo> FileChangedStream => _fileChangedSubject.AsObservable();
+        public IObservable<FileInfo> FileDeletedStream => _fileDeletedSubject.AsObservable();
+        public IObservable<IEnumerable<FileInfo>> DirectoryFilesStream => _directoryFilesSubject.Select(_ => CopyCurrentFiles());
+        public IObservable<DirectoryInfo> ObservingDirectoryStream => _observingDirectorySubject.AsObservable();
+
+        [DllImport("shlwapi.dll")]
+        public static extern bool PathIsNetworkPath(string pszPath);
+
+        private FileSystemWatcher _watcher;
+        private List<FileInfo> _currentFiles = new List<FileInfo>();
+        private string _currentDir;
+
+        public RecordDirectoryObserver(IAppConfiguration appConfiguration, IPathService pathService, ILogger<RecordDirectoryObserver> logger)
+        {
+            _appConfiguration = appConfiguration;
+            _pathService = pathService;
+            _logger = logger;
+            ObserveDirectory(_pathService.ResolveDocumentsPlaceholder(_appConfiguration.ObservedDirectory));
+        }
+
+        public void Dispose()
+        {
+            // There is no watcher while the observed folder does not exist.
+            _watcher?.Dispose();
+            _directoryFilesSubject.OnCompleted();
+            _fileCreatedSubject.OnCompleted();
+            _fileChangedSubject.OnCompleted();
+            _fileDeletedSubject.OnCompleted();
+            _observingDirectorySubject.OnCompleted();
+        }
+
+        public void RefreshCurrentDirectory()
+        {
+            if (string.IsNullOrWhiteSpace(_currentDir))
+                return;
+
+            _directoryFilesSubject.OnNext(Unit.Default);
+        }
+
+        private IEnumerable<FileInfo> CopyCurrentFiles()
+        {
+            lock (_filesLock)
+                return _currentFiles.ToArray();
+        }
+
+        public void ObserveDirectory(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir) || dir == _currentDir)
+                return;
+
+            // Update app configuration, if needed
+            if (_pathService.ResolveDocumentsPlaceholder(_appConfiguration.ObservedDirectory) != dir)
+            {
+                _appConfiguration.ObservedDirectory = dir;
+            }
+
+            _currentDir = dir;
+            var directory = new DirectoryInfo(dir);
+            if (!directory.Exists)
+            {
+                _logger.LogWarning("Cannot observe directory {path}: Does not exist", directory);
+                _observingDirectorySubject.OnNext(directory);
+                return;
+            }
+
+            if (_watcher is FileSystemWatcher)
+            {
+                _logger.LogDebug("Changing observed directory");
+                _watcher.Dispose();
+            }
+
+            _watcher = new FileSystemWatcher(directory.FullName)
+            {
+                EnableRaisingEvents = true,
+                IncludeSubdirectories = false,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName
+            };
+
+            _watcher.Created += OnFileCreated;
+            _watcher.Changed += OnFileChanged;
+            _watcher.Deleted += OnFileDeleted;
+            _watcher.Renamed += OnFileRenamed;
+            _observingDirectorySubject.OnNext(directory);
+            var files = directory.GetFiles("*.*", SearchOption.TopDirectoryOnly).Where(_validFileFilterFunc).ToList();
+            lock (_filesLock)
+                _currentFiles = files;
+            _directoryFilesSubject.OnNext(Unit.Default);
+            _logger.LogInformation("Now observing directory: {path}", directory.FullName);
+
+            void OnFileCreated(object sender, FileSystemEventArgs e)
+            {
+                if (!CheckRelevantFiles(e.FullPath))
+                    return;
+
+                var fileInfo = new FileInfo(e.FullPath);
+                _logger.LogInformation("File created: {path}", fileInfo.FullName);
+                _fileCreatedSubject.OnNext(fileInfo);
+                lock (_filesLock)
+                    _currentFiles.Add(fileInfo);
+            }            
+
+            void OnFileChanged(object sender, FileSystemEventArgs e)
+            {
+                if (!CheckRelevantFiles(e.FullPath))
+                    return;
+
+                FileInfo fileInfo;
+                lock (_filesLock)
+                    fileInfo = _currentFiles.FirstOrDefault(f => f.FullName.Equals(e.FullPath));
+                if (fileInfo is FileInfo)
+                {
+                    _logger.LogInformation("File changed: {path}", fileInfo.FullName);
+                    fileInfo.Refresh();
+                    _fileChangedSubject.OnNext(fileInfo);
+                }
+            }
+
+            void OnFileRenamed(object sender, RenamedEventArgs e)
+            {
+                // The old name need not be listed: the listing leaves out temp files, and the folder
+                // may have held no records. The new name is reported either way.
+                if (CheckRelevantFiles(e.OldFullPath))
+                {
+                    var oldFileInfo = new FileInfo(e.OldFullPath);
+                    _fileDeletedSubject.OnNext(oldFileInfo);
+                    lock (_filesLock)
+                        _currentFiles.RemoveAll(f => f.FullName.Equals(oldFileInfo.FullName));
+                }
+                OnFileCreated(sender, e);
+            }
+
+            void OnFileDeleted(object sender, FileSystemEventArgs e)
+            {
+                lock (_filesLock)
+                {
+                    if (!_currentFiles.Any() || !CheckRelevantFiles(e.FullPath))
+                        return;
+                }
+                try
+                {
+                    var fileInfo = new FileInfo(e.FullPath);
+                    _fileDeletedSubject.OnNext(fileInfo);
+                    lock (_filesLock)
+                        _currentFiles.Remove(_currentFiles.First(f => f.FullName.Equals(fileInfo.FullName)));
+                    _logger.LogInformation("File deleted: {path}", fileInfo.FullName);
+                }
+                catch 
+                {
+                    var fileInfo = new FileInfo(e.FullPath);
+                    _logger.LogInformation($"Error deleting file: {fileInfo.FullName}");
+                }
+            }
+        }
+
+        private bool CheckRelevantFiles(string path)
+            => path.EndsWith(".json") || path.EndsWith(".csv") 
+            || path.EndsWith(".json.tmp") || path.EndsWith(".csv.tmp");
+    }
+}

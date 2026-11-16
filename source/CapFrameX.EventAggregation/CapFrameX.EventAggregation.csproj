@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.Contracts\CapFrameX.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Data.Session\CapFrameX.Data.Session.csproj" />
+  </ItemGroup>
+
+</Project>

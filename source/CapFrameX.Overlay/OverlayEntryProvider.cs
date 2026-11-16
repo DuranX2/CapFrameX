@@ -1,0 +1,2327 @@
+﻿using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Extensions;
+using CapFrameX.Hardware.Controller;
+using CapFrameX.Monitoring.Contracts;
+using CapFrameX.PresentMonInterface;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using Prism.Events;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net.NetworkInformation;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CapFrameX.Overlay
+{
+    public class OverlayEntryProvider : IOverlayEntryProvider
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SystemPowerStatus
+        {
+            public byte ACLineStatus;
+            public byte BatteryFlag;
+            public byte BatteryLifePercent;
+            public byte Reserved;
+            public int BatteryLifeTime;
+            public int BatteryFullLifeTime;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
+
+        private readonly string _overlayConfigFolder;
+
+        // Only retained to remove obsolete items from existing overlay profiles.
+        private static readonly HashSet<string> RETIRED_ENTRY_IDENTIFIERS = new HashSet<string>()
+        {
+            "OnlineAmdFlmLatency", "OnlineClickToPhotonLatency",
+            "/capframex/amd-flm/0/latency/0", "/capframex/presentmon/0/latency/0"
+        };
+
+        private static readonly HashSet<string> ONLINE_METRIC_NAMES = new HashSet<string>()
+        {
+            "OnlineAverage", "OnlineP1","OnlineP0dot1", "OnlineP0dot2", "Online1PercentLow", "Online0dot1PercentLow", "Online0dot2PercentLow",
+            "OnlineGpuActiveTimeAverage", "OnlineCpuActiveTimeAverage", "OnlineFrameTimeAverage", "OnlinePcLatency", "OnlineAnimationError",
+            "OnlineGpuActiveTimePercentageDeviation", "OnlineStutteringPercentage", "PmdGpuPowerCurrent",
+            "PmdCpuPowerCurrent", "PmdSystemPowerCurrent"
+        };
+
+        // Feature-toggle gated entries. These always stay in the overlay entry list: the
+        // constructor subscribes to their config keys and flips the existing entry in place,
+        // which requires the entry to be present even while the feature is off.
+        private static readonly IReadOnlyDictionary<string, (string ConfigKey, Func<IAppConfiguration, bool> GetIsEnabled)>
+            CONFIG_GATED_ENTRIES = new Dictionary<string, (string, Func<IAppConfiguration, bool>)>()
+            {
+                { "OnlinePcLatency", (nameof(IAppConfiguration.UsePcLatency), config => config.UsePcLatency) },
+            };
+
+        // Renderer-gated entries are part of the overlay profile, not of a renderer-specific
+        // profile. Keep them in the working set while unavailable so switching renderers cannot
+        // discard unsaved formatting or selection changes.
+        private static readonly IReadOnlyDictionary<string, Func<IAppConfiguration, bool>>
+            RENDERER_GATED_ENTRIES = new Dictionary<string, Func<IAppConfiguration, bool>>()
+            {
+                { HOOK_OVERLAY_STATUS_IDENTIFIER, config => config.EnableHookOverlay },
+                { FRAME_GENERATION_TECHNOLOGY_IDENTIFIER, config => config.EnableHookOverlay },
+                { FRAME_GENERATION_STATUS_IDENTIFIER, config => config.EnableHookOverlay },
+                { DISPLAY_TIME_IDENTIFIER, config => config.EnableHookFreeOverlay
+                    || (config.EnableHookOverlay && config.HookOverlayUsePresentMonFrametimes) },
+                { PRESENT_RESOLUTION_IDENTIFIER, config => !config.EnableHookFreeOverlay },
+            };
+
+        private static readonly HashSet<string> RENDERER_GATING_CONFIG_KEYS = new HashSet<string>()
+        {
+            nameof(IAppConfiguration.EnableHookFreeOverlay),
+            nameof(IAppConfiguration.EnableHookOverlay),
+            nameof(IAppConfiguration.HookOverlayUsePresentMonFrametimes),
+        };
+
+        private const string HOOK_OVERLAY_STATUS_IDENTIFIER = "HookOverlayStatus";
+        private const string FRAME_GENERATION_TECHNOLOGY_IDENTIFIER = "FrameGenerationTechnology";
+        private const string FRAME_GENERATION_STATUS_IDENTIFIER = "FrameGenerationStatus";
+        private const string DISPLAY_TIME_IDENTIFIER = "DisplayTime";
+        private const string PRESENT_RESOLUTION_IDENTIFIER = "Resolution";
+        private const string PRESENT_MODE_IDENTIFIER = "OnlinePresentMode";
+        private const string DISPLAY_RESOLUTION_IDENTIFIER_PREFIX = "DisplayResolution:";
+
+        private readonly ISensorService _sensorService;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly IEventAggregator _eventAggregator;
+        private readonly IOnlineMetricService _onlineMetricService;
+        private readonly ISystemInfo _systemInfo;
+        private readonly IRTSSService _rTSSService;
+        private readonly ISensorConfig _sensorConfig;
+        private readonly IOverlayEntryCore _overlayEntryCore;
+        private readonly IThreadAffinityController _threadAffinityController;
+        private readonly Func<IReadOnlyList<DetectedDisplay>> _displayProvider;
+        private readonly IOverlayProfileChangeTracker _profileChangeTracker;
+
+        private readonly ILogger<OverlayEntryProvider> _logger;
+        private readonly object _overlayEntriesGate = new object();
+        private readonly ConcurrentDictionary<string, IOverlayEntry> _identifierOverlayEntryDict
+             = new ConcurrentDictionary<string, IOverlayEntry>();
+        private readonly Subject<IOverlayEntry[]> _overlayEntriesChanged
+             = new Subject<IOverlayEntry[]>();
+        private readonly TaskCompletionSource<bool> _taskCompletionSource
+            = new TaskCompletionSource<bool>();
+        private readonly ConcurrentDictionary<string, int> _colorIndexDictionary
+            = new ConcurrentDictionary<string, int>();
+        private readonly ConcurrentDictionary<int, int> _sizeIndexDictionary
+            = new ConcurrentDictionary<int, int>();
+
+        private BlockingCollection<IOverlayEntry> _overlayEntries;
+        private double _ping = double.NaN;
+        private int _pingInFlight;
+        private long _lastPingTick;
+        private long _lastCpuUsageTick;
+        private double _cachedCpuUsage = double.NaN;
+        private volatile int _currentProcessId;
+        // Written by the status stream, read by the overlay refresh: the entry itself must not be
+        // touched from the stream, it is replaced whenever a configuration is loaded or switched.
+        private volatile HookOverlayStatus _hookOverlayStatus;
+        public bool HasHardwareChanged { get; set; }
+        public bool HasPendingChanges => _profileChangeTracker.HasPendingChanges;
+        public IObservable<IOverlayEntry[]> OverlayEntriesChanged => _overlayEntriesChanged;
+        public bool ShowSystemTimeSeconds { get; set; }
+
+        public OverlayEntryProvider(ISensorService sensorService,
+            IAppConfiguration appConfiguration,
+            IEventAggregator eventAggregator,
+            IOnlineMetricService onlineMetricService,
+            ISystemInfo systemInfo,
+            IRTSSService rTSSService,
+            ISensorConfig sensorConfig,
+            IOverlayEntryCore overlayEntryCore,
+            IThreadAffinityController threadAffinityController,
+            IPathService pathService,
+            IHookOverlayStatusService hookOverlayStatusService,
+            ILogger<OverlayEntryProvider> logger,
+            IOverlayProfileChangeTracker profileChangeTracker)
+            : this(sensorService, appConfiguration, eventAggregator, onlineMetricService,
+                  systemInfo, rTSSService, sensorConfig, overlayEntryCore,
+                  threadAffinityController, pathService, hookOverlayStatusService, logger,
+                  DisplayDetection.GetDisplays, profileChangeTracker)
+        {
+        }
+
+        internal OverlayEntryProvider(ISensorService sensorService,
+            IAppConfiguration appConfiguration,
+            IEventAggregator eventAggregator,
+            IOnlineMetricService onlineMetricService,
+            ISystemInfo systemInfo,
+            IRTSSService rTSSService,
+            ISensorConfig sensorConfig,
+            IOverlayEntryCore overlayEntryCore,
+            IThreadAffinityController threadAffinityController,
+            IPathService pathService,
+            IHookOverlayStatusService hookOverlayStatusService,
+            ILogger<OverlayEntryProvider> logger,
+            Func<IReadOnlyList<DetectedDisplay>> displayProvider,
+            IOverlayProfileChangeTracker profileChangeTracker = null)
+        {
+            _sensorService = sensorService;
+            _appConfiguration = appConfiguration;
+            _eventAggregator = eventAggregator;
+            _onlineMetricService = onlineMetricService;
+            _systemInfo = systemInfo;
+            _rTSSService = rTSSService;
+            _sensorConfig = sensorConfig;
+            _overlayEntryCore = overlayEntryCore;
+            _threadAffinityController = threadAffinityController;
+            _overlayConfigFolder = pathService.ConfigFolder;
+            _logger = logger;
+            _displayProvider = displayProvider ?? (() => Array.Empty<DetectedDisplay>());
+            _profileChangeTracker = profileChangeTracker ?? new OverlayProfileChangeTracker();
+
+            _hookOverlayStatus = hookOverlayStatusService?.Current;
+            hookOverlayStatusService?.StatusStream
+                .Subscribe(status => _hookOverlayStatus = status);
+
+            _ = Task.Run(async () => await LoadOrSetDefault())
+                .ContinueWith(task => _taskCompletionSource.SetResult(true));
+
+            SubscribeToOptionPopupClosed();
+
+            ShowSystemTimeSeconds = _appConfiguration.ShowSystemTimeSeconds;
+            _appConfiguration.OnValueChanged
+            .Where(x => x.key == nameof(IAppConfiguration.ShowSystemTimeSeconds))
+            .Select(x => x.value)
+            .Subscribe(value => ShowSystemTimeSeconds = (bool)value);
+
+            foreach (var gatedEntry in CONFIG_GATED_ENTRIES)
+            {
+                string identifier = gatedEntry.Key;
+                _appConfiguration.OnValueChanged
+                .Where(x => x.key == gatedEntry.Value.ConfigKey)
+                .Select(x => x.value)
+                .Subscribe(value => UpdateConfigGatedEntryState(identifier, (bool)value));
+            }
+
+            _appConfiguration.OnValueChanged
+                .Where(x => RENDERER_GATING_CONFIG_KEYS.Contains(x.key))
+                .Subscribe(_ => UpdateRendererGatedEntryStates());
+
+            rTSSService.ProcessIdStream.Subscribe(id =>
+            {
+                // update process ID
+                _currentProcessId = id;
+            });
+
+            _logger.LogDebug("{componentName} Ready", this.GetType().Name);
+
+            // Add <S0=50>
+            _sizeIndexDictionary.TryAdd(50, 0);
+        }
+
+        public async Task<IOverlayEntry[]> GetOverlayEntries(bool updateFormats = true)
+        {
+            await _taskCompletionSource.Task;
+            // A live profile replacement must finish wiring its entries before a renderer reads it.
+            lock (_overlayEntriesGate)
+            {
+                RefreshDisplayEntries();
+                UpdateSensorData();
+                UpdateOnlineMetrics();
+                UpdateAppInfo();
+                UpdateResolution();
+                UpdateThreadAffinityState();
+                UpdateNetworkPing();
+                UpdateHookOverlayStatus();
+
+                if (updateFormats)
+                {
+                    UpdateFormatting();
+                }
+
+                return _overlayEntries.ToArray();
+            }
+        }
+
+        public IOverlayEntry GetOverlayEntry(string identifier)
+        {
+            _identifierOverlayEntryDict.TryGetValue(identifier, out IOverlayEntry entry);
+
+            return entry;
+        }
+
+        public async Task<IOverlayEntry[]> GetTelemetrySourcesAsync()
+        {
+            await _taskCompletionSource.Task.ConfigureAwait(false);
+            // Defaults are the authoritative catalog, including optional and renderer-gated rows.
+            // These detached objects never become the user's editable overlay profile.
+            var entries = OverlayUtils.GetOverlayEntryDefaults(_appConfiguration)
+                .Cast<IOverlayEntry>().ToList();
+            entries.AddRange(GetDetectedDisplays().Select(CreateDisplayResolutionEntry));
+            return entries.ToArray();
+        }
+
+        public IReadOnlyDictionary<string, object> GetTelemetryValues() => GetTelemetryValues(null);
+
+        public IReadOnlyDictionary<string, object> GetTelemetryValues(IReadOnlySet<string> identifiers)
+        {
+            bool Requested(string identifier) => identifiers == null || identifiers.Contains(identifier);
+
+            var values = new Dictionary<string, object>(StringComparer.Ordinal);
+            lock (_overlayEntriesGate)
+            {
+                foreach (string identifier in new[] { "CaptureServiceStatus", "CaptureTimer",
+                    "CustomCPU", "CustomGPU", "Mainboard", "CustomRAM", "OS", "GPUDriver" })
+                    if (Requested(identifier))
+                        values[identifier] = GetOverlayEntry(identifier)?.Value;
+                if (Requested("SystemTime"))
+                    values["SystemTime"] = DateTime.Now.ToString(ShowSystemTimeSeconds ? "HH:mm:ss" : "HH:mm");
+                if (Requested("CxAppCpuUsage"))
+                    values["CxAppCpuUsage"] = GetAppCpuUsage();
+                if (Requested("HookOverlayStatus"))
+                    values["HookOverlayStatus"] = HookOverlayStatusLabel.ForState(_appConfiguration.EnableHookOverlay
+                        ? _hookOverlayStatus?.State ?? EHookOverlayStatus.Waiting : EHookOverlayStatus.Disabled);
+                var targetHook = _currentProcessId > 0 && _hookOverlayStatus?.ProcessId == _currentProcessId
+                    ? _hookOverlayStatus : null;
+                if (Requested("Resolution"))
+                    values["Resolution"] = _appConfiguration.EnableHookOverlay
+                        ? targetHook?.RenderResolution
+                        : _appConfiguration.UsesRtss() && _currentProcessId > 0
+                            ? _rTSSService.GetResolution(_currentProcessId) : null;
+                if (Requested("GraphicsAPI"))
+                    values["GraphicsAPI"] = _appConfiguration.EnableHookOverlay ? targetHook?.RenderApi
+                        : _appConfiguration.UsesRtss() && _currentProcessId > 0
+                            ? _rTSSService.GetApiInfo(_currentProcessId) : null;
+                if (Requested(PRESENT_MODE_IDENTIFIER))
+                    values[PRESENT_MODE_IDENTIFIER] = PresentModeLabel.Shorten(_onlineMetricService?.GetOnlinePresentMode());
+                if (identifiers == null || identifiers.Any(identifier =>
+                        identifier.StartsWith(DISPLAY_RESOLUTION_IDENTIFIER_PREFIX, StringComparison.Ordinal)))
+                    foreach (var display in GetDetectedDisplays())
+                        values[GetDisplayResolutionIdentifier(display.DeviceName)] = FormatDisplayResolution(display);
+                if ((Requested("BatteryLifePercent") || Requested("BatteryLifeRemaining"))
+                    && GetSystemPowerStatus(out var power))
+                {
+                    values["BatteryLifePercent"] = power.BatteryLifePercent == 255 ? null : (object)(double)power.BatteryLifePercent;
+                    values["BatteryLifeRemaining"] = power.BatteryLifeTime < 0 ? null : (object)(power.BatteryLifeTime / 60d);
+                }
+                if (Requested("Ping"))
+                {
+                    values["Ping"] = double.IsNaN(_ping) ? null : (object)_ping;
+                    SetPing();
+                }
+            }
+            return values;
+        }
+
+        public void MoveEntry(int sourceIndex, int targetIndex)
+        {
+            lock (_overlayEntriesGate)
+            {
+                _overlayEntries.Move(sourceIndex, targetIndex);
+            }
+
+            MarkPendingChanges();
+        }
+
+        public void MarkPendingChanges()
+            => _profileChangeTracker.MarkPendingChanges();
+
+        public async Task SaveOverlayEntriesToJson(int targetConfig)
+        {
+            try
+            {
+                List<OverlayEntryWrapper> entries;
+                lock (_overlayEntriesGate)
+                {
+                    entries = _overlayEntries
+                        .Select(entry => entry as OverlayEntryWrapper)
+                        .ToList();
+                }
+
+                var persistence = new OverlayEntryPersistence()
+                {
+                    OverlayEntries = entries
+                };
+
+                var json = JsonConvert.SerializeObject(persistence);
+
+                if (!Directory.Exists(_overlayConfigFolder))
+                    Directory.CreateDirectory(_overlayConfigFolder);
+
+                using (StreamWriter outputFile = new StreamWriter(GetConfigurationFileName(targetConfig)))
+                {
+                    await outputFile.WriteAsync(json);
+                }
+
+                if (targetConfig == _appConfiguration.OverlayEntryConfigurationFile)
+                {
+                    HasHardwareChanged = false;
+                    _profileChangeTracker.ResetPendingChanges();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to save overlay profile {profile}.", targetConfig + 1);
+            }
+        }
+
+        public async Task SwitchConfigurationTo(int index)
+        {
+            SetConfigurationFileName(index);
+            await LoadOrSetDefault();
+        }
+
+        public async Task<IEnumerable<IOverlayEntry>> GetDefaultOverlayEntries()
+        {
+            var defaultEntries = await CreateDefaultOverlayEntries();
+            lock (_overlayEntriesGate)
+            {
+                _overlayEntries = defaultEntries;
+                UpdateStates(resetEvaluate: true);
+                MarkPendingChanges();
+                return _overlayEntries.ToList();
+            }
+        }
+
+        public void SetFormatForGroupName(string groupName, IOverlayEntry selectedEntry, IOverlayEntryFormatChange checkboxes)
+        {
+            foreach (var entry in _overlayEntries
+                    .Where(x => x.GroupName == groupName))
+            {
+                if (checkboxes.Colors)
+                {
+                    entry.GroupColor = selectedEntry.GroupColor;
+                    entry.Color = selectedEntry.Color;
+                    entry.UpperLimitColor = selectedEntry.UpperLimitColor;
+                    entry.LowerLimitColor = selectedEntry.LowerLimitColor;
+                }
+                if (checkboxes.Limits)
+                {
+                    entry.UpperLimitValue = selectedEntry.UpperLimitValue;
+                    entry.LowerLimitValue = selectedEntry.LowerLimitValue;
+                }
+                if (checkboxes.Format)
+                {
+                    entry.GroupFontSize = selectedEntry.GroupFontSize;
+                    entry.ValueFontSize = selectedEntry.ValueFontSize;
+                    CopyValueDisplayMode(selectedEntry, entry);
+                }
+                entry.FormatChanged = true;
+            }
+        }
+
+        public void SetFormatForSensorType(string sensorType, IOverlayEntry selectedEntry, IOverlayEntryFormatChange checkboxes)
+        {
+            foreach (var entry in _overlayEntries
+                    .Where(x => _sensorService.GetSensorTypeString(x.OverlayEntryType, x.StableIdentifier) == sensorType))
+            {
+                if (checkboxes.Colors)
+                {
+                    entry.GroupColor = selectedEntry.GroupColor;
+                    entry.Color = selectedEntry.Color;
+                    entry.UpperLimitColor = selectedEntry.UpperLimitColor;
+                    entry.LowerLimitColor = selectedEntry.LowerLimitColor;
+                }
+                if (checkboxes.Limits)
+                {
+                    entry.UpperLimitValue = selectedEntry.UpperLimitValue;
+                    entry.LowerLimitValue = selectedEntry.LowerLimitValue;
+                }
+                if (checkboxes.Format)
+                {
+                    entry.GroupFontSize = selectedEntry.GroupFontSize;
+                    entry.ValueFontSize = selectedEntry.ValueFontSize;
+                    CopyValueDisplayMode(selectedEntry, entry);
+                }
+                entry.FormatChanged = true;
+            }
+        }
+
+        public void SetFormatForAllGroups(IOverlayEntry selectedEntry, IOverlayEntryFormatChange checkboxes)
+        {
+            foreach (var entry in _overlayEntries)
+            {
+                if (checkboxes.Colors)
+                {
+                    entry.GroupColor = selectedEntry.GroupColor;
+                }
+                if (checkboxes.Format)
+                {
+                    entry.GroupFontSize = selectedEntry.GroupFontSize;
+                }
+                entry.FormatChanged = true;
+            }
+        }
+
+        public void SetFormatForAllValues(IOverlayEntry selectedEntry, IOverlayEntryFormatChange checkboxes)
+        {
+            foreach (var entry in _overlayEntries)
+            {
+                if (checkboxes.Colors)
+                {
+                    entry.Color = selectedEntry.Color;
+                    entry.UpperLimitColor = selectedEntry.UpperLimitColor;
+                    entry.LowerLimitColor = selectedEntry.LowerLimitColor;
+                }
+                if (checkboxes.Limits)
+                {
+                    entry.UpperLimitValue = selectedEntry.UpperLimitValue;
+                    entry.LowerLimitValue = selectedEntry.LowerLimitValue;
+                }
+                if (checkboxes.Format)
+                {
+                    entry.ValueFontSize = selectedEntry.ValueFontSize;
+                    CopyValueDisplayMode(selectedEntry, entry);
+                }
+                entry.FormatChanged = true;
+            }
+        }
+
+        public void ResetColorAndLimits(IOverlayEntry selectedEntry)
+        {
+            selectedEntry.UpperLimitValue = string.Empty;
+            selectedEntry.LowerLimitValue = string.Empty;
+            selectedEntry.GroupColor = string.Empty;
+            selectedEntry.Color = string.Empty;
+            selectedEntry.UpperLimitColor = string.Empty;
+            selectedEntry.LowerLimitColor = string.Empty;
+            selectedEntry.FormatChanged = true;
+        }
+
+        private static void CopyValueDisplayMode(IOverlayEntry source, IOverlayEntry target)
+        {
+            if (source.SupportsPercentageBar && target.SupportsPercentageBar)
+                target.ValueDisplayMode = OverlayPercentageBar.GetDisplayMode(source);
+        }
+
+        public void SortOverlayEntriesByType()
+        {
+            lock (_overlayEntriesGate)
+            {
+                var sortedEntries = _overlayEntries
+                    .OrderBy(entry =>
+                    {
+                        switch (entry.OverlayEntryType)
+                        {
+                            case EOverlayEntryType.CX:
+                                return 1;
+                            case EOverlayEntryType.GPU:
+                                return 2;
+                            case EOverlayEntryType.CPU:
+                                return 3;
+                            case EOverlayEntryType.RAM:
+                                return 4;
+                            case EOverlayEntryType.HDD:
+                                return 5;
+                            case EOverlayEntryType.OnlineMetric:
+                                return 6;
+                            case EOverlayEntryType.Undefined:
+                                return 7;
+                            default:
+                                return 8;
+                        }
+                    }).ThenBy(entry => entry.SortKey, new SortKeyComparer())
+                    .ToList();
+
+                _overlayEntries = CreateEntryCollection(sortedEntries);
+            }
+
+            MarkPendingChanges();
+        }
+
+        public void UpdateOverlayEntries(IEnumerable<IOverlayEntry> entries)
+        {
+            lock (_overlayEntriesGate)
+            {
+                _overlayEntries = CreateEntryCollection(entries);
+                UpdateStates(resetEvaluate: false);
+            }
+
+            MarkPendingChanges();
+        }
+
+        // ToBlockingCollection() returns null for an empty sequence. The entry list must never be
+        // null: every overlay refresh, sort and format pass enumerates it.
+        private static BlockingCollection<IOverlayEntry> CreateEntryCollection(IEnumerable<IOverlayEntry> entries)
+            => new BlockingCollection<IOverlayEntry>(
+                new ConcurrentQueue<IOverlayEntry>(entries ?? Enumerable.Empty<IOverlayEntry>()));
+
+        private void UpdateStates(bool resetEvaluate)
+        {
+            _identifierOverlayEntryDict.Clear();
+            if (resetEvaluate)
+                _sensorConfig.ResetEvaluate();
+
+            foreach (var entry in _overlayEntries)
+            {
+                entry.UpdateShowOnOverlay = UpdateSensorIsActive;
+                _sensorConfig.SelectForOverlay(entry.Identifier, entry.ShowOnOverlay);
+                _identifierOverlayEntryDict.TryAdd(entry.Identifier, entry);
+
+                if (ONLINE_METRIC_NAMES.Contains(entry.Identifier) || entry.Identifier == PRESENT_MODE_IDENTIFIER
+                    || entry.Identifier == "SystemTime"
+                    || entry.Identifier == "BatteryLifePercent" || entry.Identifier == "BatteryLifeRemaining"
+                    || entry.Identifier == "Ping" || entry.Identifier == "ThreadAffinityState" || entry.Identifier == "PCLatency")
+                {
+                    _overlayEntryCore.RealtimeMetricEntryDict[entry.Identifier] = entry;
+                }
+            }
+
+            CheckCustomSystemInfo();
+            CheckOSVersion();
+            CheckGpuDriver();
+            ManageFormats();
+        }
+
+        public async Task LoadOrSetDefault()
+        {
+            HasHardwareChanged = false;
+            BlockingCollection<IOverlayEntry> entries;
+            bool resetEvaluate;
+            try
+            {
+                entries = await GetInitializedOverlayEntries();
+                resetEvaluate = false;
+            }
+            catch
+            {
+                entries = await CreateDefaultOverlayEntries();
+                resetEvaluate = true;
+            }
+
+            lock (_overlayEntriesGate)
+            {
+                _overlayEntries = entries;
+                UpdateStates(resetEvaluate);
+            }
+
+            // Loading a profile establishes the working baseline. Hardware/sensor reconciliation
+            // is automatic and must not look like an unsaved user edit immediately after startup.
+            // Structural changes detected later (for example display hot-plug) explicitly mark the
+            // profile dirty in RefreshDisplayEntries.
+            _profileChangeTracker.ResetPendingChanges();
+        }
+
+        private void UpdateSensorIsActive(string identifier, bool isShownOnOverlay)
+        {
+            if (identifier == null) return;
+            _sensorConfig.SelectForOverlay(identifier, isShownOnOverlay);
+        }
+
+        private void ManageFormats()
+        {
+            // copy formats from sensor service
+            _overlayEntries.ForEach(entry =>
+                entry.ValueUnitFormat = GetSensorOverlayEntry(entry.Identifier)?.ValueUnitFormat);
+            _overlayEntries.ForEach(entry =>
+                entry.ValueAlignmentAndDigits = GetSensorOverlayEntry(entry.Identifier)?.ValueAlignmentAndDigits);
+
+            SetOnlineMetricFormats();
+            SetOnlineMetricsIsNumericState();
+            SetRTSSMetricFormats();
+            SetRTSSMetricIsNumericState();
+            SetHardwareIsNumericState();
+            SetAppInfoFormats();
+            SetAppInfoIsNumericState();
+            SetBatteryInfoFormats();
+            SetBatteryInfoIsNumericState();
+            SetNetworkPingIsNumericState();
+            SetPCLatencyIsNumericState();
+            SetPCLatencyFormats();
+
+            _overlayEntries.ForEach(entry => entry.FormatChanged = true);
+        }
+
+        private async Task<BlockingCollection<IOverlayEntry>> GetInitializedOverlayEntries()
+        {
+            await _sensorService.SensorServiceCompletionSource.Task;
+            await _overlayEntryCore.OverlayEntryCoreCompletionSource.Task;
+
+            string json = File.ReadAllText(GetConfigurationFileName(_appConfiguration.OverlayEntryConfigurationFile));
+            var overlayEntriesFromJson = JsonConvert.DeserializeObject<OverlayEntryPersistence>(json)
+                .OverlayEntries
+                .Where(entry => GetIsEntryKeptInList(entry))
+                .Cast<IOverlayEntry>()
+                .ToList();
+
+            // Build lookup of current sensor entries by Identifier
+            var sensorOverlayEntryClones = _overlayEntryCore.OverlayEntryDict.Values
+                .Select(entry => entry.Clone())
+                .ToList();
+            var sensorById = sensorOverlayEntryClones.ToDictionary(e => e.Identifier);
+            var matchedSensorIds = new HashSet<string>();
+
+            // Build fallback lookup by (Description, OverlayEntryType) for migrating
+            // configs from older versions where sensor indices may have shifted.
+            // Only include entries with unique (Description, Type) combinations to avoid
+            // ambiguous matches (e.g. identical GPUs in multi-GPU setups).
+            var sensorByDescriptionAndType = sensorOverlayEntryClones
+                .GroupBy(e => (e.Description, e.OverlayEntryType))
+                .Where(g => g.Count() == 1)
+                .ToDictionary(g => g.Key, g => g.Single());
+
+            // Build lookup by StableIdentifier for version-stable config migration.
+            // Only include unique StableIdentifiers to avoid ambiguous matches (multi-GPU).
+            var sensorByStableId = sensorOverlayEntryClones
+                .Where(e => !string.IsNullOrEmpty(e.StableIdentifier))
+                .GroupBy(e => e.StableIdentifier)
+                .Where(g => g.Count() == 1)
+                .ToDictionary(g => g.Key, g => g.Single());
+
+            var configOverlayEntries = new List<IOverlayEntry>();
+            bool hasChanges = false;
+
+            // Phase 1: Process loaded config entries in order, reconciling sensor entries
+            // by matching on both Identifier and Description for 100% certainty.
+            foreach (var configEntry in overlayEntriesFromJson)
+            {
+                bool isSensorType = configEntry.OverlayEntryType == EOverlayEntryType.GPU
+                    || configEntry.OverlayEntryType == EOverlayEntryType.CPU
+                    || configEntry.OverlayEntryType == EOverlayEntryType.RAM
+                    || configEntry.OverlayEntryType == EOverlayEntryType.HDD;
+
+                if (!isSensorType)
+                {
+                    // Non-sensor entries (CX, OnlineMetric, etc.): keep as-is from config
+                    if (configEntry.Identifier == PRESENT_RESOLUTION_IDENTIFIER
+                        && RefreshPresentResolutionMetadata(configEntry))
+                    {
+                        hasChanges = true;
+                    }
+                    configOverlayEntries.Add(configEntry);
+                    continue;
+                }
+
+                bool exactMatchHandled = false;
+
+                if (sensorById.TryGetValue(configEntry.Identifier, out var sensorEntry))
+                {
+                    // Sensor with matching ID exists in current hardware
+                    bool descriptionMatches = configEntry.Description == sensorEntry.Description;
+                    bool typeMatches = configEntry.OverlayEntryType == sensorEntry.OverlayEntryType;
+                    bool sortKeyMatches = configEntry.SortKey == sensorEntry.SortKey;
+
+                    if (descriptionMatches)
+                    {
+                        // Perfect match — same ID and description
+                        matchedSensorIds.Add(configEntry.Identifier);
+                        CopyUserConfig(configEntry, sensorEntry);
+                        configOverlayEntries.Add(sensorEntry);
+                        exactMatchHandled = true;
+                    }
+                    else if (typeMatches && sortKeyMatches)
+                    {
+                        // ID, type and sort key all match — high confidence it's the same sensor
+                        // with a renamed description. CopyUserConfig keeps the saved group
+                        // name only if it is still compatible with the new description;
+                        // otherwise the current sensor's group name is preserved.
+                        matchedSensorIds.Add(configEntry.Identifier);
+                        CopyUserConfig(configEntry, sensorEntry);
+                        configOverlayEntries.Add(sensorEntry);
+                        exactMatchHandled = true;
+
+                        _logger.LogDebug(
+                            "Sensor '{identifier}' description changed but ID/Type/SortKey match. Reusing sensor; group name resolved to '{groupName}'.",
+                            configEntry.Identifier, sensorEntry.GroupName);
+                    }
+                    else
+                    {
+                        // ID matches but description AND (type or sort key) differ —
+                        // sensor indices likely shifted. Don't claim this ID so fallback
+                        // paths (StableIdentifier / Description+Type) can find the correct sensor.
+                        _logger.LogDebug(
+                            "Sensor '{identifier}' ID match rejected (description: '{oldDescription}' -> '{newDescription}', type/sortKey mismatch). Trying fallback paths.",
+                            configEntry.Identifier, configEntry.Description, sensorEntry.Description);
+                    }
+                }
+
+                if (!exactMatchHandled)
+                {
+                    // Identifier not found or match quality too low.
+                    // Try migration in order: StableIdentifier → Description+Type → remove.
+                    bool matched = false;
+
+                    // 1. Try StableIdentifier match (highest confidence after exact ID)
+                    if (isSensorType
+                        && !string.IsNullOrEmpty(configEntry.StableIdentifier)
+                        && sensorByStableId.TryGetValue(configEntry.StableIdentifier, out var stableMatchSensor)
+                        && !matchedSensorIds.Contains(stableMatchSensor.Identifier))
+                    {
+                        matchedSensorIds.Add(stableMatchSensor.Identifier);
+                        CopyUserConfig(configEntry, stableMatchSensor);
+                        configOverlayEntries.Add(stableMatchSensor);
+                        hasChanges = true;
+                        matched = true;
+
+                        _logger.LogDebug(
+                            "Sensor '{oldIdentifier}' migrated to '{newIdentifier}' via StableIdentifier '{stableId}'.",
+                            configEntry.Identifier, stableMatchSensor.Identifier, configEntry.StableIdentifier);
+                    }
+
+                    // 2. Try Description + OverlayEntryType fallback (for old configs without StableIdentifier)
+                    if (!matched)
+                    {
+                        var fallbackKey = (configEntry.Description, configEntry.OverlayEntryType);
+
+                        if (isSensorType
+                            && sensorByDescriptionAndType.TryGetValue(fallbackKey, out var fallbackSensor)
+                            && !matchedSensorIds.Contains(fallbackSensor.Identifier))
+                        {
+                            matchedSensorIds.Add(fallbackSensor.Identifier);
+                            CopyUserConfig(configEntry, fallbackSensor);
+                            configOverlayEntries.Add(fallbackSensor);
+                            hasChanges = true;
+                            matched = true;
+
+                            _logger.LogDebug(
+                                "Sensor '{oldIdentifier}' migrated to '{newIdentifier}' via description match '{description}'.",
+                                configEntry.Identifier, fallbackSensor.Identifier, configEntry.Description);
+                        }
+                    }
+
+                    // 3. No match — sensor truly removed
+                    if (!matched)
+                    {
+                        hasChanges = true;
+                        _logger.LogDebug(
+                            "Sensor '{identifier}' ('{description}') no longer available. Removing from overlay config.",
+                            configEntry.Identifier, configEntry.Description);
+                    }
+                }
+            }
+
+            // Phase 2: Add new sensors that weren't in the loaded config. Per-core CPU rows are placed
+            // next to their siblings; everything else goes after the last entry of the same type.
+            // Per-core families the saved profile showed for every core ("all core clocks", "all
+            // core loads"): after a CPU swap the section has to stay complete, so the cores the new
+            // CPU adds are shown like their siblings instead of being parked hidden.
+            var completeCoreFamilies = GetCompletelyShownCoreFamilies(overlayEntriesFromJson);
+
+            foreach (var sensorEntry in sensorOverlayEntryClones)
+            {
+                if (matchedSensorIds.Contains(sensorEntry.Identifier))
+                    continue;
+
+                hasChanges = true;
+
+                if (sensorEntry.OverlayEntryType == EOverlayEntryType.CPU
+                    && CpuCoreRow.TryParse(sensorEntry.Description, out var coreRow))
+                {
+                    if (completeCoreFamilies.TryGetValue(coreRow.Family, out var sibling))
+                    {
+                        CopyFormatting(sibling, sensorEntry);
+                        sensorEntry.ShowOnOverlay = true;
+                    }
+                    else
+                    {
+                        sensorEntry.ShowOnOverlay = false;
+                    }
+
+                    // Next to its neighbours, not at the end of the section.
+                    configOverlayEntries.Insert(
+                        GetCoreEntryInsertIndex(configOverlayEntries, sensorEntry, coreRow), sensorEntry);
+
+                    _logger.LogDebug(
+                        "New core sensor '{identifier}' ('{description}') detected. Added to overlay config ({visibility}).",
+                        sensorEntry.Identifier, sensorEntry.Description,
+                        sensorEntry.ShowOnOverlay ? "shown like its siblings" : "hidden");
+                    continue;
+                }
+
+                // New sensor not present in saved config — add but don't show on overlay
+                sensorEntry.ShowOnOverlay = false;
+
+                int insertIndex = -1;
+                for (int i = configOverlayEntries.Count - 1; i >= 0; i--)
+                {
+                    if (configOverlayEntries[i].OverlayEntryType == sensorEntry.OverlayEntryType)
+                    {
+                        insertIndex = i + 1;
+                        break;
+                    }
+                }
+
+                if (insertIndex >= 0)
+                    configOverlayEntries.Insert(insertIndex, sensorEntry);
+                else
+                    configOverlayEntries.Add(sensorEntry);
+
+                _logger.LogDebug(
+                    "New sensor '{identifier}' ('{description}') detected. Added to overlay config (hidden).",
+                    sensorEntry.Identifier, sensorEntry.Description);
+            }
+
+            if (ReconcileDisplayResolutionEntries(configOverlayEntries, GetDetectedDisplays()))
+            {
+                hasChanges = true;
+            }
+
+            // check separators
+            var separatorDict = new Dictionary<string, int>();
+
+            foreach (var entry in configOverlayEntries)
+            {
+                if (!separatorDict.ContainsKey(entry.GroupName))
+                    separatorDict.Add(entry.GroupName, entry.GroupSeparators);
+                else
+                    separatorDict[entry.GroupName] = Math.Max(entry.GroupSeparators, separatorDict[entry.GroupName]);
+            }
+
+            foreach (var entry in configOverlayEntries)
+            {
+                entry.GroupSeparators = separatorDict[entry.GroupName];
+            }
+
+            // Manage default entries from Utils list
+            var utilsDefaults = OverlayUtils.GetOverlayEntryDefaults(_appConfiguration)
+                .Where(item => item.IsEntryEnabled || IsConditionallyAvailableEntry(item.Identifier))
+                .ToList();
+
+            foreach (var defaultEntry in utilsDefaults)
+            {
+                var existingConfigEntry = configOverlayEntries.FirstOrDefault(entry => entry.Identifier == defaultEntry.Identifier);
+                if (existingConfigEntry == null)
+                {
+                    int index = utilsDefaults.IndexOf(defaultEntry) - 1;
+
+                    if (index >= 0)
+                    {
+                        var predecessorEntry = utilsDefaults[index];
+                        var predecessorConfigOverlayEntry = configOverlayEntries.FirstOrDefault(entry => entry.Identifier == predecessorEntry.Identifier);
+                        int predecessorConfigOverlayEntryIndex = configOverlayEntries.IndexOf(predecessorConfigOverlayEntry);
+                        configOverlayEntries.Insert(predecessorConfigOverlayEntryIndex + 1, defaultEntry);
+                        hasChanges = true;
+                    }
+                }
+                else if (IsConditionallyAvailableEntry(defaultEntry.Identifier)
+                    && existingConfigEntry is OverlayEntryWrapper existingWrapper)
+                {
+                    // The description is a fixed label (not user-editable) but persists in the
+                    // config JSON — refresh it so renamed metrics don't keep stale wording.
+                    // GroupName stays untouched: users may have customized it.
+                    if (!string.Equals(existingWrapper.Description, defaultEntry.Description,
+                        StringComparison.Ordinal))
+                    {
+                        existingWrapper.Description = defaultEntry.Description;
+                        hasChanges = true;
+                    }
+                }
+            }
+
+            HasHardwareChanged = hasChanges;
+
+            return CreateEntryCollection(configOverlayEntries);
+        }
+
+        /// <summary>
+        /// Copies user-configured display settings from a saved config entry to a current sensor entry.
+        /// </summary>
+        private static void CopyUserConfig(IOverlayEntry source, IOverlayEntry target)
+        {
+            target.ShowOnOverlay = source.ShowOnOverlay;
+            CopyFormatting(source, target);
+
+            if (IsGroupNameCompatible(source.GroupName, target.Description))
+            {
+                target.GroupName = source.GroupName;
+            }
+        }
+
+        /// <summary>
+        /// Copies the presentation of one entry onto another: colors, font sizes, limits, graph and
+        /// separators. Visibility and group name are left alone.
+        /// </summary>
+        private static void CopyFormatting(IOverlayEntry source, IOverlayEntry target)
+        {
+            target.ShowGraph = source.ShowGraph;
+            target.ValueDisplayMode = source.ValueDisplayMode;
+            target.Color = source.Color;
+            target.ValueFontSize = source.ValueFontSize;
+            target.UpperLimitValue = source.UpperLimitValue;
+            target.LowerLimitValue = source.LowerLimitValue;
+            target.GroupColor = source.GroupColor;
+            target.GroupFontSize = source.GroupFontSize;
+            target.GroupSeparators = source.GroupSeparators;
+            target.UpperLimitColor = source.UpperLimitColor;
+            target.LowerLimitColor = source.LowerLimitColor;
+        }
+
+        /// <summary>
+        /// The per-core families ("(MHz)", "(%)", "Thread #1 (%)") a saved profile shows for every
+        /// core it knew, each with the entry a newly appearing core takes its formatting from. A
+        /// family with even one hidden core is a deliberate selection and is not returned.
+        /// </summary>
+        private static Dictionary<string, IOverlayEntry> GetCompletelyShownCoreFamilies(IEnumerable<IOverlayEntry> savedEntries)
+        {
+            var representatives = new Dictionary<string, IOverlayEntry>();
+            var incomplete = new HashSet<string>();
+
+            foreach (var entry in savedEntries)
+            {
+                if (entry.OverlayEntryType != EOverlayEntryType.CPU
+                    || !CpuCoreRow.TryParse(entry.Description, out var coreRow))
+                    continue;
+
+                if (entry.ShowOnOverlay)
+                    representatives[coreRow.Family] = entry;
+                else
+                    incomplete.Add(coreRow.Family);
+            }
+
+            foreach (var family in incomplete)
+                representatives.Remove(family);
+
+            return representatives;
+        }
+
+        /// <summary>
+        /// Where a per-core entry belongs in the list: behind the last row of the same family with a
+        /// lower core number, else in front of the first one with a higher number. A family without
+        /// any rows falls back to SortKey order within the CPU section (the order the templates
+        /// establish), and a profile without CPU entries appends.
+        /// </summary>
+        private static int GetCoreEntryInsertIndex(List<IOverlayEntry> entries, IOverlayEntry coreEntry, CpuCoreRow coreRow)
+        {
+            int afterLowerSibling = -1;
+            int beforeHigherSibling = -1;
+            int afterLowerSortKey = -1;
+            int firstCpuIndex = -1;
+
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (entry.OverlayEntryType != EOverlayEntryType.CPU)
+                    continue;
+
+                if (firstCpuIndex < 0)
+                    firstCpuIndex = i;
+
+                if (AlphanumericComparer.Instance.Compare(entry.SortKey, coreEntry.SortKey) <= 0)
+                    afterLowerSortKey = i + 1;
+
+                if (!CpuCoreRow.TryParse(entry.Description, out var sibling) || sibling.Family != coreRow.Family)
+                    continue;
+
+                if (sibling.Index < coreRow.Index)
+                    afterLowerSibling = i + 1;
+                else if (sibling.Index > coreRow.Index && beforeHigherSibling < 0)
+                    beforeHigherSibling = i;
+            }
+
+            if (afterLowerSibling >= 0)
+                return afterLowerSibling;
+            if (beforeHigherSibling >= 0)
+                return beforeHigherSibling;
+            if (afterLowerSortKey >= 0)
+                return afterLowerSortKey;
+
+            return firstCpuIndex >= 0 ? firstCpuIndex : entries.Count;
+        }
+
+        public void RefreshDisplayEntries(IReadOnlyList<DetectedDisplay> displays = null)
+        {
+            displays ??= GetDetectedDisplays();
+            IOverlayEntry[] changedEntries = null;
+
+            lock (_overlayEntriesGate)
+            {
+                if (_overlayEntries == null)
+                {
+                    return;
+                }
+
+                var entries = _overlayEntries.ToList();
+                var previousDisplayEntries = entries
+                    .Where(entry => IsDisplayResolutionIdentifier(entry.Identifier))
+                    .ToArray();
+
+                if (!ReconcileDisplayResolutionEntries(entries, displays))
+                {
+                    return;
+                }
+
+                _overlayEntries = CreateEntryCollection(entries);
+                SynchronizeDisplayEntryState(previousDisplayEntries, entries);
+                HasHardwareChanged = true;
+                MarkPendingChanges();
+                changedEntries = _overlayEntries.ToArray();
+            }
+
+            // Topology changes are rare. Publish only structural changes so the Overlay view can
+            // rebind its collection without doing that work on every value refresh.
+            _overlayEntriesChanged.OnNext(changedEntries);
+        }
+
+        private IReadOnlyList<DetectedDisplay> GetDetectedDisplays()
+        {
+            try
+            {
+                return _displayProvider() ?? Array.Empty<DetectedDisplay>();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to enumerate active displays for overlay items.");
+                return Array.Empty<DetectedDisplay>();
+            }
+        }
+
+        private void SynchronizeDisplayEntryState(IEnumerable<IOverlayEntry> previousDisplayEntries,
+            IEnumerable<IOverlayEntry> currentEntries)
+        {
+            var currentDisplayEntries = currentEntries
+                .Where(entry => IsDisplayResolutionIdentifier(entry.Identifier))
+                .ToArray();
+            var currentIdentifiers = new HashSet<string>(
+                currentDisplayEntries.Select(entry => entry.Identifier),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var previousEntry in previousDisplayEntries)
+            {
+                if (currentIdentifiers.Contains(previousEntry.Identifier))
+                {
+                    continue;
+                }
+
+                _identifierOverlayEntryDict.TryRemove(previousEntry.Identifier, out _);
+                _sensorConfig.SelectForOverlay(previousEntry.Identifier, false);
+            }
+
+            foreach (var entry in currentDisplayEntries)
+            {
+                entry.UpdateShowOnOverlay = UpdateSensorIsActive;
+                _sensorConfig.SelectForOverlay(entry.Identifier, entry.ShowOnOverlay);
+                _identifierOverlayEntryDict[entry.Identifier] = entry;
+                entry.FormatChanged = true;
+            }
+        }
+
+        internal static bool ReconcileDisplayResolutionEntries(List<IOverlayEntry> entries,
+            IReadOnlyList<DetectedDisplay> displays)
+        {
+            displays ??= Array.Empty<DetectedDisplay>();
+            var detectedByIdentifier = new Dictionary<string, DetectedDisplay>(
+                StringComparer.OrdinalIgnoreCase);
+            var detectedInOrder = new List<(string Identifier, DetectedDisplay Display)>();
+
+            foreach (var display in displays)
+            {
+                if (display == null || string.IsNullOrWhiteSpace(display.DeviceName)
+                    || display.Width <= 0 || display.Height <= 0)
+                {
+                    continue;
+                }
+
+                string identifier = GetDisplayResolutionIdentifier(display.DeviceName);
+                if (detectedByIdentifier.ContainsKey(identifier))
+                {
+                    continue;
+                }
+
+                detectedByIdentifier.Add(identifier, display);
+                detectedInOrder.Add((identifier, display));
+            }
+
+            bool structureChanged = false;
+            var matchedIdentifiers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int index = entries.Count - 1; index >= 0; index--)
+            {
+                var entry = entries[index];
+                if (!IsDisplayResolutionIdentifier(entry.Identifier))
+                {
+                    continue;
+                }
+
+                if (!detectedByIdentifier.TryGetValue(entry.Identifier, out var display)
+                    || !matchedIdentifiers.Add(entry.Identifier))
+                {
+                    entries.RemoveAt(index);
+                    structureChanged = true;
+                    continue;
+                }
+
+                UpdateDisplayResolutionEntry(entry, display);
+            }
+
+            int insertIndex = GetDisplayResolutionInsertIndex(entries);
+            foreach (var detected in detectedInOrder)
+            {
+                if (matchedIdentifiers.Contains(detected.Identifier))
+                {
+                    continue;
+                }
+
+                entries.Insert(insertIndex++, CreateDisplayResolutionEntry(detected.Display));
+                matchedIdentifiers.Add(detected.Identifier);
+                structureChanged = true;
+            }
+
+            return structureChanged;
+        }
+
+        private static int GetDisplayResolutionInsertIndex(IReadOnlyList<IOverlayEntry> entries)
+        {
+            for (int index = entries.Count - 1; index >= 0; index--)
+            {
+                if (IsDisplayResolutionIdentifier(entries[index].Identifier))
+                {
+                    return index + 1;
+                }
+            }
+
+            for (int index = 0; index < entries.Count; index++)
+            {
+                if (entries[index].Identifier == PRESENT_RESOLUTION_IDENTIFIER)
+                {
+                    return index + 1;
+                }
+            }
+
+            return entries.Count;
+        }
+
+        internal static IOverlayEntry CreateDisplayResolutionEntry(DetectedDisplay display)
+        {
+            string label = DisplayDetection.GetLabel(display.DeviceName);
+            return new OverlayEntryWrapper(GetDisplayResolutionIdentifier(display.DeviceName))
+            {
+                StableIdentifier = display.DeviceName,
+                OverlayEntryType = EOverlayEntryType.CX,
+                ShowOnOverlay = false,
+                ShowOnOverlayIsEnabled = true,
+                Description = $"{label} Resolution",
+                GroupName = $"{label} Resolution",
+                Value = FormatDisplayResolution(display),
+                ValueFormat = default,
+                ShowGraph = false,
+                ShowGraphIsEnabled = false,
+                Color = string.Empty,
+                IsEntryEnabled = true
+            };
+        }
+
+        private static void UpdateDisplayResolutionEntry(IOverlayEntry entry,
+            DetectedDisplay display)
+        {
+            if (!string.Equals(entry.StableIdentifier, display.DeviceName,
+                    StringComparison.Ordinal))
+            {
+                entry.StableIdentifier = display.DeviceName;
+            }
+
+            if (entry is OverlayEntryWrapper wrapper)
+            {
+                wrapper.Description = $"{DisplayDetection.GetLabel(display.DeviceName)} Resolution";
+            }
+
+            entry.Value = FormatDisplayResolution(display);
+            if (!entry.IsEntryEnabled)
+            {
+                entry.IsEntryEnabled = true;
+            }
+            if (!entry.ShowOnOverlayIsEnabled)
+            {
+                entry.ShowOnOverlayIsEnabled = true;
+            }
+            if (entry.ShowGraph)
+            {
+                entry.ShowGraph = false;
+            }
+            if (entry.ShowGraphIsEnabled)
+            {
+                entry.ShowGraphIsEnabled = false;
+            }
+        }
+
+        private static string FormatDisplayResolution(DetectedDisplay display)
+            => $"{display.Width}x{display.Height}";
+
+        internal static string GetDisplayResolutionIdentifier(string deviceName)
+            => DISPLAY_RESOLUTION_IDENTIFIER_PREFIX + (deviceName ?? string.Empty);
+
+        internal static bool IsDisplayResolutionIdentifier(string identifier)
+            => !string.IsNullOrEmpty(identifier)
+                && identifier.StartsWith(DISPLAY_RESOLUTION_IDENTIFIER_PREFIX,
+                    StringComparison.OrdinalIgnoreCase);
+
+        internal static bool RefreshPresentResolutionMetadata(IOverlayEntry entry)
+        {
+            if (entry == null || entry.Identifier != PRESENT_RESOLUTION_IDENTIFIER)
+            {
+                return false;
+            }
+
+            bool changed = false;
+            if (entry is OverlayEntryWrapper wrapper)
+            {
+                changed = !string.Equals(wrapper.Description, "Present Resolution",
+                    StringComparison.Ordinal);
+                wrapper.Description = "Present Resolution";
+            }
+
+            bool hasLegacyDefaultGroup = string.Equals(entry.GroupName, "Resolution",
+                    StringComparison.OrdinalIgnoreCase)
+                || string.Equals(entry.GroupName, "App Resolution",
+                    StringComparison.OrdinalIgnoreCase)
+                || string.Equals(entry.GroupName, "Application Resolution",
+                    StringComparison.OrdinalIgnoreCase);
+            if (hasLegacyDefaultGroup)
+            {
+                entry.GroupName = "Present Resolution";
+                changed = true;
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Decides whether a saved group name from an older config is still semantically
+        /// compatible with the current sensor's description. Guards against stale
+        /// "Thread #N" labels carried over from previous CX versions landing on sensors
+        /// that the current version no longer exposes as SMT threads (e.g. Intel hybrid
+        /// E-cores renamed from "Core #N Thread #1" to "Core #N E" between versions).
+        /// </summary>
+        private static bool IsGroupNameCompatible(string oldGroupName, string currentDescription)
+        {
+            if (string.IsNullOrEmpty(oldGroupName) || string.IsNullOrEmpty(currentDescription))
+                return true;
+
+            // A saved core label ("Core #7 P") on a sensor that now describes another core identity
+            // ("Core #7 E (MHz)"): the CPU was swapped for one whose core #7 has a different type.
+            // Carrying the label over would mislabel the core, so the sensor's own group name wins.
+            if (CpuCoreRow.TryParse(oldGroupName, out var savedCore)
+                && CpuCoreRow.TryParse(currentDescription, out var currentCore)
+                && savedCore.Label != currentCore.Label)
+            {
+                return false;
+            }
+
+            bool oldHasThreadMarker = oldGroupName.IndexOf("Thread #", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool currentHasThreadMarker = currentDescription.IndexOf("Thread #", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            return !(oldHasThreadMarker && !currentHasThreadMarker);
+        }
+
+        /// <summary>
+        /// Applies config-driven enabled state to a persisted entry and decides whether it
+        /// stays in the overlay entry list when a configuration is loaded from JSON.
+        /// </summary>
+        private bool GetIsEntryKeptInList(OverlayEntryWrapper entry)
+        {
+            if (RETIRED_ENTRY_IDENTIFIERS.Contains(entry.Identifier)
+                || RETIRED_ENTRY_IDENTIFIERS.Contains(entry.StableIdentifier))
+            {
+                return false;
+            }
+
+            // Display-resolution items are reconciled against the live Screen.AllScreens snapshot
+            // after loading. Keep them long enough to preserve user formatting for displays that
+            // are still connected, even if an older config persisted a disabled state.
+            if (IsDisplayResolutionIdentifier(entry.Identifier))
+            {
+                return true;
+            }
+
+            // Feature-toggle gated entries: sync all state flags from the config toggle, but
+            // always keep the entry so the live toggle subscription in the constructor can flip
+            // it in place later.
+            if (CONFIG_GATED_ENTRIES.TryGetValue(entry.Identifier, out var gatedEntry))
+            {
+                SetConfigGatedEntryState(entry, gatedEntry.GetIsEnabled(_appConfiguration));
+                return true;
+            }
+
+            // Renderer capability changes only affect whether these entries can currently be fed.
+            // They remain in the profile so a mode switch does not replace their working copies.
+            if (RENDERER_GATED_ENTRIES.TryGetValue(entry.Identifier, out var getIsEnabled))
+            {
+                SetRendererGatedEntryState(entry, getIsEnabled(_appConfiguration));
+                return true;
+            }
+
+            // Return true by default
+            return entry.IsEntryEnabled;
+        }
+
+        private void CheckOSVersion()
+        {
+            _identifierOverlayEntryDict.TryGetValue("OS", out IOverlayEntry entry);
+
+            if (entry != null)
+            {
+                entry.Value = _systemInfo.GetOSVersion();
+            }
+        }
+
+        private void CheckGpuDriver()
+        {
+            _identifierOverlayEntryDict.TryGetValue("GPUDriver", out IOverlayEntry entry);
+
+            if (entry != null)
+            {
+                entry.Value = _sensorService.GetGpuDriverVersion();
+            }
+        }
+
+        private void CheckCustomSystemInfo()
+        {
+            _identifierOverlayEntryDict.TryGetValue("CustomCPU", out IOverlayEntry customCPUEntry);
+
+            if (customCPUEntry != null)
+            {
+                customCPUEntry.Value =
+                    _appConfiguration.HardwareInfoSource == "Auto" ? _systemInfo.GetProcessorName()
+                    : _appConfiguration.CustomCpuDescription;
+            }
+
+            _identifierOverlayEntryDict.TryGetValue("CustomGPU", out IOverlayEntry customGPUEntry);
+
+            if (customGPUEntry != null)
+            {
+                customGPUEntry.Value =
+                    _appConfiguration.HardwareInfoSource == "Auto" ? _systemInfo.GetGraphicCardName()
+                    : _appConfiguration.CustomGpuDescription;
+            }
+
+            _identifierOverlayEntryDict.TryGetValue("Mainboard", out IOverlayEntry mainboardEntry);
+
+            if (mainboardEntry != null)
+            {
+                mainboardEntry.Value =
+                    _appConfiguration.HardwareInfoSource == "Auto" ? _systemInfo.GetMotherboardName()
+                    : _appConfiguration.CustomMainboardDescription;
+            }
+
+            _identifierOverlayEntryDict.TryGetValue("CustomRAM", out IOverlayEntry customRAMEntry); ;
+
+            if (customRAMEntry != null)
+            {
+                customRAMEntry.Value =
+                    _appConfiguration.HardwareInfoSource == "Auto" ? _systemInfo.GetSystemRAMInfoName()
+                    : _appConfiguration.CustomRamDescription;
+            }
+        }
+
+        private async Task<BlockingCollection<IOverlayEntry>> CreateDefaultOverlayEntries()
+        {
+            var defaultEntries = OverlayUtils.GetOverlayEntryDefaults(_appConfiguration)
+                .Where(item => item.IsEntryEnabled || IsConditionallyAvailableEntry(item.Identifier))
+                .Select(item => (item as IOverlayEntry).Clone())
+                .ToList();
+
+            ReconcileDisplayResolutionEntries(defaultEntries, GetDetectedDisplays());
+            var overlayEntries = CreateEntryCollection(defaultEntries);
+
+            //log hardware configs
+            _logger.LogInformation("Set overlay defaults");
+            _logger.LogInformation("CPU detected: {cpuName}.", _sensorService.GetCpuName());
+            _logger.LogInformation("CPU threads detected: {threadCount}.", Environment.ProcessorCount);
+            _logger.LogInformation("GPU detected: {gpuName}.", _sensorService.GetGpuName());
+
+            await _overlayEntryCore.OverlayEntryCoreCompletionSource.Task;
+
+            // Sensor data
+            _overlayEntryCore.OverlayEntryDict.Values.ForEach(sensor => overlayEntries.TryAdd(sensor.Clone()));
+            return await Task.FromResult(CreateEntryCollection(overlayEntries
+                .OrderBy(entry =>
+                {
+                    switch (entry.OverlayEntryType)
+                    {
+                        case EOverlayEntryType.CX:
+                            return 1;
+                        case EOverlayEntryType.GPU:
+                            return 2;
+                        case EOverlayEntryType.CPU:
+                            return 3;
+                        case EOverlayEntryType.RAM:
+                            return 4;
+                        case EOverlayEntryType.HDD:
+                            return 5;
+                        case EOverlayEntryType.OnlineMetric:
+                            return 6;
+                        case EOverlayEntryType.Undefined:
+                            return 7;
+                        default:
+                            return 8;
+                    }
+                }).ThenBy(entry => entry.SortKey, new SortKeyComparer())));
+        }
+
+        private void UpdateConfigGatedEntryState(string identifier, bool enabled)
+        {
+            if (!_identifierOverlayEntryDict.TryGetValue(identifier, out IOverlayEntry entry))
+                return;
+
+            SetConfigGatedEntryState(entry, enabled);
+        }
+
+        private static void SetConfigGatedEntryState(IOverlayEntry entry, bool enabled)
+        {
+            entry.IsEntryEnabled = enabled;
+            entry.ShowOnOverlayIsEnabled = enabled;
+            if (!enabled)
+                entry.ShowOnOverlay = false;
+        }
+
+        private static bool IsConditionallyAvailableEntry(string identifier)
+            => CONFIG_GATED_ENTRIES.ContainsKey(identifier)
+                || RENDERER_GATED_ENTRIES.ContainsKey(identifier);
+
+        private void UpdateRendererGatedEntryStates()
+        {
+            foreach (var gatedEntry in RENDERER_GATED_ENTRIES)
+            {
+                if (_identifierOverlayEntryDict.TryGetValue(gatedEntry.Key, out IOverlayEntry entry))
+                {
+                    SetRendererGatedEntryState(entry, gatedEntry.Value(_appConfiguration));
+                }
+            }
+        }
+
+        private static void SetRendererGatedEntryState(IOverlayEntry entry, bool enabled)
+        {
+            entry.IsEntryEnabled = enabled;
+            if (entry.ShowOnOverlayIsEnabled != enabled)
+            {
+                entry.ShowOnOverlayIsEnabled = enabled;
+            }
+
+            // ShowOnOverlay is the user's profile choice. IsEntryEnabled prevents unsupported
+            // renderers from consuming it while leaving that choice intact for the next switch.
+        }
+
+        private void UpdateSensorData()
+        {
+            // ProcessIdStream already maintains this atomic cache in the constructor. Waiting on
+            // Take(1) here coupled every overlay refresh to another observable and could leave a
+            // refresh pending when no PID value was available. Sensor values are likewise copied
+            // from OverlayEntryCore's latest completed snapshot below; no hardware I/O occurs.
+            // CapFrameX renderers and the remote API receive their PresentMon scalars together
+            // when OverlayService publishes the output snapshot. Only the RTSS renderer reads
+            // its shared memory; an unrelated RTSS instance must not supply CX's values.
+            var currentFramerate = !_appConfiguration.UsesRtss()
+                ? Tuple.Create(0.0, 0.0)
+                : _rTSSService.GetCurrentFramerate(_currentProcessId);
+
+            foreach (var entry in _overlayEntries)
+            {
+                switch (entry.OverlayEntryType)
+                {
+                    case EOverlayEntryType.GPU:
+                    case EOverlayEntryType.CPU:
+                    case EOverlayEntryType.RAM:
+                    case EOverlayEntryType.HDD:
+                        entry.Value = GetSensorOverlayEntry(entry.Identifier)?.Value;
+                        break;
+                    case EOverlayEntryType.CX when entry.Identifier == "Framerate":
+                        entry.Value = currentFramerate.Item1;
+                        break;
+                    case EOverlayEntryType.CX when entry.Identifier == "Frametime":
+                        entry.Value = currentFramerate.Item2;
+                        break;
+                    case EOverlayEntryType.CX when entry.Identifier == "SystemTime":
+                        entry.Value = ShowSystemTimeSeconds ? DateTime.Now.ToString("HH:mm:ss") : DateTime.Now.ToString("HH:mm");
+                        break;
+                    case EOverlayEntryType.CX when entry.Identifier == "BatteryLifePercent":
+                        {
+                            GetSystemPowerStatus(out var powerStatus);
+                            entry.Value = powerStatus.BatteryLifePercent == 255 ? double.NaN : (double)powerStatus.BatteryLifePercent;
+                        }
+                        break;
+                    case EOverlayEntryType.CX when entry.Identifier == "BatteryLifeRemaining":
+                        {
+                            GetSystemPowerStatus(out var powerStatus);
+                            entry.Value = powerStatus.BatteryLifeTime == -1 ? double.NaN : powerStatus.BatteryLifeTime / 60d;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        private IOverlayEntry GetSensorOverlayEntry(string identifier)
+        {
+            _overlayEntryCore.OverlayEntryDict.TryGetValue(identifier, out IOverlayEntry entry);
+            return entry;
+        }
+
+        private void UpdateOnlineMetrics()
+        {
+            // average
+            _identifierOverlayEntryDict.TryGetValue("OnlineAverage", out IOverlayEntry averageEntry);
+
+            if (averageEntry != null && averageEntry.ShowOnOverlay)
+            {
+                averageEntry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.Average), MidpointRounding.AwayFromZero);
+            }
+
+            // P1
+            _identifierOverlayEntryDict.TryGetValue("OnlineP1", out IOverlayEntry p1Entry);
+
+            if (p1Entry != null && p1Entry.ShowOnOverlay)
+            {
+                p1Entry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.P1), MidpointRounding.AwayFromZero);
+            }
+
+            // P0.1
+            _identifierOverlayEntryDict.TryGetValue("OnlineP0dot1", out IOverlayEntry p1dot1Entry);
+
+            if (p1dot1Entry != null && p1dot1Entry.ShowOnOverlay)
+            {
+                p1dot1Entry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.P0dot1), MidpointRounding.AwayFromZero);
+            }
+
+            // P0.2
+            _identifierOverlayEntryDict.TryGetValue("OnlineP0dot2", out IOverlayEntry p1dot2Entry);
+
+            if (p1dot2Entry != null && p1dot2Entry.ShowOnOverlay)
+            {
+                p1dot2Entry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.P0dot2), MidpointRounding.AwayFromZero);
+            }
+
+            // 1% Low
+            _identifierOverlayEntryDict.TryGetValue("Online1PercentLow", out IOverlayEntry onePercentLowEntry);
+
+            if (onePercentLowEntry != null && onePercentLowEntry.ShowOnOverlay)
+            {
+                onePercentLowEntry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.OnePercentLowAverage), MidpointRounding.AwayFromZero);
+            }
+
+            // 0.1% Low
+            _identifierOverlayEntryDict.TryGetValue("Online0dot1PercentLow", out IOverlayEntry zeroDotOnePercentLowEntry);
+
+            if (zeroDotOnePercentLowEntry != null && zeroDotOnePercentLowEntry.ShowOnOverlay)
+            {
+                zeroDotOnePercentLowEntry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.ZerodotOnePercentLowAverage), MidpointRounding.AwayFromZero);
+            }
+
+            // 0.2% Low
+            _identifierOverlayEntryDict.TryGetValue("Online0dot2PercentLow", out IOverlayEntry zeroDotTwoPercentLowEntry);
+
+            if (zeroDotTwoPercentLowEntry != null && zeroDotTwoPercentLowEntry.ShowOnOverlay)
+            {
+                zeroDotTwoPercentLowEntry.Value = Math.Round(_onlineMetricService.GetOnlineFpsMetricValue(EMetric.ZerodotTwoPercentLowAverage), MidpointRounding.AwayFromZero);
+            }
+
+            // GPU Active Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineGpuActiveTimeAverage", out IOverlayEntry gpuActiveTimeAverage);
+
+            if (gpuActiveTimeAverage != null && gpuActiveTimeAverage.ShowOnOverlay)
+            {
+                gpuActiveTimeAverage.Value = Math.Round(_onlineMetricService.GetOnlineGpuActiveTimeMetricValue(EMetric.GpuActiveAverage), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // CPU Active Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineCpuActiveTimeAverage", out IOverlayEntry cpuActiveTimeAverage);
+
+            if (cpuActiveTimeAverage != null && cpuActiveTimeAverage.ShowOnOverlay)
+            {
+                cpuActiveTimeAverage.Value = Math.Round(_onlineMetricService.GetOnlineCpuActiveTimeMetricValue(EMetric.CpuActiveAverage), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // Frame Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineFrameTimeAverage", out IOverlayEntry frameTimeAverage);
+
+            if (frameTimeAverage != null && frameTimeAverage.ShowOnOverlay)
+            {
+                frameTimeAverage.Value = Math.Round(_onlineMetricService.GetOnlineFrameTimeMetricValue(EMetric.Average), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // GPU Active Time Deviation
+            _identifierOverlayEntryDict.TryGetValue("OnlineGpuActiveTimePercentageDeviation", out IOverlayEntry gpuActiveTimeDeviation);
+
+            if (gpuActiveTimeDeviation != null && gpuActiveTimeDeviation.ShowOnOverlay)
+            {
+                gpuActiveTimeDeviation.Value = Math.Round(_onlineMetricService.GetOnlineGpuActiveTimeDeviationMetricValue(), MidpointRounding.AwayFromZero);
+            }
+
+            // stuttering percentage (time)
+            _identifierOverlayEntryDict.TryGetValue("OnlineStutteringPercentage", out IOverlayEntry stutteringPercentage);
+
+            if (stutteringPercentage != null && stutteringPercentage.ShowOnOverlay)
+            {
+                stutteringPercentage.Value = Math.Round(_onlineMetricService.GetOnlineStutteringPercentageValue(), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // PC Latency
+            _identifierOverlayEntryDict.TryGetValue("OnlinePcLatency", out IOverlayEntry pcLatency);
+
+            if (pcLatency != null && pcLatency.ShowOnOverlay)
+            {
+                pcLatency.Value = Math.Round(_onlineMetricService.GetOnlinePcLatencyAverageValue(), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // Present mode
+            _identifierOverlayEntryDict.TryGetValue(PRESENT_MODE_IDENTIFIER, out IOverlayEntry presentMode);
+
+            if (presentMode != null && presentMode.ShowOnOverlay)
+            {
+                presentMode.Value = PresentModeLabel.Shorten(_onlineMetricService.GetOnlinePresentMode()) ?? "N/A";
+            }
+
+            // Animation Error
+            _identifierOverlayEntryDict.TryGetValue("OnlineAnimationError", out IOverlayEntry animationError);
+
+            if (animationError != null && animationError.ShowOnOverlay)
+            {
+                animationError.Value = Math.Round(_onlineMetricService.GetOnlineAnimationErrorValue(), 1, MidpointRounding.AwayFromZero);
+            }
+
+            // PMD metrics
+            _identifierOverlayEntryDict.TryGetValue("PmdGpuPowerCurrent", out IOverlayEntry pmdGpuPowerCurrent);
+            _identifierOverlayEntryDict.TryGetValue("PmdCpuPowerCurrent", out IOverlayEntry pmdcpuPowerCurrent);
+            _identifierOverlayEntryDict.TryGetValue("PmdSystemPowerCurrent", out IOverlayEntry pmdSystemPowerCurrent);
+
+            if ((pmdGpuPowerCurrent != null && pmdGpuPowerCurrent.ShowOnOverlay)
+                || (pmdcpuPowerCurrent != null && pmdcpuPowerCurrent.ShowOnOverlay)
+                || (pmdSystemPowerCurrent != null && pmdSystemPowerCurrent.ShowOnOverlay))
+            {
+                OnlinePmdMetrics pmdMetrics = _onlineMetricService.GetPmdMetricsPowerCurrent();
+                if (pmdMetrics != null)
+                {
+                    if (pmdGpuPowerCurrent != null && pmdGpuPowerCurrent.ShowOnOverlay)
+                    {
+                        pmdGpuPowerCurrent.Value = Math.Round(pmdMetrics.GpuPowerCurrent, 1, MidpointRounding.AwayFromZero);
+                    }
+
+                    if (pmdcpuPowerCurrent != null && pmdcpuPowerCurrent.ShowOnOverlay)
+                    {
+                        pmdcpuPowerCurrent.Value = Math.Round(pmdMetrics.CpuPowerCurrent, 1, MidpointRounding.AwayFromZero);
+                    }
+
+                    if (pmdSystemPowerCurrent != null && pmdSystemPowerCurrent.ShowOnOverlay)
+                    {
+                        pmdSystemPowerCurrent.Value = Math.Round(pmdMetrics.SystemPowerCurrent, 1, MidpointRounding.AwayFromZero);
+                    }
+                }
+            }
+        }
+
+        private void UpdateAppInfo()
+        {
+            // CX CPU usage
+            _identifierOverlayEntryDict.TryGetValue("CxAppCpuUsage", out IOverlayEntry cxCpuUsage);
+
+            if (cxCpuUsage != null)
+            {
+                cxCpuUsage.Value = GetAppCpuUsage();
+            }
+        }
+
+        private double GetAppCpuUsage()
+        {
+            long now = Environment.TickCount64;
+            if (now - _lastCpuUsageTick >= 200)
+            {
+                _cachedCpuUsage = _systemInfo.GetCapFrameXAppCpuUsage();
+                _lastCpuUsageTick = now;
+            }
+            return _cachedCpuUsage;
+        }
+
+        private void UpdateResolution()
+        {
+            _identifierOverlayEntryDict.TryGetValue(PRESENT_RESOLUTION_IDENTIFIER, out IOverlayEntry resolution);
+
+            if (resolution != null && resolution.IsEntryEnabled && resolution.ShowOnOverlay)
+            {
+                // The in-game renderer replaces this placeholder with the hooked swapchain's
+                // backbuffer extent. Querying RTSS here would publish a stale/unrelated value,
+                // and so would it with the renderers switched off.
+                if (!_appConfiguration.UsesRtss())
+                {
+                    resolution.Value = "N/A";
+                    return;
+                }
+
+                // render resolution of the currently active 3D app, read from RTSS shared memory
+                // (same source as the capture file's ResolutionInfo); empty until RTSS measured it
+                var resolutionInfo = _rTSSService.GetResolution(_currentProcessId);
+                resolution.Value = string.IsNullOrEmpty(resolutionInfo) ? "N/A" : resolutionInfo;
+            }
+        }
+
+        private void UpdateHookOverlayStatus()
+        {
+            _identifierOverlayEntryDict.TryGetValue(HOOK_OVERLAY_STATUS_IDENTIFIER, out IOverlayEntry hookOverlayStatus);
+
+            if (hookOverlayStatus == null)
+                return;
+
+            // No status seen yet means the service has not published its initial state, which only
+            // happens before the composition root wired it up — not "the hook is off".
+            hookOverlayStatus.Value = _appConfiguration.EnableHookOverlay
+                ? HookOverlayStatusLabel.ForState(_hookOverlayStatus?.State ?? EHookOverlayStatus.Waiting)
+                : HookOverlayStatusLabel.ForState(EHookOverlayStatus.Disabled);
+        }
+
+        private void UpdateThreadAffinityState()
+        {
+            _identifierOverlayEntryDict.TryGetValue("ThreadAffinityState", out IOverlayEntry threadAffinityState);
+
+            if (threadAffinityState != null && threadAffinityState.ShowOnOverlay)
+            {
+                var threadAffinityStateText = _threadAffinityController.CpuAffinityState == AffinityState.ECores ? "E-Cores"
+                    : _threadAffinityController.CpuAffinityState == AffinityState.PCores ? "P-Cores"
+                    : _threadAffinityController.CpuAffinityState.ToString();
+
+                threadAffinityState.Value = threadAffinityStateText;
+            }
+        }
+
+        private void UpdateNetworkPing()
+        {
+            _identifierOverlayEntryDict.TryGetValue("Ping", out IOverlayEntry ping);
+
+            if (ping != null && ping.ShowOnOverlay)
+            {
+                ping.Value = Math.Round(_ping, 0, MidpointRounding.AwayFromZero);
+                SetPing();
+            }
+        }
+
+        private void SetOnlineMetricsIsNumericState()
+        {
+            foreach (var metricName in ONLINE_METRIC_NAMES)
+            {
+                _identifierOverlayEntryDict.TryGetValue(metricName, out IOverlayEntry metricEntry);
+
+                if (metricEntry != null)
+                {
+                    metricEntry.IsNumeric = true;
+                }
+            }
+        }
+
+        private void SetOnlineMetricFormats()
+        {
+            // average
+            _identifierOverlayEntryDict.TryGetValue("OnlineAverage", out IOverlayEntry averageEntry);
+
+            if (averageEntry != null)
+            {
+                averageEntry.ValueUnitFormat = "FPS";
+                averageEntry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // P1
+            _identifierOverlayEntryDict.TryGetValue("OnlineP1", out IOverlayEntry p1Entry);
+
+            if (p1Entry != null)
+            {
+                p1Entry.ValueUnitFormat = "FPS";
+                p1Entry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // P0.1
+            _identifierOverlayEntryDict.TryGetValue("OnlineP0dot1", out IOverlayEntry p1dot1Entry);
+
+            if (p1dot1Entry != null)
+            {
+                p1dot1Entry.ValueUnitFormat = "FPS";
+                p1dot1Entry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // P0.2
+            _identifierOverlayEntryDict.TryGetValue("OnlineP0dot2", out IOverlayEntry p1dot2Entry);
+
+            if (p1dot2Entry != null)
+            {
+                p1dot2Entry.ValueUnitFormat = "FPS";
+                p1dot2Entry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // 1% Low
+            _identifierOverlayEntryDict.TryGetValue("Online1PercentLow", out IOverlayEntry onePercentLowEntry);
+
+            if (onePercentLowEntry != null)
+            {
+                onePercentLowEntry.ValueUnitFormat = "FPS";
+                onePercentLowEntry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // 0.1% Low
+            _identifierOverlayEntryDict.TryGetValue("Online0dot1PercentLow", out IOverlayEntry zeroDotOnePercentLowEntry);
+
+            if (zeroDotOnePercentLowEntry != null)
+            {
+                zeroDotOnePercentLowEntry.ValueUnitFormat = "FPS";
+                zeroDotOnePercentLowEntry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // 0.2% Low
+            _identifierOverlayEntryDict.TryGetValue("Online0dot2PercentLow", out IOverlayEntry zeroDotTwoPercentLowEntry);
+
+            if (zeroDotTwoPercentLowEntry != null)
+            {
+                zeroDotTwoPercentLowEntry.ValueUnitFormat = "FPS";
+                zeroDotTwoPercentLowEntry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // GPU Active Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineGpuActiveTimeAverage", out IOverlayEntry gpuActiveTimeAverage);
+
+            if (gpuActiveTimeAverage != null)
+            {
+                gpuActiveTimeAverage.ValueUnitFormat = "ms";
+                gpuActiveTimeAverage.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // CPU Active Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineCpuActiveTimeAverage", out IOverlayEntry cpuActiveTimeAverage);
+
+            if (cpuActiveTimeAverage != null)
+            {
+                cpuActiveTimeAverage.ValueUnitFormat = "ms";
+                cpuActiveTimeAverage.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // Frame Time Average
+            _identifierOverlayEntryDict.TryGetValue("OnlineFrameTimeAverage", out IOverlayEntry frameTimeAverage);
+
+            if (frameTimeAverage != null)
+            {
+                frameTimeAverage.ValueUnitFormat = "ms";
+                frameTimeAverage.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // GPU Active Time Deviation
+            _identifierOverlayEntryDict.TryGetValue("OnlineGpuActiveTimePercentageDeviation", out IOverlayEntry gpuActiveTimeDeviation);
+
+            if (gpuActiveTimeDeviation != null)
+            {
+                gpuActiveTimeDeviation.ValueUnitFormat = "%";
+                gpuActiveTimeDeviation.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // stuttering percentage
+            _identifierOverlayEntryDict.TryGetValue("OnlineStutteringPercentage", out IOverlayEntry stutteringPercentage);
+
+            if (stutteringPercentage != null)
+            {
+                stutteringPercentage.ValueUnitFormat = "%";
+                stutteringPercentage.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // PC Latency
+            _identifierOverlayEntryDict.TryGetValue("OnlinePcLatency", out IOverlayEntry pcLatency);
+
+            if (pcLatency != null)
+            {
+                pcLatency.ValueUnitFormat = "ms";
+                pcLatency.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // Animation Error
+            _identifierOverlayEntryDict.TryGetValue("OnlineAnimationError", out IOverlayEntry animationError);
+
+            if (animationError != null)
+            {
+                animationError.ValueUnitFormat = "ms";
+                animationError.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // ping
+            _identifierOverlayEntryDict.TryGetValue("Ping", out IOverlayEntry ping);
+
+            if (ping != null)
+            {
+                ping.ValueUnitFormat = "ms";
+                ping.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // PMD
+            var pmdMetrics = new List<string>()
+            {
+                "PmdGpuPowerCurrent", "PmdCpuPowerCurrent", "PmdSystemPowerCurrent"
+            };
+
+            foreach (var pmdMetric in pmdMetrics)
+            {
+                _identifierOverlayEntryDict.TryGetValue(pmdMetric, out IOverlayEntry pmdMetricEntry);
+
+                if (pmdMetricEntry != null)
+                {
+                    pmdMetricEntry.ValueUnitFormat = "W";
+                    pmdMetricEntry.ValueAlignmentAndDigits = "{0,5:F1}";
+                }
+            }
+        }
+
+        private void SetRTSSMetricIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x =>
+                x.Identifier == "Framerate" || x.Identifier == "Frametime" || x.Identifier == "DisplayTime"))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetAppInfoFormats()
+        {
+            // CPU usage
+            _identifierOverlayEntryDict.TryGetValue("CxAppCpuUsage", out IOverlayEntry cxCpuUsage);
+
+            if (cxCpuUsage != null)
+            {
+                cxCpuUsage.ValueUnitFormat = "%";
+                cxCpuUsage.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+        }
+
+        private void SetAppInfoIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x => x.Identifier == "CxAppCpuUsage"))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetRTSSMetricFormats()
+        {
+            // framerate
+            _identifierOverlayEntryDict.TryGetValue("Framerate", out IOverlayEntry framerateEntry);
+
+            if (framerateEntry != null)
+            {
+                framerateEntry.ValueUnitFormat = "FPS";
+                framerateEntry.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // frametime
+            _identifierOverlayEntryDict.TryGetValue("Frametime", out IOverlayEntry frametimeEntry);
+
+            if (frametimeEntry != null)
+            {
+                frametimeEntry.ValueUnitFormat = "ms ";
+                frametimeEntry.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+
+            // display time (hook-free OSD only)
+            _identifierOverlayEntryDict.TryGetValue("DisplayTime", out IOverlayEntry displayTimeEntry);
+
+            if (displayTimeEntry != null)
+            {
+                displayTimeEntry.ValueUnitFormat = "ms ";
+                displayTimeEntry.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+        }
+
+        private void SetHardwareIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x =>
+               x.OverlayEntryType == EOverlayEntryType.GPU
+                || x.OverlayEntryType == EOverlayEntryType.CPU
+                || x.OverlayEntryType == EOverlayEntryType.RAM
+                || x.OverlayEntryType == EOverlayEntryType.HDD))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetBatteryInfoIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x =>
+                x.Identifier == "BatteryLifePercent" || x.Identifier == "BatteryLifeRemaining"))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetNetworkPingIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x =>
+               x.Identifier == "Ping"))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetPCLatencyIsNumericState()
+        {
+            foreach (var entry in _overlayEntries.Where(x =>
+               x.Identifier == "PCLatency"))
+            {
+                entry.IsNumeric = true;
+            }
+        }
+
+        private void SetPCLatencyFormats()
+        {
+            // PC latency
+            _identifierOverlayEntryDict.TryGetValue("PCLatency", out IOverlayEntry pcLatency);
+
+            if (pcLatency != null)
+            {
+                pcLatency.ValueUnitFormat = "ms";
+                pcLatency.ValueAlignmentAndDigits = "{0,5:F1}";
+            }
+        }
+
+        private void SetBatteryInfoFormats()
+        {
+            // BatteryLifePercent
+            _identifierOverlayEntryDict.TryGetValue("BatteryLifePercent", out IOverlayEntry batteryLifePercent);
+
+            if (batteryLifePercent != null)
+            {
+                batteryLifePercent.ValueUnitFormat = "%";
+                batteryLifePercent.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+
+            // BatteryLifeRemaining
+            _identifierOverlayEntryDict.TryGetValue("BatteryLifeRemaining", out IOverlayEntry batteryLifeRemaining);
+
+            if (batteryLifeRemaining != null)
+            {
+                batteryLifeRemaining.ValueUnitFormat = "min ";
+                batteryLifeRemaining.ValueAlignmentAndDigits = "{0,5:F0}";
+            }
+        }
+
+        private void UpdateFormatting()
+        {
+            bool updateVariables = false;
+
+            foreach (var entry in _overlayEntries)
+            {
+                if (entry.FormatChanged)
+                {
+                    updateVariables = true;
+
+                    // group name format
+                    var basicGroupFormat = entry.GroupSeparators == 0 ? "{0}"
+                        : Enumerable.Repeat("\n", entry.GroupSeparators).Aggregate((i, j) => i + j) + "{0}";
+                    var groupNameFormatStringBuilder = new StringBuilder();
+                    // groupNameFormatStringBuilder.Append("<S=");
+                    AppendSizeFormat(groupNameFormatStringBuilder, entry.GroupFontSize);
+                    // groupNameFormatStringBuilder.Append(entry.GroupFontSize.ToString());
+                    AppendColorFormat(groupNameFormatStringBuilder, entry.GroupColor);
+                    groupNameFormatStringBuilder.Append(basicGroupFormat);
+                    groupNameFormatStringBuilder.Append(" <C><S>");
+                    entry.GroupNameFormat = groupNameFormatStringBuilder.ToString();
+
+                    if (entry.ValueUnitFormat != null && entry.ValueAlignmentAndDigits != null)
+                    {
+                        var valueFormatStringBuilder = new StringBuilder();
+                        // valueFormatStringBuilder.Append("<S=");
+                        AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize);
+                        // valueFormatStringBuilder.Append(entry.ValueFontSize.ToString());
+                        AppendColorFormat(valueFormatStringBuilder, entry.Color);
+                        valueFormatStringBuilder.Append(entry.ValueAlignmentAndDigits);
+                        valueFormatStringBuilder.Append("<C><S>");
+                        // valueFormatStringBuilder.Append("<S=");
+                        AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize / 2);
+                        // valueFormatStringBuilder.Append((entry.ValueFontSize / 2).ToString());
+                        AppendColorFormat(valueFormatStringBuilder, entry.Color);
+                        valueFormatStringBuilder.Append(entry.ValueUnitFormat);
+                        valueFormatStringBuilder.Append("<C><S>");
+                        entry.ValueFormat = valueFormatStringBuilder.ToString();
+                    }
+                    else
+                    {
+                        var valueFormatStringBuilder = new StringBuilder();
+                        //valueFormatStringBuilder.Append("<S=");
+                        AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize);
+                        // valueFormatStringBuilder.Append(entry.ValueFontSize.ToString());
+                        AppendColorFormat(valueFormatStringBuilder, entry.Color);
+                        valueFormatStringBuilder.Append("{0}<C><S>");
+                        entry.ValueFormat = valueFormatStringBuilder.ToString();
+                    }
+
+                    // reset format changed  and last limit state 
+                    entry.FormatChanged = false;
+                    entry.LastLimitState = LimitState.Undefined;
+                }
+
+                // check value limits
+                if (entry.ShowOnOverlay)
+                {
+                    if (!(entry.LowerLimitValue == string.Empty && entry.UpperLimitValue == string.Empty))
+                    {
+                        var currentColor = string.Empty;
+                        bool upperLimit = false;
+                        bool lowerLimit = false;
+                        LimitState limitState = LimitState.Undefined;
+
+                        if (entry.Value == null)
+                            continue;
+
+                        if (entry.UpperLimitValue != string.Empty)
+                        {
+                            if (!double.TryParse(entry.Value.ToString(), out double currentConvertedValue))
+                                continue;
+
+                            if (!double.TryParse(entry.UpperLimitValue, NumberStyles.Float, CultureInfo.InvariantCulture, out double convertedUpperValue))
+                                continue;
+
+                            if (currentConvertedValue >= convertedUpperValue)
+                            {
+                                currentColor = entry.UpperLimitColor;
+                                upperLimit = true;
+                                limitState = LimitState.Upper;
+                            }
+                        }
+
+                        if (entry.LowerLimitValue != string.Empty)
+                        {
+                            if (!upperLimit)
+                            {
+                                if (!double.TryParse(entry.Value.ToString(), out double currentConvertedValue))
+                                    continue;
+
+                                if (!double.TryParse(entry.LowerLimitValue, NumberStyles.Float, CultureInfo.InvariantCulture, out double convertedLowerValue))
+                                    continue;
+
+                                if (currentConvertedValue <= convertedLowerValue)
+                                {
+                                    currentColor = entry.LowerLimitColor;
+                                    lowerLimit = true;
+                                    limitState = LimitState.Lower;
+                                }
+                            }
+                        }
+
+                        if (!upperLimit && !lowerLimit)
+                        {
+                            currentColor = entry.Color;
+                            limitState = LimitState.None;
+                        }
+
+                        if (limitState != entry.LastLimitState)
+                        {
+                            if (entry.ValueUnitFormat != null && entry.ValueAlignmentAndDigits != null)
+                            {
+                                updateVariables = true;
+
+                                var valueFormatStringBuilder = new StringBuilder();
+                                // valueFormatStringBuilder.Append("<S=");
+                                AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize);
+                                // valueFormatStringBuilder.Append(entry.ValueFontSize.ToString());
+                                AppendColorFormat(valueFormatStringBuilder, currentColor);
+                                valueFormatStringBuilder.Append(entry.ValueAlignmentAndDigits);
+                                valueFormatStringBuilder.Append("<C><S>");
+                                //valueFormatStringBuilder.Append("<S=");
+                                AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize / 2);
+                                // valueFormatStringBuilder.Append((entry.ValueFontSize / 2).ToString());
+                                AppendColorFormat(valueFormatStringBuilder, currentColor);
+                                valueFormatStringBuilder.Append(entry.ValueUnitFormat);
+                                valueFormatStringBuilder.Append("<C><S>");
+                                entry.ValueFormat = valueFormatStringBuilder.ToString();
+                            }
+                            else
+                            {
+                                updateVariables = true;
+
+                                var valueFormatStringBuilder = new StringBuilder();
+                                //valueFormatStringBuilder.Append("<S=");
+                                AppendSizeFormat(valueFormatStringBuilder, entry.ValueFontSize);
+                                // valueFormatStringBuilder.Append(entry.ValueFontSize.ToString());
+                                AppendColorFormat(valueFormatStringBuilder, currentColor);
+                                valueFormatStringBuilder.Append("{0}<C><S>");
+                                entry.ValueFormat = valueFormatStringBuilder.ToString();
+                            }
+
+                            entry.LastLimitState = limitState;
+                        }
+                    }
+                }
+            }
+
+            if (updateVariables)
+            {
+                var variablesStringBuilder = new StringBuilder();
+                _colorIndexDictionary.ForEach(pair => variablesStringBuilder.Append($"<C{pair.Value}={pair.Key}>"));
+                _sizeIndexDictionary.ForEach(pair => variablesStringBuilder.Append($"<S{pair.Value}={pair.Key}>"));
+                _rTSSService.SetFormatVariables(variablesStringBuilder.ToString());
+            }
+        }
+
+        private void AppendColorFormat(StringBuilder formatStringBuilder, string groupColor)
+        {
+            if (_colorIndexDictionary.TryGetValue(groupColor, out var value))
+            {
+                formatStringBuilder.Append($"><C{value}>");
+            }
+            else
+            {
+                int index = _colorIndexDictionary.Count() + 1;
+                _colorIndexDictionary.TryAdd(groupColor, index);
+
+                formatStringBuilder.Append($"><C{index}>");
+            }
+        }
+
+        private void AppendSizeFormat(StringBuilder formatStringBuilder, int size)
+        {
+            if (_sizeIndexDictionary.TryGetValue(size, out var value))
+            {
+                formatStringBuilder.Append($"<S{value}");
+            }
+            else
+            {
+                int index = _sizeIndexDictionary.Count() + 1;
+                _sizeIndexDictionary.TryAdd(size, index);
+
+                formatStringBuilder.Append($"<S{index}");
+            }
+        }
+
+        private string GetConfigurationFileName(int targetConfig)
+        {
+            return Path.Combine(_overlayConfigFolder, $"OverlayEntryConfiguration_" +
+                    $"{targetConfig}.json");
+        }
+
+        private void SetConfigurationFileName(int index)
+        {
+            _appConfiguration.OverlayEntryConfigurationFile = index;
+        }
+
+        private void SubscribeToOptionPopupClosed()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.OptionPopupClosed>>()
+                .Subscribe(_ =>
+                {
+                    CheckCustomSystemInfo();
+                });
+        }
+
+        private async void SetPing()
+        {
+            // Classic refresh and the designer share this single bounded request; neither can
+            // start a second ping while one is pending or sample faster than once per second.
+            long now = Environment.TickCount64;
+            if (string.IsNullOrWhiteSpace(_appConfiguration.PingURL)
+                || now - Interlocked.Read(ref _lastPingTick) < 1000
+                || Interlocked.CompareExchange(ref _pingInFlight, 1, 0) != 0) return;
+            Interlocked.Exchange(ref _lastPingTick, now);
+            using Ping pingSender = new Ping();
+            try
+            {
+                PingReply reply = await pingSender.SendPingAsync(_appConfiguration.PingURL, 1000).ConfigureAwait(false);
+                _ping = reply.Status == IPStatus.Success ? reply.RoundtripTime : double.NaN;
+            }
+            catch
+            {
+                _ping = double.NaN;
+            }
+            finally { Interlocked.Exchange(ref _pingInFlight, 0); }
+        }
+
+        public void UpdateOverlayEntryFormats()
+        {
+            _overlayEntries.ForEach(entry => entry.FormatChanged = true);
+        }
+    }
+}

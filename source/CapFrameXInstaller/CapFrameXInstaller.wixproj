@@ -1,0 +1,33 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <!-- WiX v6 is an MSBuild SDK restored from NuGet; nothing has to be installed on the build
+       machine. The file list comes from the <Files> element in Product.wxs, which replaces the
+       heat.exe pre-build step and filter.xslt of the WiX v3 project. -->
+  <PropertyGroup>
+    <OutputName>CapFrameXInstaller</OutputName>
+    <OutputType>Package</OutputType>
+    <ProjectGuid>{77416b78-a34f-4cfc-9562-a2599d054c8f}</ProjectGuid>
+    <Platforms>x64</Platforms>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <!-- Pinned because Product.wxs references the x64 flavours of the util extension's custom
+         actions (Wix4CloseApplications_X64, Wix4UtilCA_X64). -->
+    <InstallerPlatform>x64</InstallerPlatform>
+    <RepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))</RepoRoot>
+    <OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>obj\$(Platform)\$(Configuration)\</IntermediateOutputPath>
+    <!-- ICE61 is expected: downgrades are intentionally supported, see MajorUpgrade in Product.wxs. -->
+    <SuppressIces>ICE57;ICE61</SuppressIces>
+  </PropertyGroup>
+  <Import Project="$(RepoRoot)\version\Version.props" />
+  <PropertyGroup>
+    <DefineConstants Condition=" '$(Configuration)' == 'Debug' ">$(DefineConstants);Debug</DefineConstants>
+    <DefineConstants>$(DefineConstants);CapFrameXInstaller.BinaryDir=$(RepoRoot)\source\CapFrameX\bin\x64\$(Configuration)\net10.0-windows</DefineConstants>
+    <DefineConstants>$(DefineConstants);CapFrameXVersion=$(CapFrameXVersion);CapFrameXInstallerVersion=$(CapFrameXInstallerVersion)</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.CustomInstallerActions\CapFrameX.CustomInstallerActions.csproj" />
+    <ProjectReference Include="..\CapFrameX\CapFrameX.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,2206 @@
+﻿using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Data;
+using CapFrameX.Data.Session.Contracts;
+using CapFrameX.EventAggregation.Messages;
+using CapFrameX.Extensions;
+using CapFrameX.Extensions.NetStandard;
+using CapFrameX.MVVM.Dialogs;
+using CapFrameX.Sensor.Reporting;
+using CapFrameX.Sensor.Reporting.Contracts;
+using CapFrameX.Statistics.NetStandard;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using CapFrameX.Statistics.PlotBuilder.Contracts;
+using CapFrameX.ViewModel.DataContext;
+using LiveCharts;
+using LiveCharts.Defaults;
+using LiveCharts.Wpf;
+using Microsoft.Extensions.Logging;
+using Prism.Commands;
+using Prism.Events;
+using Prism.Mvvm;
+using Prism.Navigation.Regions;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Linq;
+using System.Reactive;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+
+namespace CapFrameX.ViewModel
+{
+    public partial class DataViewModel : BindableBase, INavigationAware
+    {
+        private readonly IStatisticProvider _frametimeStatisticProvider;
+        private readonly IFrametimeAnalyzer _frametimeAnalyzer;
+        private readonly IEventAggregator _eventAggregator;
+        private readonly IAppConfiguration _appConfiguration;
+        private readonly RecordManager _recordManager;
+        private readonly RecordWriteQueue _recordWriteQueue;
+        private readonly IRecordDataServer _localRecordDataServer;
+        private static ILogger<DataViewModel> _logger;
+
+        private bool _useUpdateSession;
+        private ISession _session;
+        private bool _isCuttingRecord;
+        private ISession _previousSession;
+        private SeriesCollection _statisticCollection;
+        private SeriesCollection _lShapeCollection;
+        private SeriesCollection _stutteringStatisticCollection;
+        private SeriesCollection _variancetatisticCollection;
+        private string[] _parameterLabels;
+        private string[] _lShapeLabels;
+        private string[] _advancedParameterLabels;
+        private bool _removeOutliers;
+        private List<ISystemInfoEntry> _systemInfos;
+        private bool _isRangeSliderActive;
+        private bool _doUpdateCharts = true;
+        private Func<double, string> _parameterFormatter;
+        private TabItem _selectedChartItem;
+        private string _currentGameName;
+        private double _maxRecordingTime;
+        private string _remainingRecordingTime;
+        private double _firstSeconds;
+        private double _lastSeconds;
+        private EChartYAxisSetting _selecetedChartYAxisSetting = EChartYAxisSetting.FullFit;
+        private UserControl _messageDialogContent;
+        private bool _messageDialogContentIsOpen;
+        private string _messageText;
+        private int _barMaxValue = 100;
+        private bool _aggregationSeparators;
+        private bool _showStutteringThresholds;
+        private string _avgPcLatency;
+        private bool _isPcLatencyAvailable;
+        private bool _isAnimationErrorAvailable;
+        private bool _isCpuLoadAvailable;
+        private bool _isCpuMaxLoadAvailable;
+        private bool _isGpuLoadAvailable;
+        private bool _isGpuPowerLimitAvailable;
+        private bool _isGpuActiveChartAvailable;
+        private bool _isCpuActiveChartAvailable;
+        private bool _useFrametimeStatisticParameters;
+        private EFilterMode _selectedFilterMode = EFilterMode.None;
+        private ELShapeMetrics _lShapeMetric = ELShapeMetrics.Frametimes;
+        private string _lShapeYaxisLabel = CxLang.T("DataViewModel_FrametimesMs") + Environment.NewLine + " ";
+        private bool _isDistributionChartDirty = true;
+        private bool _isFpsChartDirty = true;
+        private bool _isFrametimeChartDirty = true;
+
+        private ISubject<Unit> _onUpdateChart = new BehaviorSubject<Unit>(default);
+
+        public IFileRecordInfo RecordInfo { get; private set; }
+
+        public FrametimeGraphDataContext FrametimeGraphDataContext { get; }
+
+        public FpsGraphDataContext FpsGraphDataContext { get; }
+
+        public FrametimeDistributionGraphDataContext FrametimeDistributionGraphDataContext { get; }
+
+        public IAppConfiguration AppConfiguration => _appConfiguration;
+
+        public Array ChartYAxisSettings => Enum.GetValues(typeof(EChartYAxisSetting));
+
+        public Array FilterModes => Enum.GetValues(typeof(EFilterMode))
+            .Cast<EFilterMode>()
+            .ToArray();
+
+        public Array LShapeMetrics => Enum.GetValues(typeof(ELShapeMetrics))
+            .Cast<ELShapeMetrics>()
+            .ToArray();
+
+        public ObservableCollection<ISensorReportItem> SensorReportItems { get; }
+            = new ObservableCollection<ISensorReportItem>();
+
+        /// <summary>
+        /// https://docs.microsoft.com/en-us/dotnet/standard/base-types/standard-numeric-format-strings
+        /// </summary>
+        public Func<double, string> ParameterFormatter
+        {
+            get { return _parameterFormatter; }
+            set
+            {
+                _parameterFormatter = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        /// <summary>
+        /// https://docs.microsoft.com/en-us/dotnet/standard/base-types/standard-numeric-format-strings
+        /// </summary>
+        public Func<ChartPoint, string> PieChartPointLabel { get; } =
+            chartPoint => string.Format(CultureInfo.InvariantCulture, "{0:0.##} ({1:P})", chartPoint.Y, chartPoint.Participation);
+
+        public ISubject<Unit> ResetLShapeChart = new Subject<Unit>();
+
+        public string[] ParameterLabels
+        {
+            get { return _parameterLabels; }
+            set
+            {
+                _parameterLabels = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string[] LShapeLabels
+        {
+            get { return _lShapeLabels; }
+            set
+            {
+                _lShapeLabels = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string[] AdvancedParameterLabels
+        {
+            get { return _advancedParameterLabels; }
+            set
+            {
+                _advancedParameterLabels = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public SeriesCollection StatisticCollection
+        {
+            get { return _statisticCollection; }
+            set
+            {
+                _statisticCollection = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public SeriesCollection LShapeCollection
+        {
+            get { return _lShapeCollection; }
+            set
+            {
+                _lShapeCollection = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public SeriesCollection StutteringStatisticCollection
+        {
+            get { return _stutteringStatisticCollection; }
+            set
+            {
+                _stutteringStatisticCollection = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public SeriesCollection VarianceStatisticCollection
+        {
+            get { return _variancetatisticCollection; }
+            set
+            {
+                _variancetatisticCollection = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool RemoveOutliers
+        {
+            get { return _removeOutliers; }
+            set
+            {
+                _removeOutliers = value;
+                RaisePropertyChanged();
+                OnRemoveOutliersChanged();
+            }
+        }
+
+        public TabItem SelectedChartItem
+        {
+            get { return _selectedChartItem; }
+            set
+            {
+                _selectedChartItem = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(SelectedChart));
+                OnChartItemChanged();
+            }
+        }
+        public EChartTab SelectedChart => SelectedChartItem?.Tag is EChartTab chart ? chart : EChartTab.None;
+
+        public List<ISystemInfoEntry> SystemInfos
+        {
+            get { return _systemInfos; }
+            set { _systemInfos = value; RaisePropertyChanged(); }
+        }
+
+        public bool IsRangeSliderActive
+        {
+            get { return _isRangeSliderActive; }
+            set
+            {
+                _isRangeSliderActive = value;
+                RaisePropertyChanged();
+
+                if (!value)
+                    OnSliderRangeChanged();
+            }
+        }
+
+        public string CurrentGameName
+        {
+            get { return _currentGameName; }
+            set
+            {
+                _currentGameName = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string RemainingRecordingTime
+        {
+            get { return _remainingRecordingTime; }
+            set
+            {
+                _remainingRecordingTime = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public double MaxRecordingTime
+        {
+            get { return _maxRecordingTime; }
+            set
+            {
+                _maxRecordingTime = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(MinRangeSliderRange));
+            }
+        }
+
+        public double MinRangeSliderRange
+        {
+            get { return MaxRecordingTime * 0.01; }
+        }
+
+        public double FirstSeconds
+        {
+            get { return _firstSeconds; }
+            set
+            {
+                _firstSeconds = value;
+                OnRangeSliderValueChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public double LastSeconds
+        {
+            get { return _lastSeconds; }
+            set
+            {
+                _lastSeconds = value;
+                OnRangeSliderValueChanged();
+                RaisePropertyChanged();
+            }
+        }
+
+        public double StutteringFactor
+        {
+            get { return _appConfiguration.StutteringFactor; }
+            set
+            {
+                _appConfiguration.StutteringFactor = value;
+                RaisePropertyChanged();
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public double StutteringLowFPSThreshold
+        {
+            get { return _appConfiguration.StutteringThreshold; }
+            set
+            {
+                _appConfiguration.StutteringThreshold = value;
+                RaisePropertyChanged();
+                _onUpdateChart.OnNext(default);
+            }
+        }
+        public EChartYAxisSetting SelecetedChartYAxisSetting
+        {
+            get { return _selecetedChartYAxisSetting; }
+            set
+            {
+                _selecetedChartYAxisSetting = value;
+                RaisePropertyChanged();
+                SetFrametimeChartYAxisSetting(GetYAxisSettingFromSelection(value));
+            }
+        }
+
+        public ELShapeMetrics SelectedLShapeMetric
+        {
+            get { return _lShapeMetric; }
+            set
+            {
+                _lShapeMetric = value;
+                LShapeYaxisLabel = value == ELShapeMetrics.Frametimes ? CxLang.T("DataViewModel_FrametimesMs") + Environment.NewLine + " " : "FPS" + Environment.NewLine + " ";
+                RaisePropertyChanged();
+                UpdateSecondaryCharts();
+            }
+        }
+
+        public string LShapeYaxisLabel
+        {
+            get { return _lShapeYaxisLabel; }
+            set
+            {
+                _lShapeYaxisLabel = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool NeverShowDialog
+        {
+            get { return !_appConfiguration.ShowOutlierWarning; }
+            set
+            {
+                _appConfiguration.ShowOutlierWarning = !value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public UserControl MessageDialogContent
+        {
+            get { return _messageDialogContent; }
+            set
+            {
+                _messageDialogContent = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool MessageDialogContentIsOpen
+        {
+            get { return _messageDialogContentIsOpen; }
+            set
+            {
+                _messageDialogContentIsOpen = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string MessageText
+        {
+            get { return _messageText; }
+            set
+            {
+                _messageText = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int BarMaxValue
+        {
+            get { return _barMaxValue; }
+            set
+            {
+                _barMaxValue = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(BarChartSeparators));
+            }
+        }
+
+        public string AvgPcLatency
+        {
+            get { return _avgPcLatency; }
+            set
+            {
+                _avgPcLatency = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool IsPcLatencyAvailable
+        {
+            get { return _isPcLatencyAvailable; }
+            set
+            {
+                _isPcLatencyAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowPcLatency));
+            }
+        }
+
+        public bool IsAnimationErrorAvailable
+        {
+            get { return _isAnimationErrorAvailable; }
+            set
+            {
+                _isAnimationErrorAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowAnimationError));
+            }
+        }
+
+        public bool IsCpuLoadAvailable
+        {
+            get { return _isCpuLoadAvailable; }
+            set
+            {
+                _isCpuLoadAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowCpuLoad));
+            }
+        }
+
+        public bool IsCpuMaxLoadAvailable
+        {
+            get { return _isCpuMaxLoadAvailable; }
+            set
+            {
+                _isCpuMaxLoadAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowCpuMaxThreadLoad));
+            }
+        }
+
+        public bool IsGpuLoadAvailable
+        {
+            get { return _isGpuLoadAvailable; }
+            set
+            {
+                _isGpuLoadAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowGpuLoad));
+            }
+        }
+
+        public bool IsGpuPowerLimitAvailable
+        {
+            get { return _isGpuPowerLimitAvailable; }
+            set
+            {
+                _isGpuPowerLimitAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowGpuPowerLimit));
+            }
+        }
+
+        public bool IsGpuActiveChartAvailable
+        {
+            get { return _isGpuActiveChartAvailable; }
+            set
+            {
+                _isGpuActiveChartAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowGpuActiveChart));
+            }
+        }
+
+        public bool IsCpuActiveChartAvailable
+        {
+            get { return _isCpuActiveChartAvailable; }
+            set
+            {
+                _isCpuActiveChartAvailable = value;
+                RaisePropertyChanged();
+                RaisePropertyChanged(nameof(ShowCpuActiveChart));
+            }
+        }
+
+        public int BarChartSeparators
+        {
+            get
+            {
+                int steps;
+                double maxValueFracture = _barMaxValue / 3;
+
+                if (maxValueFracture <= 10)
+                    steps = 3;
+                else if (maxValueFracture <= 15)
+                    steps = 5;
+                else if (maxValueFracture <= 20)
+                    steps = 10;
+                else if (maxValueFracture <= 25)
+                    steps = 15;
+                else if (maxValueFracture <= 50)
+                    steps = 25;
+                else if (maxValueFracture <= 75)
+                    steps = 50;
+                else if (maxValueFracture <= 100)
+                    steps = 75;
+                else if (maxValueFracture <= 150)
+                    steps = 100;
+                else if (maxValueFracture <= 250)
+                    steps = 150;
+                else if (maxValueFracture <= 350)
+                    steps = 200;
+                else if (maxValueFracture <= 500)
+                    steps = 300;
+                else if (maxValueFracture <= 750)
+                    steps = 500;
+                else if (maxValueFracture <= 1000)
+                    steps = 750;
+                else if (maxValueFracture <= 2000)
+                    steps = 1000;
+                else if (maxValueFracture <= 3000)
+                    steps = 2000;
+                else
+                    steps = 3000;
+
+                return steps;
+            }
+        }
+
+        public bool AdditionalGraphsEnabled
+        {
+            get => _session == null ? false
+                : _session.Runs.Any(r => r.SensorData != null
+                || r.SensorData2 != null
+                || _session.Runs.All(run => !run.CaptureData.PcLatency.IsNullOrEmpty())
+                || _session.Runs.All(run => !run.CaptureData.AnimationError.IsNullOrEmpty()));
+        }
+
+        public ICommand CopyStatisticalParameterCommand { get; }
+
+        public ICommand CopyLShapeQuantilesCommand { get; }
+
+        public ICommand CopySystemInfoCommand { get; }
+
+        public ICommand CopySensorInfoCommand { get; }
+
+        public ICommand CopyRawSensorInfoCommand { get; }
+
+        public DelegateCommand CutRecordCommand { get; }
+
+        public DelegateCommand CutRecordInverseCommand { get; }
+
+        // Keep the saved selection independent of the current record's metrics.
+        // Availability only controls whether the selected graph can be shown.
+        public bool ShowGpuLoad
+        {
+            get => _appConfiguration.AnalysisShowGpuLoad && IsGpuLoadAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowGpuLoad = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowCpuLoad
+        {
+            get => _appConfiguration.AnalysisShowCpuLoad && IsCpuLoadAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowCpuLoad = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowCpuMaxThreadLoad
+        {
+            get => _appConfiguration.AnalysisShowCpuMaxThreadLoad && IsCpuMaxLoadAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowCpuMaxThreadLoad = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowGpuPowerLimit
+        {
+            get => _appConfiguration.AnalysisShowGpuPowerLimit && IsGpuPowerLimitAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowGpuPowerLimit = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowPcLatency
+        {
+            get => _appConfiguration.AnalysisShowPcLatency && IsPcLatencyAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowPcLatency = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowAnimationError
+        {
+            get => _appConfiguration.AnalysisShowAnimationError && IsAnimationErrorAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowAnimationError = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowGpuActiveChart
+        {
+            get => _appConfiguration.AnalysisShowGpuActiveChart && IsGpuActiveChartAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowGpuActiveChart = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowCpuActiveChart
+        {
+            get => _appConfiguration.AnalysisShowCpuActiveChart && IsCpuActiveChartAvailable;
+            set
+            {
+                _appConfiguration.AnalysisShowCpuActiveChart = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public EFilterMode SelectedFilterMode
+        {
+            get { return _selectedFilterMode; }
+            set
+            {
+                _selectedFilterMode = value;
+                RaisePropertyChanged();
+                OnFilterModeChanged();
+            }
+        }
+
+        public bool ShowAggregationSeparators
+        {
+            get { return _aggregationSeparators; }
+            set
+            {
+                _aggregationSeparators = value;                              
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool ShowStutteringThresholds
+        {
+            get { return _showStutteringThresholds; }
+            set
+            {
+                _showStutteringThresholds = value;
+                RaisePropertyChanged();
+                SetChartUpdateFlags(true, true, false);
+                _onUpdateChart.OnNext(default);
+            }
+        }
+
+        public bool UseFrametimeStatisticParameters
+        {
+            get { return _useFrametimeStatisticParameters; }
+            set
+            {
+                _useFrametimeStatisticParameters = value;
+                RaisePropertyChanged();
+                UpdateMainCharts();
+            }
+        }
+
+        public bool AnalysisRangeSliderRealTime
+        {
+            get { return _appConfiguration.AnalysisRangeSliderRealTime; }
+            set
+            {
+                _appConfiguration.AnalysisRangeSliderRealTime = value;
+                RaisePropertyChanged();
+            }
+        }
+
+
+        public double GpuActiveDeviationPercentage
+        {
+            get { return ShowGpuActiveChart ? _localRecordDataServer.GetGpuActiveDeviationPercentage() : 0; }
+
+        }
+
+        public DataViewModel(IStatisticProvider frametimeStatisticProvider,
+            IFrametimeAnalyzer frametimeAnalyzer,
+            IEventAggregator eventAggregator,
+            IAppConfiguration appConfiguration,
+            RecordManager recordManager,
+            RecordWriteQueue recordWriteQueue,
+            ILogger<DataViewModel> logger)
+        {
+            _frametimeStatisticProvider = frametimeStatisticProvider;
+            _frametimeAnalyzer = frametimeAnalyzer;
+            _eventAggregator = eventAggregator;
+            _appConfiguration = appConfiguration;
+            _recordManager = recordManager;
+            _recordWriteQueue = recordWriteQueue;
+            _logger = logger;
+
+            CopyStatisticalParameterCommand = new DelegateCommand(OnCopyStatisticalParameter);
+            CopyLShapeQuantilesCommand = new DelegateCommand(OnCopyQuantiles);
+            CopySystemInfoCommand = new DelegateCommand(OnCopySystemInfoCommand);
+            CopySensorInfoCommand = new DelegateCommand(OnCopySensorInfo);
+            CopyRawSensorInfoCommand = new DelegateCommand(OnCopyRawSensorInfo);
+            CutRecordCommand = new DelegateCommand(() => OnCutRecord(false), () => !_isCuttingRecord);
+            CutRecordInverseCommand = new DelegateCommand(() => OnCutRecord(true), () => !_isCuttingRecord);
+            CopyFPSThresholdDataCommand = new DelegateCommand(OnCopyFPSThresholdData);
+            ThresholdCountsCommand = new DelegateCommand(() => _appConfiguration.ShowThresholdTimes = false);
+            ThresholdTimesCommand = new DelegateCommand(() => _appConfiguration.ShowThresholdTimes = true);
+
+            ParameterFormatter = value => value.ToString(CultureInfo.InvariantCulture);
+            _localRecordDataServer = new LocalRecordDataServer(appConfiguration);
+            FrametimeGraphDataContext = new FrametimeGraphDataContext(_localRecordDataServer,
+                _appConfiguration, _frametimeStatisticProvider, _eventAggregator);
+            FpsGraphDataContext = new FpsGraphDataContext(_localRecordDataServer,
+                _appConfiguration, _frametimeStatisticProvider, _eventAggregator);
+            FrametimeDistributionGraphDataContext = new FrametimeDistributionGraphDataContext(_localRecordDataServer,
+                _appConfiguration, _frametimeStatisticProvider, _eventAggregator);
+
+            MessageDialogContent = new ConditionalMessageDialog();
+
+            SubscribeToEvents();
+            InitializeStatisticParameter();
+            SetThresholdLabels();
+            Setup();
+
+            CxLang.Instance.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(CxLang.UiLanguage) && _session != null)
+                    UpdateSensorSessionReport();
+            };
+        }
+
+        private bool GetIsPowerLimitAvailable()
+        {
+            if (_session == null)
+                return false;
+
+            if (_session.Runs == null
+                || !_session.Runs.Any())
+                return false;
+
+            if (_session.Runs
+                .All(run => run.SensorData != null)
+               && _session.Runs
+                .All(run => !run.SensorData.GPUPowerLimit.IsNullOrEmpty()))
+                return true;
+
+            if (_session.Runs
+                .All(run => run.SensorData2 != null)
+               && _session.Runs
+                .All(run => !run.SensorData2.GPUPowerLimit.IsNullOrEmpty()))
+                return true;
+
+            return false;
+        }
+
+        private bool GetIsGpuActiveChartAvailable()
+        {
+            if (_session == null)
+                return false;
+
+            if (_session.Runs == null
+                || !_session.Runs.Any())
+                return false;
+
+            if (_session.Runs
+                .All(run => run.CaptureData != null)
+                && _session.Runs
+                .All(run => !run.CaptureData.GpuActive.IsNullOrEmpty()))
+                return true;
+
+            return false;
+        }
+
+        private bool GetIsCpuActiveChartAvailable()
+        {
+            if (_session == null)
+                return false;
+
+            if (_session.Runs == null
+                || !_session.Runs.Any())
+                return false;
+
+            if (_session.Runs
+                .All(run => run.CaptureData != null)
+                && _session.Runs
+                .All(run => !run.CaptureData.CpuActive.IsNullOrEmpty()))
+                return true;
+
+            return false;
+        }
+
+        private VisibleGraphs GetVisibleGraphs() =>
+            new VisibleGraphs(
+                ShowGpuLoad,
+                ShowCpuLoad,
+                ShowCpuMaxThreadLoad,
+                ShowGpuPowerLimit,
+                ShowPcLatency,
+                ShowAnimationError,
+                ShowAggregationSeparators,
+                ShowStutteringThresholds,
+                StutteringFactor,
+                StutteringLowFPSThreshold,
+                ShowGpuActiveChart,
+                ShowCpuActiveChart,
+                _appConfiguration.UseDisplayChangeMetrics);
+
+        private void Setup()
+        {
+            _onUpdateChart.Subscribe(_ =>
+            {
+                
+                if (SelectedChart == EChartTab.Distribution && _isDistributionChartDirty)
+                {
+                    FrametimeDistributionGraphDataContext.BuildPlotmodel(GetVisibleGraphs());
+                    _isDistributionChartDirty = false;
+                }
+                    
+
+                if (SelectedChart == EChartTab.Fps && _isFpsChartDirty)
+                {
+                    FpsGraphDataContext.BuildPlotmodel(GetVisibleGraphs());
+                    _isFpsChartDirty = false;
+                }
+                   
+
+                if (SelectedChart == EChartTab.Frametimes && _isFrametimeChartDirty)
+                {
+                    FrametimeGraphDataContext.BuildPlotmodel(GetVisibleGraphs(), plotModel =>
+                    {
+                        FrametimeGraphDataContext.UpdateAxis(EPlotAxis.YAXISFRAMETIMES, axis =>
+                        {
+                            var tuple = GetYAxisSettingFromSelection(SelecetedChartYAxisSetting);
+                            SetFrametimeChartYAxisSetting(tuple);
+                        });
+                    });
+                    _isFrametimeChartDirty = false;
+                }
+                RaisePropertyChanged(nameof(GpuActiveDeviationPercentage));
+            });
+        }
+
+        partial void InitializeStatisticParameter();
+
+        private void OnAcceptParameterSettings()
+        {
+            Task.Factory.StartNew(() =>
+            {
+                var frametimeSubset = GetFrametimesSubset();
+                var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+                    ? GetDisplayChangeTimesSubset() : frametimeSubset;
+
+                SetStaticChart(frametimeSubset, sampleSubset, GetGpuActiveTimesSubset());
+            });
+        }
+
+        private void OnSliderRangeChanged()
+        {
+            if (_session == null)
+                return;
+
+            UpdateRangeSliderParameter();
+            UpdateMainCharts();
+            UpdateSecondaryCharts();
+        }
+
+        private void OnRangeSliderValueChanged()
+        {
+            
+            _localRecordDataServer.SetTimeWindow(FirstSeconds, LastSeconds - FirstSeconds);
+            RemainingRecordingTime = "(" + Math.Round(LastSeconds - FirstSeconds, 2)
+                .ToString("0.00", CultureInfo.InvariantCulture) + " s)";
+
+            SetChartUpdateFlags();
+
+            if (AnalysisRangeSliderRealTime)
+            {
+                RealTimeUpdateCharts();
+                UpdateSecondaryCharts();
+            }
+        }
+
+        private void OnCopyStatisticalParameter()
+        {
+            if (_session == null)
+                return;
+
+            var gpuActiveTimes = GetGpuActiveTimesSubset();
+            var frametimes = GetFrametimesSubset();
+            var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+                ? GetDisplayChangeTimesSubset() : frametimes;
+            var animationErrorsAbs = GetAnimationErrorsSubset()?.Select(error => Math.Abs(error)).ToList();
+
+            double GetFrametimeMetricValue(IList<double> sequence, EMetric metric) =>
+              Math.Round(_frametimeStatisticProvider.GetFrametimeMetricValue(sequence, metric), 2);
+
+            double GetP99MetricValue(IList<double> sequence) =>
+                Math.Round(_frametimeStatisticProvider.GetPQuantileSequence(sequence, 0.99), 2);
+
+            double GetMetricValue(IList<double> sequence, EMetric metric) =>
+                Math.Round(_frametimeStatisticProvider.GetFpsMetricValue(sequence, metric), 2);
+
+            var max = double.NaN;
+            var p99_quantile = double.NaN;
+            var p95_quantile = double.NaN;
+            var median = double.NaN;
+            var average = double.NaN;
+            var gpuActiveAverage = double.NaN;
+            var p0dot1_quantile = double.NaN;
+            var p0dot2_quantile = double.NaN;
+            var p1_quantile = double.NaN;
+            var gpuActiveP1_quantile = double.NaN;
+            var p5_quantile = double.NaN;
+            var p1_LowAverage = double.NaN;
+            var gpuActiveP1_LowAverage = double.NaN;
+            var p0dot1_LowAverage = double.NaN;
+            var p1_LowIntegral = double.NaN;
+            var p0dot1_LowIntegral = double.NaN;
+            var min = double.NaN;
+            var adaptiveStandardDeviation = double.NaN;
+            var cpuFpsPerWatt = double.NaN;
+            var gpuFpsPerWatt = double.NaN;
+            var animationErrorAverage = double.NaN;
+            var animationErrorP99 = double.NaN;
+
+            if (UseFrametimeStatisticParameters)
+            {
+                max = GetFrametimeMetricValue(sampleSubset, EMetric.Max);
+                p99_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P99);
+                p95_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P95);
+                median = GetFrametimeMetricValue(sampleSubset, EMetric.Median);
+                average = GetFrametimeMetricValue(frametimes, EMetric.Average);
+                gpuActiveAverage = GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveAverage);
+                p0dot1_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P0dot1);
+                p0dot2_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P0dot2);
+                p1_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P1);
+                gpuActiveP1_quantile = GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveP1);
+                p5_quantile = GetFrametimeMetricValue(sampleSubset, EMetric.P5);
+                p1_LowAverage = GetFrametimeMetricValue(sampleSubset, EMetric.OnePercentLowAverage);
+                gpuActiveP1_LowAverage = GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveOnePercentLowAverage);
+                p0dot1_LowAverage = GetFrametimeMetricValue(sampleSubset, EMetric.ZerodotOnePercentLowAverage);
+                p1_LowIntegral = GetFrametimeMetricValue(sampleSubset, EMetric.OnePercentLowIntegral);
+                p0dot1_LowIntegral = GetFrametimeMetricValue(sampleSubset, EMetric.ZerodotOnePercentLowIntegral);
+                min = GetFrametimeMetricValue(sampleSubset, EMetric.Min);
+                adaptiveStandardDeviation = GetFrametimeMetricValue(sampleSubset, EMetric.AdaptiveStd);
+
+                if (!animationErrorsAbs.IsNullOrEmpty())
+                {
+                    animationErrorAverage = GetFrametimeMetricValue(animationErrorsAbs, EMetric.Average);
+                    animationErrorP99 = GetP99MetricValue(animationErrorsAbs);
+                }
+            }
+            else
+            {
+                max = GetMetricValue(sampleSubset, EMetric.Max);
+                p99_quantile = GetMetricValue(sampleSubset, EMetric.P99);
+                p95_quantile = GetMetricValue(sampleSubset, EMetric.P95);
+                median = GetMetricValue(sampleSubset, EMetric.Median);
+                average = GetMetricValue(frametimes, EMetric.Average);
+                //gpuActiveAverage = GetMetricValue(gpuActiveTimes, EMetric.GpuActiveAverage);
+                p0dot1_quantile = GetMetricValue(sampleSubset, EMetric.P0dot1);
+                p0dot2_quantile = GetMetricValue(sampleSubset, EMetric.P0dot2);
+                p1_quantile = GetMetricValue(sampleSubset, EMetric.P1);
+                //gpuActiveP1_quantile = GetMetricValue(gpuActiveTimes, EMetric.GpuActiveP1);
+                p5_quantile = GetMetricValue(sampleSubset, EMetric.P5);
+                p1_LowAverage = GetMetricValue(sampleSubset, EMetric.OnePercentLowAverage);
+                //gpuActiveP1_LowAverage = GetMetricValue(gpuActiveTimes, EMetric.GpuActiveOnePercentLowAverage);
+                p0dot1_LowAverage = GetMetricValue(sampleSubset, EMetric.ZerodotOnePercentLowAverage);
+                p1_LowIntegral = GetMetricValue(sampleSubset, EMetric.OnePercentLowIntegral);
+                p0dot1_LowIntegral = GetMetricValue(sampleSubset, EMetric.ZerodotOnePercentLowIntegral);
+                min = GetMetricValue(sampleSubset, EMetric.Min);
+                adaptiveStandardDeviation = GetMetricValue(sampleSubset, EMetric.AdaptiveStd);
+                cpuFpsPerWatt = _frametimeStatisticProvider
+                     .GetPhysicalMetricValue(frametimes, EMetric.CpuFpsPerWatt,
+                     SensorReport.GetAverageSensorValues(_session.Runs.Select(run => run.SensorData2), EReportSensorName.CpuPower,
+                     _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength));
+                gpuFpsPerWatt = _frametimeStatisticProvider
+                .GetPhysicalMetricValue(frametimes, EMetric.GpuFpsPerWatt,
+                SensorReport.GetAverageSensorValues(_session.Runs.Select(run => run.SensorData2), EReportSensorName.GpuPower,
+                _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength, _appConfiguration.UseTBPSim));
+            }
+
+            // Vice versa!
+            // "Adaptive STDEV","Min","0.1% Low Integral","0.1% Low Average" ,"0.1%","0.2%" ,"1% Low Integral","1% Low Average", "1%" ,"5%" ,"Average" ,"95%" ,"99%" ,"Max"
+            StringBuilder builder = new StringBuilder();
+            if (UseFrametimeStatisticParameters)
+            {
+                if (_appConfiguration.UseSingleRecordMaxStatisticParameter)
+                    builder.Append("Min" + "\t" + min.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter)
+                    builder.Append("P1" + "\t" + p99_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter)
+                    builder.Append("P5" + "\t" + p95_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordMedianStatisticParameter)
+                    builder.Append("Median" + "\t" + median.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAverageStatisticParameter)
+                    builder.Append("Average" + "\t" + average.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                    builder.Append("GPU-Busy Average" + "\t" + gpuActiveAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter)
+                    builder.Append("P95" + "\t" + p5_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter)
+                    builder.Append("P99" + "\t" + p1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                    builder.Append("GPU-Busy P99" + "\t" + gpuActiveP1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                    builder.Append("1% High Average" + "\t" + p1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                    builder.Append("Gpu-Busy 1% High Average" + "\t" + gpuActiveP1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                    builder.Append("1% High Integral" + "\t" + p1_LowIntegral.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter)
+                    builder.Append("P99.8" + "\t" + p0dot2_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter)
+                    builder.Append("P99.9" + "\t" + p0dot1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                    builder.Append("0.1% High Average" + "\t" + p0dot1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                    builder.Append("0.1% High Integral" + "\t" + p0dot1_LowIntegral.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordMinStatisticParameter)
+                    builder.Append("Max" + "\t" + max.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAnimationErrorP99StatisticParameter && !double.IsNaN(animationErrorP99))
+                    builder.Append("P99 |Animation Error|" + "\t" + animationErrorP99.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAnimationErrorAverageStatisticParameter && !double.IsNaN(animationErrorAverage))
+                    builder.Append("Average |Animation Error|" + "\t" + animationErrorAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter)
+                    builder.Append("Adaptive STDEV" + "\t" + adaptiveStandardDeviation.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+            }
+            else
+            {
+                if (_appConfiguration.UseSingleRecordMaxStatisticParameter)
+                    builder.Append("Max" + "\t" + max.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter)
+                    builder.Append("P99" + "\t" + p99_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter)
+                    builder.Append("P95" + "\t" + p95_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordMedianStatisticParameter)
+                    builder.Append("Median" + "\t" + median.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAverageStatisticParameter)
+                    builder.Append("Average" + "\t" + average.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                    builder.Append("GPU-Busy Average" + "\t" + gpuActiveAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter)
+                    builder.Append("P5" + "\t" + p5_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter)
+                    builder.Append("P1" + "\t" + p1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                    builder.Append("GPU-Busy P1" + "\t" + gpuActiveP1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                    builder.Append("1% Low Average" + "\t" + p1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                    builder.Append("Gpu-Busy 1% Low Average" + "\t" + gpuActiveP1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                    builder.Append("1% Low Integral" + "\t" + p1_LowIntegral.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter)
+                    builder.Append("P0.2" + "\t" + p0dot2_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter)
+                    builder.Append("P0.1" + "\t" + p0dot1_quantile.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                    builder.Append("0.1% Low Average" + "\t" + p0dot1_LowAverage.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                    builder.Append("0.1% Low Integral" + "\t" + p0dot1_LowIntegral.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordMinStatisticParameter)
+                    builder.Append("Min" + "\t" + min.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter)
+                    builder.Append("Adaptive STDEV" + "\t" + adaptiveStandardDeviation.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordCpuFpsPerWattParameter)
+                    builder.Append("CPU FPS/10W" + "\t" + cpuFpsPerWatt.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+                if (_appConfiguration.UseSingleRecordGpuFpsPerWattParameter)
+                    builder.Append("GPU FPS/10W" + "\t" + gpuFpsPerWatt.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+            }
+            Clipboard.SetDataObject(builder.ToString(), false);
+        }
+
+        private void OnCopyQuantiles()
+        {
+            if (RecordInfo == null)
+                return;
+
+            var lShapeQuantiles = _frametimeAnalyzer.GetLShapeQuantiles(SelectedLShapeMetric);
+            var frametimes = GetFrametimesSubset();
+            var fps = GetFPSSubset();
+            double action(double q) => Math.Round(_frametimeStatisticProvider.GetPQuantileSequence(SelectedLShapeMetric == ELShapeMetrics.Frametimes ? frametimes : fps, q / 100), 2);
+
+            StringBuilder builder = new StringBuilder();
+
+            foreach (var quantile in lShapeQuantiles)
+            {
+                builder.Append(quantile.ToString(CultureInfo.InvariantCulture) + "%" + "\t" + action(quantile)
+                    .ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+            }
+
+            Clipboard.SetDataObject(builder.ToString(), false);
+        }
+
+        private void OnCopySystemInfoCommand()
+        {
+            if (RecordInfo == null)
+                return;
+
+            var systemInfos = _recordManager.GetSystemInfos(RecordInfo);
+
+            StringBuilder builder = new StringBuilder();
+
+            foreach (var systemInfo in systemInfos)
+            {
+                builder.Append(systemInfo.Key + "\t" + systemInfo.Value + Environment.NewLine);
+            }
+
+            Clipboard.SetDataObject(builder.ToString(), false);
+        }
+
+        private void OnCopySensorInfo()
+        {
+            if (RecordInfo == null)
+                return;
+
+            var sensorInfos = SensorReport.GetReportFromSessionSensorData(_session.Runs.Select(run => run.SensorData2),
+                _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength);
+
+            StringBuilder builder = new StringBuilder();
+
+            foreach (var sensorInfo in sensorInfos)
+            {
+                builder.Append(sensorInfo.Name + "\t" + sensorInfo.MinValue + "\t" +
+                sensorInfo.AverageValue + "\t" + sensorInfo.MaxValue + Environment.NewLine);
+            }
+
+            Clipboard.SetDataObject(builder.ToString(), false);
+        }
+
+        private void OnCopyRawSensorInfo()
+        {
+            if (RecordInfo == null)
+                return;
+
+            var text = RawSensorInfoExport.BuildText(_session.Runs.Select(run => run.SensorData2));
+            if (text.Length == 0)
+            {
+                // Nothing to copy: say so instead of leaving the clipboard as it was without a word. The
+                // plain dialog, since "never show again" of the conditional one hides the outlier warning.
+                MessageDialogContent = new MessageDialog();
+                MessageText = CxLang.T("DataViewModel_NoSensorDataToCopy");
+                MessageDialogContentIsOpen = true;
+                return;
+            }
+
+            Clipboard.SetDataObject(text, false);
+        }
+
+        private void OnChartItemChanged()
+        {
+            UpdateSecondaryCharts();
+            _onUpdateChart.OnNext(default);
+        }
+
+        private void OnRemoveOutliersChanged()
+        {
+            if (RecordInfo == null)
+                return;
+
+            _localRecordDataServer.RemoveOutlierMethod = RemoveOutliers ?
+                ERemoveOutlierMethod.DeciPercentile : ERemoveOutlierMethod.None;
+
+            CurrentGameName = RemoveOutliers ? CxLang.Format("DataViewModel_OutlierCleaned0", RecordInfo.GameName)
+                : RecordInfo.GameName;
+
+            SetChartUpdateFlags();
+
+
+            UpdateMainCharts();
+            UpdateSecondaryCharts();
+
+            if (!NeverShowDialog && RemoveOutliers)
+            {
+                MessageDialogContent = new ConditionalMessageDialog();
+                MessageText = CxLang.T("DataViewModel_RemoveOutliersIsOnlyASimulation");
+                MessageDialogContentIsOpen = true;
+            }
+        }
+
+        private void OnFilterModeChanged()
+        {
+            _localRecordDataServer.FilterMode = SelectedFilterMode;
+            FpsGraphDataContext.BuildPlotmodel(GetVisibleGraphs());
+        }
+
+        private async void OnCutRecord(bool inverse)
+        {
+            // The cut clones, filters and writes the whole record, which froze the window while it ran
+            // on the UI thread. It runs on the record write queue now: the exit waits for the queue, up
+            // to 10 s as for metadata edits, so closing the app no longer drops a cut that is still being
+            // written, and the cut runs after the metadata edits saved before the click and before those
+            // saved after it. The cut buttons are disabled until it is written.
+            if (_isCuttingRecord)
+                return;
+
+            var session = _localRecordDataServer.CurrentSession;
+            double firstSeconds = FirstSeconds;
+            double lastSeconds = LastSeconds;
+            SetCuttingRecord(true);
+            try
+            {
+                // Taken at the click: the record folder can be switched while the cut waits or runs.
+                string recordDirectory = await _recordManager.GetRecordDirectory();
+                await _recordWriteQueue.Enqueue(() => _recordManager
+                    .DuplicateSession(session, inverse, firstSeconds, lastSeconds, recordDirectory)
+                    .GetAwaiter().GetResult());
+            }
+            finally
+            {
+                SetCuttingRecord(false);
+            }
+        }
+
+        private void SetCuttingRecord(bool isCutting)
+        {
+            _isCuttingRecord = isCutting;
+            CutRecordCommand.RaiseCanExecuteChanged();
+            CutRecordInverseCommand.RaiseCanExecuteChanged();
+        }
+
+        private void UpdateRangeSliderParameter()
+        {
+            if (_session == null)
+                return;
+
+            MaxRecordingTime = _session.Runs.SelectMany(r => r.CaptureData.TimeInSeconds).Last();
+
+            _doUpdateCharts = false;
+            FirstSeconds = 0;
+            LastSeconds = MaxRecordingTime;
+            _doUpdateCharts = true;
+            RemainingRecordingTime = "(" + Math.Round(MaxRecordingTime, 2)
+                .ToString("0.00", CultureInfo.InvariantCulture) + " s)";
+        }
+
+        private void SubscribeToEvents()
+        {
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.UpdateSession>>()
+                .Subscribe(msg =>
+                {
+                    _session = msg.CurrentSession;
+                    RecordInfo = msg.RecordInfo;
+                    RaisePropertyChanged(nameof(AdditionalGraphsEnabled));
+
+                    if (_useUpdateSession)
+                    {
+                        UpdateAnalysisPage();
+                    }
+                });
+
+            // A metadata edit of the record on display changes what shows the metadata, not the
+            // analysis: the session is not loaded again for it.
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.UpdateRecordInfos>>()
+                .Subscribe(msg =>
+                {
+                    if (RecordInfo == null || msg?.RecordInfo == null || msg.RecordInfo.Id != RecordInfo.Id)
+                        return;
+
+                    RecordInfo = msg.RecordInfo;
+                    CurrentGameName = RemoveOutliers ? CxLang.Format("DataViewModel_OutlierCleaned0", RecordInfo.GameName)
+                        : RecordInfo.GameName;
+                    SystemInfos = _recordManager.GetSystemInfos(RecordInfo);
+                });
+
+            _eventAggregator.GetEvent<PubSubEvent<ViewMessages.ThemeChanged>>()
+                .Subscribe(msg =>
+                {
+                    if (_useUpdateSession)
+                    {
+                        UpdateAnalysisPage();
+                    }
+                });
+        }
+
+        private void UpdateAnalysisPage()
+        {
+            if (_session != null && RecordInfo != null)
+            {
+
+                SetChartUpdateFlags();
+
+                CurrentGameName = RemoveOutliers ? CxLang.Format("DataViewModel_OutlierCleaned0", RecordInfo.GameName)
+                    : RecordInfo.GameName;
+                SystemInfos = _recordManager.GetSystemInfos(RecordInfo);
+
+                // Update PC latency
+                IsPcLatencyAvailable = _session.Runs.All(run => !run.CaptureData.PcLatency.IsNullOrEmpty()) && _session.Runs.All(run =>
+                {
+                    var filteredValues = run.CaptureData.PcLatency.Where(x => !double.IsNaN(x) && x > 0);
+
+                    if (!filteredValues.Any())
+                    {
+                        return false;
+                    }
+
+                    var validValueCount = filteredValues.Count();
+                    var totalValueCount = run.CaptureData.PcLatency.Length;
+
+                    // Allow 60% invalid values
+                    if (validValueCount < totalValueCount * 0.4f)
+                    {
+                        return false;
+                    }
+
+                    if (filteredValues.Average() <= 0)
+                    {
+                        return false;
+                    }
+
+                    return true;
+                });
+
+                if (IsPcLatencyAvailable)
+                {
+                    var averagePcLatency = _session.Runs.Average(run => run.CaptureData.PcLatency.Where(x => !double.IsNaN(x)).Average());
+                    AvgPcLatency = $"PC Latency: {Math.Round(averagePcLatency, 1, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)}ms";
+                }
+
+                // Update Animation Error
+                IsAnimationErrorAvailable = _session.Runs.All(run => !run.CaptureData.AnimationError.IsNullOrEmpty()) && _session.Runs.All(run =>
+                {
+                    var filteredValues = run.CaptureData.AnimationError.Where(x => !double.IsNaN(x));
+                    return filteredValues.Any();
+                });
+
+                // Check load metrics
+                IsCpuLoadAvailable = _session.Runs.All(run => run.SensorData2 != null && !run.SensorData2.CpuUsage.IsNullOrEmpty());
+                IsCpuMaxLoadAvailable = _session.Runs.All(run => run.SensorData2 != null && !run.SensorData2.CpuMaxThreadUsage.IsNullOrEmpty());
+                IsGpuLoadAvailable = _session.Runs.All(run => run.SensorData2 != null && !run.SensorData2.GpuUsage.IsNullOrEmpty());
+                IsGpuPowerLimitAvailable = GetIsPowerLimitAvailable();
+
+                //Check GPU Active metric
+                IsGpuActiveChartAvailable = GetIsGpuActiveChartAvailable();
+
+                //Check CPU Active metric
+                IsCpuActiveChartAvailable = GetIsCpuActiveChartAvailable();
+
+                // Do update actions
+                FrametimeGraphDataContext.RecordSession = _session;
+                FpsGraphDataContext.RecordSession = _session;
+                FrametimeDistributionGraphDataContext.RecordSession = _session;
+
+                UpdateRangeSliderParameter();
+                UpdateMainCharts();
+                UpdateSecondaryCharts();
+                UpdateSensorSessionReport();
+            }
+            else
+            {
+                ResetData();
+            }
+        }
+
+        private void UpdateSensorSessionReport()
+        {
+            SensorReportItems.Clear();
+            SensorReport.GetReportFromSessionSensorData(_session.Runs.Select(run => run.SensorData2).Cast<ISessionSensorData>(),
+               _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength)
+               .ForEach(item =>
+               {
+                   // The report names are the English descriptions; the table shows them in the UI language.
+                   if (item.Name != null && ReportSensorNames.TryGetValue(item.Name, out var sensorName))
+                       item.Name = CxLang.TranslateEnum(sensorName);
+                   SensorReportItems.Add(item);
+               });
+        }
+
+        private static readonly Dictionary<string, EReportSensorName> ReportSensorNames =
+            Enum.GetValues(typeof(EReportSensorName)).Cast<EReportSensorName>()
+                .ToDictionary(name => name.GetDescription(), name => name);
+
+        private void UpdateMainCharts()
+        {
+            if (!_doUpdateCharts)
+                return;
+
+            var frametimeSubset = GetFrametimesSubset();
+            var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+                ? GetDisplayChangeTimesSubset() : frametimeSubset;
+            var gpuActiveSubset = GetGpuActiveTimesSubset();
+
+            if (frametimeSubset != null && sampleSubset != null)
+            {
+                _onUpdateChart.OnNext(default);
+
+                Task.Factory.StartNew(() => SetStaticChart(frametimeSubset, sampleSubset, gpuActiveSubset));
+                Task.Factory.StartNew(() => SetStutteringChart(sampleSubset));
+                Task.Factory.StartNew(() => SetVarianceChart());
+                Task.Factory.StartNew(() => SetFpsThresholdChart(sampleSubset));
+            }
+        }
+
+        private void RealTimeUpdateCharts()
+        {
+            if (!_doUpdateCharts) return;
+            _onUpdateChart.OnNext(default);
+        }
+
+        private void DemandUpdateCharts()
+        {
+            if (!_doUpdateCharts)
+                return;
+
+            var frametimeSubset = GetFrametimesSubset();
+            var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+                ? GetDisplayChangeTimesSubset() : frametimeSubset;
+            var gpuActiveSubset = GetGpuActiveTimesSubset();
+
+            if (frametimeSubset != null && sampleSubset != null)
+            {
+                Task.Factory.StartNew(() => SetStaticChart(frametimeSubset, sampleSubset, gpuActiveSubset));
+                Task.Factory.StartNew(() => SetStutteringChart(sampleSubset));
+                Task.Factory.StartNew(() => SetVarianceChart());
+                Task.Factory.StartNew(() => SetFpsThresholdChart(sampleSubset));
+                UpdateSensorSessionReport();
+            }
+        }
+
+        private void UpdateSecondaryCharts()
+        {
+            if (SelectedChartItem == null)
+                return;
+
+            var frametimeSubset = GetFrametimesSubset();
+            var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+               ? GetDisplayChangeTimesSubset() : frametimeSubset;
+            var fpsSubset = GetFPSSubset();
+
+            if (sampleSubset == null || fpsSubset == null)
+                return;
+
+            if (SelectedChart == EChartTab.LShape)
+            {
+                Task.Factory.StartNew(() => SetLShapeChart(sampleSubset, fpsSubset));
+            }
+        }
+
+        private IList<double> GetFrametimesSubset()
+            => _localRecordDataServer?.GetFrametimeTimeWindow();
+
+        private IList<double> GetDisplayChangeTimesSubset()
+            => _localRecordDataServer?.GetDisplayChangeTimeWindow();
+
+        private IList<double> GetFPSSubset()
+            => _localRecordDataServer?.GetFpsTimeWindow();
+
+        private IList<double> GetGpuActiveTimesSubset()
+            => _localRecordDataServer?.GetGpuActiveTimeTimeWindow();
+
+        private IList<double> GetAnimationErrorsSubset()
+            => _localRecordDataServer?.GetAnimationErrorTimeWindow();
+
+        private void SetStaticChart(IList<double> frametimes, IList<double> displayChangeTimes, IList<double> gpuActiveTimes)
+        {
+            if (frametimes == null || !frametimes.Any())
+                return;
+
+            if (displayChangeTimes == null || !displayChangeTimes.Any())
+                return;
+
+            var animationErrorsAbs = GetAnimationErrorsSubset()?.Select(error => Math.Abs(error)).ToList();
+
+            double GetFrametimeMetricValue(IList<double> sequence, EMetric metric) =>
+                _frametimeStatisticProvider.GetFrametimeMetricValue(sequence, metric);
+
+            double GetP99MetricValue(IList<double> sequence) =>
+                Math.Round(_frametimeStatisticProvider.GetPQuantileSequence(sequence, 0.99),
+                    _appConfiguration.FpsValuesRoundingDigits, MidpointRounding.AwayFromZero);
+
+            double GetMetricValue(IList<double> sequence, EMetric metric) =>
+                _frametimeStatisticProvider.GetFpsMetricValue(sequence, metric);
+
+            var max = double.NaN;
+            var p99_quantile = double.NaN;
+            var p95_quantile = double.NaN;
+            var median = double.NaN;
+            var average = double.NaN;
+            var gpuActiveAverage = double.NaN;
+            var p0dot1_quantile = double.NaN;
+            var p0dot2_quantile = double.NaN;
+            var p1_quantile = double.NaN;
+            var gpuActiveP1_quantile = double.NaN;
+            var p5_quantile = double.NaN;
+            var p1_LowAverage = double.NaN;
+            var gpuActiveP1_LowAverage = double.NaN;
+            var p0dot1_LowAverage = double.NaN;
+            var p1_LowIntegral = double.NaN;
+            var p0dot1_LowIntegral = double.NaN;
+            var min = double.NaN;
+            var adaptiveStandardDeviation = double.NaN;
+            var cpuFpsPerWatt = double.NaN;
+            var gpuFpsPerWatt = double.NaN;
+            var animationErrorAverage = double.NaN;
+            var animationErrorP99 = double.NaN;
+
+            if (UseFrametimeStatisticParameters)
+            {
+                max = GetFrametimeMetricValue(displayChangeTimes, EMetric.Max);
+                p99_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P99);
+                p95_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P95);
+                median = GetFrametimeMetricValue(displayChangeTimes, EMetric.Median);
+                average = GetFrametimeMetricValue(frametimes, EMetric.Average);
+                gpuActiveAverage = !gpuActiveTimes.IsNullOrEmpty() ? GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveAverage) : double.NaN;
+                p0dot1_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P0dot1);
+                p0dot2_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P0dot2);
+                p1_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P1);
+                gpuActiveP1_quantile = !gpuActiveTimes.IsNullOrEmpty() ? GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveP1) : double.NaN;
+                p5_quantile = GetFrametimeMetricValue(displayChangeTimes, EMetric.P5);
+                p1_LowAverage = GetFrametimeMetricValue(displayChangeTimes, EMetric.OnePercentLowAverage);
+                gpuActiveP1_LowAverage = !gpuActiveTimes.IsNullOrEmpty() ? GetFrametimeMetricValue(gpuActiveTimes, EMetric.GpuActiveOnePercentLowAverage) : double.NaN;
+                p0dot1_LowAverage = GetFrametimeMetricValue(displayChangeTimes, EMetric.ZerodotOnePercentLowAverage);
+                p1_LowIntegral = GetFrametimeMetricValue(displayChangeTimes, EMetric.OnePercentLowIntegral);
+                p0dot1_LowIntegral = GetFrametimeMetricValue(displayChangeTimes, EMetric.ZerodotOnePercentLowIntegral);
+                min = GetFrametimeMetricValue(displayChangeTimes, EMetric.Min);
+                adaptiveStandardDeviation = GetFrametimeMetricValue(displayChangeTimes, EMetric.AdaptiveStd);
+
+                if (!animationErrorsAbs.IsNullOrEmpty())
+                {
+                    animationErrorAverage = GetFrametimeMetricValue(animationErrorsAbs, EMetric.Average);
+                    animationErrorP99 = GetP99MetricValue(animationErrorsAbs);
+                }
+            }
+            else
+            {
+                max = GetMetricValue(displayChangeTimes, EMetric.Max);
+                p99_quantile = GetMetricValue(displayChangeTimes, EMetric.P99);
+                p95_quantile = GetMetricValue(displayChangeTimes, EMetric.P95);
+                median = GetMetricValue(displayChangeTimes, EMetric.Median);
+                average = GetMetricValue(frametimes, EMetric.Average);
+                //gpuActiveAverage = !gpuActiveTimes.IsNullOrEmpty() ? GetMetricValue(gpuActiveTimes, EMetric.GpuActiveAverage) : double.NaN;
+                p0dot1_quantile = GetMetricValue(displayChangeTimes, EMetric.P0dot1);
+                p0dot2_quantile = GetMetricValue(displayChangeTimes, EMetric.P0dot2);
+                p1_quantile = GetMetricValue(displayChangeTimes, EMetric.P1);
+                //gpuActiveP1_quantile = !gpuActiveTimes.IsNullOrEmpty() ? GetMetricValue(gpuActiveTimes, EMetric.GpuActiveP1) : double.NaN;
+                p5_quantile = GetMetricValue(displayChangeTimes, EMetric.P5);
+                p1_LowAverage = GetMetricValue(displayChangeTimes, EMetric.OnePercentLowAverage);
+                //gpuActiveP1_LowAverage = !gpuActiveTimes.IsNullOrEmpty() ? GetMetricValue(gpuActiveTimes, EMetric.GpuActiveOnePercentLowAverage) : double.NaN;
+                p0dot1_LowAverage = GetMetricValue(displayChangeTimes, EMetric.ZerodotOnePercentLowAverage);
+                p1_LowIntegral = GetMetricValue(displayChangeTimes, EMetric.OnePercentLowIntegral);
+                p0dot1_LowIntegral = GetMetricValue(displayChangeTimes, EMetric.ZerodotOnePercentLowIntegral);
+                min = GetMetricValue(displayChangeTimes, EMetric.Min);
+                adaptiveStandardDeviation = GetMetricValue(displayChangeTimes, EMetric.AdaptiveStd);
+                cpuFpsPerWatt = _frametimeStatisticProvider
+                    .GetPhysicalMetricValue(frametimes, EMetric.CpuFpsPerWatt,
+                    SensorReport.GetAverageSensorValues(_session.Runs.Select(run => run.SensorData2), EReportSensorName.CpuPower,
+                    _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength));
+                gpuFpsPerWatt = _frametimeStatisticProvider
+                .GetPhysicalMetricValue(frametimes, EMetric.GpuFpsPerWatt,
+                SensorReport.GetAverageSensorValues(_session.Runs.Select(run => run.SensorData2), EReportSensorName.GpuPower,
+                _localRecordDataServer.CurrentTime, _localRecordDataServer.CurrentTime + _localRecordDataServer.WindowLength, _appConfiguration.UseTBPSim));
+            }
+
+            // set metrics
+            Application.Current.Dispatcher.Invoke(new Action(() =>
+            {
+                IChartValues values = new ChartValues<double>();
+                if (UseFrametimeStatisticParameters)
+                {
+                    if (_appConfiguration.UseSingleRecordGpuFpsPerWattParameter && !double.IsNaN(gpuFpsPerWatt))
+                        values.Add(gpuFpsPerWatt);
+                    if (_appConfiguration.UseSingleRecordCpuFpsPerWattParameter && !double.IsNaN(cpuFpsPerWatt))
+                        values.Add(cpuFpsPerWatt);
+                    if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter && !double.IsNaN(adaptiveStandardDeviation))
+                        values.Add(adaptiveStandardDeviation);
+                    if (_appConfiguration.UseSingleRecordAnimationErrorP99StatisticParameter && !double.IsNaN(animationErrorP99))
+                        values.Add(animationErrorP99);
+                    if (_appConfiguration.UseSingleRecordAnimationErrorAverageStatisticParameter && !double.IsNaN(animationErrorAverage))
+                        values.Add(animationErrorAverage);
+                    if (_appConfiguration.UseSingleRecordMinStatisticParameter && !double.IsNaN(max))
+                        values.Add(max);
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                        values.Add(p0dot1_LowIntegral);
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                        values.Add(p0dot1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter && !double.IsNaN(p0dot1_quantile))
+                        values.Add(p0dot1_quantile);
+                    if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter && !double.IsNaN(p0dot2_quantile))
+                        values.Add(p0dot2_quantile);
+                    if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                        values.Add(p1_LowIntegral);
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                        values.Add(gpuActiveP1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                        values.Add(p1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                        values.Add(gpuActiveP1_quantile);
+                    if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter && !double.IsNaN(p1_quantile))
+                        values.Add(p1_quantile);
+                    if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter && !double.IsNaN(p5_quantile))
+                        values.Add(p5_quantile);
+                    if (_appConfiguration.UseSingleRecordMedianStatisticParameter && !double.IsNaN(median))
+                        values.Add(median);
+                    if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                        values.Add(gpuActiveAverage);
+                    if (_appConfiguration.UseSingleRecordAverageStatisticParameter && !double.IsNaN(average))
+                        values.Add(average);
+                    if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter && !double.IsNaN(p95_quantile))
+                        values.Add(p95_quantile);
+                    if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter && !double.IsNaN(p99_quantile))
+                        values.Add(p99_quantile);
+                    if (_appConfiguration.UseSingleRecordMaxStatisticParameter && !double.IsNaN(min))
+                        values.Add(min);
+                }
+                else
+                {
+                    if (_appConfiguration.UseSingleRecordGpuFpsPerWattParameter && !double.IsNaN(gpuFpsPerWatt))
+                        values.Add(gpuFpsPerWatt);
+                    if (_appConfiguration.UseSingleRecordCpuFpsPerWattParameter && !double.IsNaN(cpuFpsPerWatt))
+                        values.Add(cpuFpsPerWatt);
+                    if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter && !double.IsNaN(adaptiveStandardDeviation))
+                        values.Add(adaptiveStandardDeviation);
+                    if (_appConfiguration.UseSingleRecordMinStatisticParameter && !double.IsNaN(min))
+                        values.Add(min);
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                        values.Add(p0dot1_LowIntegral);
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                        values.Add(p0dot1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter && !double.IsNaN(p0dot1_quantile))
+                        values.Add(p0dot1_quantile);
+                    if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter && !double.IsNaN(p0dot2_quantile))
+                        values.Add(p0dot2_quantile);
+                    if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                        values.Add(p1_LowIntegral);
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                        values.Add(gpuActiveP1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                        values.Add(p1_LowAverage);
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                        values.Add(gpuActiveP1_quantile);
+                    if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter && !double.IsNaN(p1_quantile))
+                        values.Add(p1_quantile);
+                    if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter && !double.IsNaN(p5_quantile))
+                        values.Add(p5_quantile);
+                    if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                        values.Add(gpuActiveAverage);
+                    if (_appConfiguration.UseSingleRecordAverageStatisticParameter && !double.IsNaN(average))
+                        values.Add(average);
+                    if (_appConfiguration.UseSingleRecordMedianStatisticParameter && !double.IsNaN(median))
+                        values.Add(median);
+                    if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter && !double.IsNaN(p95_quantile))
+                        values.Add(p95_quantile);
+                    if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter && !double.IsNaN(p99_quantile))
+                        values.Add(p99_quantile);
+                    if (_appConfiguration.UseSingleRecordMaxStatisticParameter && !double.IsNaN(max))
+                        values.Add(max);
+                }
+
+                StatisticCollection = new SeriesCollection
+                {
+                    new RowSeries
+                    {
+                        Title = RecordInfo.GameName,
+                        Fill = new SolidColorBrush(Color.FromRgb(0xFB, 0xBF, 0x24)),
+                        Values = values,
+                        DataLabels = true,
+                        FontSize = 12,
+                        MaxRowHeigth = 30,
+                        Foreground = new SolidColorBrush(_appConfiguration.UseDarkMode ? Colors.White : Colors.Black)
+                    }
+                };
+
+                double maxOffset = (values as IList<double>).Max() * 0.15;
+                BarMaxValue = (int)((values as IList<double>).Max() + maxOffset);
+
+                var parameterLabelList = new List<string>();
+
+                //{ "Adaptive STDEV", "Min", "0.1% Low Integral", "0.1% Low Average", "0.1%", "0.2%", "1% Low Integral", "1% Low Average", "1%", "5%", "Average", "95%", "99%", "Max" }
+                if (UseFrametimeStatisticParameters)
+                {
+                    if (_appConfiguration.UseSingleRecordGpuFpsPerWattParameter && !double.IsNaN(gpuFpsPerWatt))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuFpsPer10W"));
+                    if (_appConfiguration.UseSingleRecordCpuFpsPerWattParameter && !double.IsNaN(cpuFpsPerWatt))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarCpuFpsPer10W"));
+                    if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter && !double.IsNaN(adaptiveStandardDeviation))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarAdaptiveSTDEV"));
+                    if (_appConfiguration.UseSingleRecordAnimationErrorP99StatisticParameter && !double.IsNaN(animationErrorP99))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarP99AnimationError"));
+                    if (_appConfiguration.UseSingleRecordAnimationErrorAverageStatisticParameter && !double.IsNaN(animationErrorAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarAverageAnimationError"));
+                    if (_appConfiguration.UseSingleRecordMinStatisticParameter && !double.IsNaN(max))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMax"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarPointOnePercentHighIntegral"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarPointOnePercentHighAverage"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter && !double.IsNaN(p0dot1_quantile))
+                        parameterLabelList.Add("P99.9");
+                    if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter && !double.IsNaN(p0dot2_quantile))
+                        parameterLabelList.Add("P99.8");
+                    if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarOnePercentHighIntegral"));
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyOnePercentHighAverage"));
+                    if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarOnePercentHighAverage"));
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyP99"));
+                    if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter && !double.IsNaN(p1_quantile))
+                        parameterLabelList.Add("P99");
+                    if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter && !double.IsNaN(p5_quantile))
+                        parameterLabelList.Add("P95");
+                    if (_appConfiguration.UseSingleRecordMedianStatisticParameter && !double.IsNaN(median))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMedian"));
+                    if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyAverage"));
+                    if (_appConfiguration.UseSingleRecordAverageStatisticParameter && !double.IsNaN(average))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarAverage"));
+                    if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter && !double.IsNaN(p95_quantile))
+                        parameterLabelList.Add("P5");
+                    if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter && !double.IsNaN(p99_quantile))
+                        parameterLabelList.Add("P1");
+                    if (_appConfiguration.UseSingleRecordMaxStatisticParameter && !double.IsNaN(min))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMin"));
+                }
+                else
+                {
+                    if (_appConfiguration.UseSingleRecordGpuFpsPerWattParameter && !double.IsNaN(gpuFpsPerWatt))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuFpsPer10W"));
+                    if (_appConfiguration.UseSingleRecordCpuFpsPerWattParameter && !double.IsNaN(cpuFpsPerWatt))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarCpuFpsPer10W"));
+                    if (_appConfiguration.UseSingleRecordAdaptiveSTDStatisticParameter && !double.IsNaN(adaptiveStandardDeviation))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarAdaptiveSTDEV"));
+                    if (_appConfiguration.UseSingleRecordMinStatisticParameter && !double.IsNaN(min))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMin"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowIntegralStatisticParameter && !double.IsNaN(p0dot1_LowIntegral))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarPointOnePercentLowIntegral"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1LowAverageStatisticParameter && !double.IsNaN(p0dot1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarPointOnePercentLowAverage"));
+                    if (_appConfiguration.UseSingleRecordP0Dot1QuantileStatisticParameter && !double.IsNaN(p0dot1_quantile))
+                        parameterLabelList.Add("P0.1");
+                    if (_appConfiguration.UseSingleRecordP0Dot2QuantileStatisticParameter && !double.IsNaN(p0dot2_quantile))
+                        parameterLabelList.Add("P0.2");
+                    if (_appConfiguration.UseSingleRecordP1LowIntegralStatisticParameter && !double.IsNaN(p1_LowIntegral))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarOnePercentLowIntegral"));
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1LowAverageStatisticParameter && !double.IsNaN(gpuActiveP1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyOnePercentLowAverage"));
+                    if (_appConfiguration.UseSingleRecordP1LowAverageStatisticParameter && !double.IsNaN(p1_LowAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarOnePercentLowAverage"));
+                    if (_appConfiguration.UseSingleRecordGpuActiveP1QuantileStatisticParameter && !double.IsNaN(gpuActiveP1_quantile))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyP1"));
+                    if (_appConfiguration.UseSingleRecordP1QuantileStatisticParameter && !double.IsNaN(p1_quantile))
+                        parameterLabelList.Add("P1");
+                    if (_appConfiguration.UseSingleRecordP5QuantileStatisticParameter && !double.IsNaN(p5_quantile))
+                        parameterLabelList.Add("P5");
+                    if (_appConfiguration.UseSingleRecordGpuActiveAverageStatisticParameter && !double.IsNaN(gpuActiveAverage))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarGpuBusyAverage"));
+                    if (_appConfiguration.UseSingleRecordAverageStatisticParameter && !double.IsNaN(average))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarAverage"));
+                    if (_appConfiguration.UseSingleRecordMedianStatisticParameter && !double.IsNaN(median))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMedian"));
+                    if (_appConfiguration.UseSingleRecordP95QuantileStatisticParameter && !double.IsNaN(p95_quantile))
+                        parameterLabelList.Add("P95");
+                    if (_appConfiguration.UseSingleRecord99QuantileStatisticParameter && !double.IsNaN(p99_quantile))
+                        parameterLabelList.Add("P99");
+                    if (_appConfiguration.UseSingleRecordMaxStatisticParameter && !double.IsNaN(max))
+                        parameterLabelList.Add(CxLang.T("DataViewModel_BarMax"));
+                }
+
+                ParameterLabels = parameterLabelList.ToArray();
+            }));
+        }
+
+        private void SetStutteringChart(IList<double> samples)
+        {
+            if (samples == null || !samples.Any())
+                return;
+
+            var stutteringTimePercentage = _frametimeStatisticProvider.GetStutteringTimePercentage(samples, _appConfiguration.StutteringFactor);
+
+            var lowFPSTimePercentage = _frametimeStatisticProvider.GetLowFPSTimePercentage(samples, _appConfiguration.StutteringFactor, _appConfiguration.StutteringThreshold);
+
+            double stutteringTotalTime = Math.Round(stutteringTimePercentage / 100 * samples.Skip(1).Sum() / 1000, 2, MidpointRounding.AwayFromZero);
+            double lowFPSTotalTime = Math.Round(lowFPSTimePercentage / 100 * samples.Skip(1).Sum() / 1000, 2, MidpointRounding.AwayFromZero);
+            double smoothTotalTime = Math.Round((1 - (stutteringTimePercentage + lowFPSTimePercentage) / 100) * samples.Skip(1).Sum() / 1000, 2, MidpointRounding.AwayFromZero);
+
+            Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                StutteringStatisticCollection = new SeriesCollection
+                {
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_Smooth01", smoothTotalTime.ToString(CultureInfo.InvariantCulture), Math.Round(100 - (stutteringTimePercentage + lowFPSTimePercentage), 1, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>(){ smoothTotalTime },
+                        DataLabels = false,
+                        Fill = ColorRessource.PieChartSmoothFill,
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_LowFPS01", lowFPSTotalTime.ToString(CultureInfo.InvariantCulture), Math.Round(lowFPSTimePercentage, 1, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>(){ lowFPSTotalTime },
+                        DataLabels = false,
+                        Fill = ColorRessource.PieChartLowFPSFill,
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_Stuttering01", stutteringTotalTime.ToString(CultureInfo.InvariantCulture), Math.Round(stutteringTimePercentage, 1, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>(){ stutteringTotalTime },
+                        DataLabels = false,
+                        Fill = ColorRessource.PieChartStutterFill,
+                        StrokeThickness = 0
+                    }
+                };
+            }));
+        }
+
+        private void SetVarianceChart()
+        {
+            if (_session == null) return;
+
+            IList<double> variances;
+
+            if (_appConfiguration.UseDisplayChangeMetrics)
+            {
+                variances = _frametimeStatisticProvider.GetDisplayTimeVariancePercentages(_session);
+            }
+            else
+            {
+                variances = _frametimeStatisticProvider.GetFrametimeVariancePercentages(_session);
+            }
+
+            Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                VarianceStatisticCollection = new SeriesCollection
+                {
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_VarianceBelow01", 2, Math.Round(variances[0] * 100, 2).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>() { variances[0] },
+                        DataLabels = false,
+                        Fill = new SolidColorBrush(Color.FromRgb(34, 151, 243)), // blue
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_VarianceBelow01", 4, Math.Round(variances[1] * 100, 2).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>() { variances[1] },
+                        DataLabels = false,
+                        Fill = new SolidColorBrush(Color.FromRgb(15, 120, 180)), // dark blue
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_VarianceBelow01", 8, Math.Round(variances[2] * 100, 2).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>() { variances[2] },
+                        DataLabels = false,
+                        Fill = new SolidColorBrush(Color.FromRgb(255, 180, 0)), // yellow
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_VarianceBelow01", 12, Math.Round(variances[3] * 100, 2).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>() { variances[3] },
+                        DataLabels = false,
+                        Fill = new SolidColorBrush(Color.FromRgb(241, 125, 32)), // orange
+                        StrokeThickness = 0
+                    },
+
+                    new PieSeries
+                    {
+                        Title = CxLang.Format("DataViewModel_VarianceAbove01", 12, Math.Round(variances[4] * 100, 2).ToString(CultureInfo.InvariantCulture)),
+                        Values = new ChartValues<double>() { variances[4] },
+                        DataLabels = false,
+                        Fill = new SolidColorBrush(Color.FromRgb(200, 0, 0)), // red
+                        StrokeThickness = 0
+                    },
+                };
+            }));
+        }
+
+        private void SetLShapeChart(IList<double> samples, IList<double> fps)
+        {
+            if (samples == null || !samples.Any())
+                return;
+
+            var lShapeQuantiles = _frametimeAnalyzer.GetLShapeQuantiles(SelectedLShapeMetric);
+            double action(double q) => _frametimeStatisticProvider.GetPQuantileSequence(SelectedLShapeMetric == ELShapeMetrics.Frametimes ? samples : fps, q / 100);
+            var observablePoints = lShapeQuantiles.Select(q => new ObservablePoint(q, action(q)));
+
+            var chartValues = new ChartValues<ObservablePoint>();
+            chartValues.AddRange(observablePoints);
+            string unit = SelectedLShapeMetric == ELShapeMetrics.Frametimes ? " ms" : " fps";
+
+            Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                LShapeCollection = new SeriesCollection()
+                {
+                    new LineSeries
+                    {
+                        Values = chartValues,
+                        Stroke = ColorRessource.LShapeStroke,
+                        Fill = Brushes.Transparent,
+                        FontSize = 11,
+                        StrokeThickness = 2,
+                        LineSmoothness= 1,
+                        PointGeometrySize = 5,
+                        PointGeometry = DefaultGeometries.Square,
+                        DataLabels = true,
+                        LabelPoint = point => point.X.ToString(CultureInfo.InvariantCulture) + "%, " +
+                            Math.Round(point.Y, 1).ToString(CultureInfo.InvariantCulture) + unit
+                    }
+                };
+
+                ResetLShapeChart.OnNext(default);
+            }));
+        }
+
+        private void ResetData()
+        {
+            FrametimeGraphDataContext.Reset();
+            FpsGraphDataContext.Reset();
+            FrametimeDistributionGraphDataContext.Reset();
+            _localRecordDataServer.CurrentSession = null;
+            LShapeCollection?.Clear();
+            StatisticCollection?.Clear();
+            StutteringStatisticCollection?.Clear();
+            VarianceStatisticCollection?.Clear();
+            SystemInfos?.Clear();
+        }
+
+        private void SetFrametimeChartYAxisSetting(Tuple<double, double> setting)
+        {
+            FrametimeGraphDataContext.UpdateAxis(EPlotAxis.YAXISFRAMETIMES, axis =>
+            {
+                axis.Reset();
+                axis.Minimum = setting.Item1;
+                axis.Maximum = setting.Item2;
+            });
+        }
+
+        private Tuple<double, double> GetYAxisSettingFromSelection(EChartYAxisSetting selection)
+        {
+            Tuple<double, double> setting = new Tuple<double, double>(double.NaN, double.NaN);
+
+            if (_localRecordDataServer == null || _localRecordDataServer.CurrentSession == null)
+                return setting;
+
+            switch (selection)
+            {
+                case EChartYAxisSetting.FullFit:
+                    {
+                        var frametimes = _localRecordDataServer?
+                            .GetFrametimePointTimeWindow().Select(pnt => pnt.Y);
+
+                        var yMin = frametimes.Min();
+                        var yMax = frametimes.Max();
+
+
+                        if (GetIsGpuActiveChartAvailable() && ShowGpuActiveChart)
+                        {
+                            var gpuActiveTimes = _localRecordDataServer?
+                            .GetGpuActiveTimePointTimeWindow().Select(pnt => pnt.Y);
+
+                            yMin = Math.Min(yMin, gpuActiveTimes.Min());
+                            yMax = Math.Max(yMax, gpuActiveTimes.Max());
+                        }
+
+                        if (GetIsCpuActiveChartAvailable() && ShowCpuActiveChart)
+                        {
+                            var cpuActiveTimes = _localRecordDataServer?
+                            .GetCpuActiveTimePointTimeWindow().Select(pnt => pnt.Y);
+
+                            yMin = Math.Min(yMin, cpuActiveTimes.Min());
+                            yMax = Math.Max(yMax, cpuActiveTimes.Max());
+                        }
+
+                        if (ShowStutteringThresholds)
+                        {
+                            var frametimeStatisticProvider = new FrametimeStatisticProvider(null);
+                            var sampleSubset = _appConfiguration.UseDisplayChangeMetrics
+                                ? GetDisplayChangeTimesSubset() : frametimes;
+
+                            var movingAverage = frametimeStatisticProvider.GetMovingAverage(sampleSubset.ToList());
+
+                            yMax = Math.Max(Math.Max(movingAverage.Max() * _appConfiguration.StutteringFactor, yMax), 1000 / _appConfiguration.StutteringThreshold);
+                        }
+
+                        if (IsPcLatencyAvailable && ShowPcLatency)
+                        {
+                            var maxLatency = _localRecordDataServer.CurrentSession.Runs.Max(run => run.CaptureData.PcLatency.Max());
+                            yMax = Math.Max(yMax, maxLatency);
+                        }
+
+                        if (IsAnimationErrorAvailable && ShowAnimationError)
+                        {
+                            var minAnimationError = _localRecordDataServer.CurrentSession.Runs.Max(run =>
+                                run.CaptureData.AnimationError.Where(x => !double.IsNaN(x)).DefaultIfEmpty(0).Min());
+                            var maxAnimationError = _localRecordDataServer.CurrentSession.Runs.Max(run =>
+                                run.CaptureData.AnimationError.Where(x => !double.IsNaN(x)).DefaultIfEmpty(0).Max());
+                            yMin = Math.Min(yMin, minAnimationError);
+                            yMax = Math.Max(yMax, maxAnimationError);
+                        }
+
+                        setting = new Tuple<double, double>(yMin - (yMax - yMin) / 6, yMax + (yMax - yMin) / 6);
+                    }
+                    break;
+                case EChartYAxisSetting.IQR:
+                    {
+                        // One window per series serves both statistics.
+                        var frametimes = _localRecordDataServer
+                            .GetFrametimePointTimeWindow().Select(pnt => pnt.Y).ToArray();
+                        double iqr = MathNet.Numerics.Statistics.Statistics.InterquartileRange(frametimes);
+                        double median = MathNet.Numerics.Statistics.Statistics.Median(frametimes);
+
+                        double gpuActiveIqr = double.MinValue;
+                        double gpuActiveMedian = double.MinValue;
+                        double cpuActiveIqr = double.MinValue;
+                        double cpuActiveMedian = double.MinValue;
+
+                        if (GetIsGpuActiveChartAvailable() && ShowGpuActiveChart)
+                        {
+                            var gpuActiveTimes = _localRecordDataServer
+                                .GetGpuActiveTimePointTimeWindow().Select(pnt => pnt.Y).ToArray();
+                            gpuActiveIqr = MathNet.Numerics.Statistics.Statistics.InterquartileRange(gpuActiveTimes);
+                            gpuActiveMedian = MathNet.Numerics.Statistics.Statistics.Median(gpuActiveTimes);
+                        }
+
+                        if (GetIsCpuActiveChartAvailable() && ShowCpuActiveChart)
+                        {
+                            var cpuActiveTimes = _localRecordDataServer
+                                .GetCpuActiveTimePointTimeWindow().Select(pnt => pnt.Y).ToArray();
+                            cpuActiveIqr = MathNet.Numerics.Statistics.Statistics.InterquartileRange(cpuActiveTimes);
+                            cpuActiveMedian = MathNet.Numerics.Statistics.Statistics.Median(cpuActiveTimes);
+                        }
+
+                        double maxMedian = Math.Max(Math.Max(median, gpuActiveMedian), cpuActiveMedian);
+                        double maxIqr = Math.Max(Math.Max(iqr, gpuActiveIqr), cpuActiveIqr);
+
+                        var animBounds = GetAnimationErrorBounds();
+                        double yMin = Math.Min(maxMedian - 4 * maxIqr, animBounds.Min);
+                        double yMax = Math.Max(maxMedian + 6 * maxIqr, animBounds.Max);
+                        setting = new Tuple<double, double>(yMin, yMax);
+                    }
+                    break;
+                case EChartYAxisSetting.Zero_Ten:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 10);
+                    break;
+                case EChartYAxisSetting.Zero_Twenty:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 20);
+                    break;
+                case EChartYAxisSetting.Zero_Thirty:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 30);
+                    break;
+                case EChartYAxisSetting.Zero_Forty:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 40);
+                    break;
+                case EChartYAxisSetting.Zero_Sixty:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 60);
+                    break;
+                case EChartYAxisSetting.Zero_Eighty:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 80);
+                    break;
+                case EChartYAxisSetting.Zero_Hundred:
+                    setting = new Tuple<double, double>(Math.Min(0, GetAnimationErrorBounds().Min), 100);
+                    break;
+            }
+
+            return setting;
+        }
+
+        private (double Min, double Max) GetAnimationErrorBounds()
+        {
+            if (!IsAnimationErrorAvailable || !ShowAnimationError
+                || _localRecordDataServer?.CurrentSession == null)
+                return (double.PositiveInfinity, double.NegativeInfinity);
+
+            var min = _localRecordDataServer.CurrentSession.Runs.Min(run =>
+                run.CaptureData.AnimationError.Where(x => !double.IsNaN(x)).DefaultIfEmpty(0).Min());
+            var max = _localRecordDataServer.CurrentSession.Runs.Max(run =>
+                run.CaptureData.AnimationError.Where(x => !double.IsNaN(x)).DefaultIfEmpty(0).Max());
+            return (min, max);
+        }
+
+        private void SetChartUpdateFlags(bool frametimes = true, bool fps = true, bool distribution = true)
+        {
+            if(frametimes)
+            _isFrametimeChartDirty = true;
+            if(fps)
+            _isFpsChartDirty = true;
+            if(distribution)
+            _isDistributionChartDirty = true;
+        }
+
+
+        public void OnStutteringOptionsChanged()
+        {
+            DemandUpdateCharts();
+        }
+
+        public void OnRangeSliderDragCompleted()
+        {
+            if (FirstSeconds > LastSeconds || FirstSeconds < 0)
+                FirstSeconds = 0;
+
+            if (LastSeconds > MaxRecordingTime || LastSeconds <= 0)
+                LastSeconds = MaxRecordingTime;
+
+            SetChartUpdateFlags();
+
+            if (!AnalysisRangeSliderRealTime)
+            {
+                RealTimeUpdateCharts();
+                UpdateSecondaryCharts();
+            }
+
+            DemandUpdateCharts();
+        }
+
+        public void OnNavigatedTo(NavigationContext navigationContext)
+        {
+            _useUpdateSession = true;
+            if (_session == null || _session?.Hash != _previousSession?.Hash)
+            {
+                try
+                {
+                    UpdateAnalysisPage();
+                }
+                catch
+                { return; }
+            }
+        }
+
+        public bool IsNavigationTarget(NavigationContext navigationContext)
+        {
+            return true;
+        }
+
+        public void OnNavigatedFrom(NavigationContext navigationContext)
+        {
+            _previousSession = _session;
+            _useUpdateSession = false;
+        }
+    }
+}

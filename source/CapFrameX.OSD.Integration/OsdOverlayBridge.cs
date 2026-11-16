@@ -1,0 +1,708 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reactive.Linq;
+using System.Threading;
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.OSD.Interop;
+using Serilog;
+
+namespace CapFrameX.OSD.Integration
+{
+    /// <summary>
+    /// Drives the hook-free DWM/DirectComposition overlay from CapFrameX's existing data,
+    /// as an alternative to RTSS:
+    ///  - entries come from <c>IOverlayService.CurrentOverlayEntries</c> — the processed,
+    ///    SORTED, value-populated display list (the same one RTSS renders);
+    ///    OnDictionaryUpdated fires once that list has been refreshed,
+    ///  - per-present frametimes and display times (MsBetweenDisplayChange) from the
+    ///    capture service's frame-data stream → batched PushSample,
+    ///  - runs while the user selected the hook-free overlay
+    ///    (<c>IAppConfiguration.EnableHookFreeOverlay</c>) and the overlay is active. It stands in
+    ///    for the in-game overlay only where that can never draw (anti-cheat, blacklist,
+    ///    Direct3D 9, see <c>HookOverlayManager.HookFreeFallbackStream</c>), never for an in-game
+    ///    overlay that merely failed; RTSS is gated off in OverlayService for both hook modes, so
+    ///    the renderers never overlap,
+    ///  - is only VISIBLE while the capture process list has at least one entry: a desktop
+    ///    overlay with nothing to measure would otherwise sit on an empty desktop. The overlay
+    ///    hotkey keeps toggling <c>IsOverlayActive</c>, which can hide the overlay at any time
+    ///    but cannot show it past this gate.
+    /// </summary>
+    public sealed class OsdOverlayBridge : IDisposable
+    {
+        private readonly IOverlayService _overlayService;
+        private readonly OsdHost _osd;
+        private readonly IDisposable _activeSub;
+        private readonly IDisposable _entriesSub;
+        private IDisposable _frameSub;
+        private readonly IDisposable _enabledSub;
+        private readonly IDisposable _fallbackSub;
+        private readonly IDisposable _valueSmoothingSub;
+        private readonly IDisposable _replayBufferSub;
+        private readonly IDisposable _hookFreeRefreshRateSub;
+        private readonly IDisposable _displaySub;
+        private readonly IDisposable _backgroundOpacitySub;
+        private readonly IDisposable _zoomSub;
+        private readonly IDisposable _resolutionScalingSub;
+        private readonly IDisposable _fontFamilySub;
+        private readonly OverlayDesignRuntimePublisher _designRuntime;
+        private readonly IDisposable _designSub;
+        private readonly object _designGate = new object();
+        private ulong _lastDesignRevision, _lastDesignMetricsRevision;
+        private bool _customDesignLoaded;
+        // OsdDebug.json asks for the former feed cadence (HookFreeDesignFeed.AppliesEverySnapshot).
+        private volatile bool _designFeedEverySnapshot;
+        private readonly int _ftIndex;
+        private readonly int _runtimeIndex;
+        private readonly int _displayChangedIndex;
+        private readonly int _processIdIndex;
+        private readonly int _swapChainIndex;
+        private readonly int _frameTypeIndex;
+        private readonly int _presentModeIndex;
+        private readonly int _allowsTearingIndex;
+        private readonly HookFreeFeedDiagnostics _feedDiagnostics;
+        private readonly IObservable<string[]> _frameDataStream;
+        private readonly bool _filterFrameRowsByTarget;
+        private readonly IDisposable _targetPidSub;
+        private readonly IDisposable _processCountSub;
+        private readonly object _frameSubscriptionLock = new object();
+        // StartTimeInMs (CPUStartQPCTimeInMs) sits AFTER the optional PC-latency column, so
+        // its index is layout-dependent — resolve it lazily instead of caching a stale int.
+        private readonly Func<int> _startTimeIndexProvider;
+        private volatile bool _active;
+        private volatile bool _enabled;
+        private volatile bool _fallbackEnabled;
+        private volatile bool _hasProcesses;
+        private volatile bool _started;
+        private int _targetPid;
+        // The present mode of most of a process' recent presents (PresentMon's name) decides how a
+        // hide takes the window out of the picture (HookFreeHideMethods); null without a process
+        // list or recent presents.
+        private readonly Func<int, string> _presentModeOfProcess;
+        // Null until the first visibility is applied, so the first hide also chooses its method.
+        private bool? _lastShown;
+
+        // Sets the native hide method; a test seam, the native core in production.
+        internal Func<HookFreeHideMethod, bool> ApplyHideMethod { get; set; } = HookFreeHideMethods.Apply;
+
+        // The PresentMon row stream can run hundreds or thousands of times per second. Keep the
+        // bridge completely out of that path unless the current layout actually needs one of its
+        // graphs. Scalar values and runtime labels already arrive in the shared entries, so a
+        // numeric-only profile does not need another frame subscription here. A hidden overlay
+        // keeps the feed: shown again, its charts continue on the current window (the native core
+        // re-anchors its replay at the show) instead of playing the samples from before the hide
+        // and then jumping over the gap.
+        private const int NeedFrametimeGraph = 1 << 0;
+        private const int NeedDisplayTimeGraph = 1 << 1;
+        private int _frameFeedRequirements;
+        // Retained only to report runtime changes in the graph-feed diagnostics.
+        private volatile string _lastDiagnosticRuntime;
+
+        // Last background opacity forwarded to the OSD (percent); -1 forces the first push.
+        private readonly IAppConfiguration _appConfiguration;
+        private int _lastBgOpacity = -1;
+        // Last zoom forwarded to the OSD (percent); -1 forces the first push.
+        private int _lastZoom = -1;
+        // Last placement forwarded; -1 forces the first push after a (re)start.
+        private int _lastAnchor = -1, _lastMonitor = -1, _lastMarginX = -1, _lastMarginY = -1;
+        private readonly object _positionLock = new object();
+        private readonly OverlayPixelOrbitResolver _pixelOrbit;
+
+        public OsdOverlayBridge(IOverlayService overlayService,
+                                IAppConfiguration appConfiguration,
+                                IObservable<string[]> frameDataStream = null,
+                                int frametimeColumnIndex = -1,
+                                int presentRuntimeColumnIndex = -1,
+                                int displayChangedColumnIndex = -1,
+                                Func<int> startTimeIndexProvider = null,
+                                IObservable<int> processIdStream = null,
+                                int processIdColumnIndex = -1,
+                                int swapChainColumnIndex = -1,
+                                int frameTypeColumnIndex = -1,
+                                int presentModeColumnIndex = -1,
+                                int allowsTearingColumnIndex = -1,
+                                IObservable<int> processCountStream = null,
+                                OverlayDesignRuntimePublisher designRuntime = null,
+                                OverlayPixelOrbitResolver pixelOrbit = null,
+                                IObservable<bool> hookFreeFallbackStream = null,
+                                Func<int, string> presentModeOfProcess = null)
+        {
+            if (overlayService == null) throw new ArgumentNullException(nameof(overlayService));
+            if (appConfiguration == null) throw new ArgumentNullException(nameof(appConfiguration));
+            if (processIdStream != null && processIdColumnIndex < 0)
+                throw new ArgumentOutOfRangeException(nameof(processIdColumnIndex));
+            if (processIdStream == null && processIdColumnIndex >= 0)
+                throw new ArgumentNullException(nameof(processIdStream));
+
+            _overlayService = overlayService;
+            _appConfiguration = appConfiguration;
+            _designRuntime = designRuntime;
+            _pixelOrbit = pixelOrbit;
+            _presentModeOfProcess = presentModeOfProcess;
+            // Seeded from the configuration so the very first frame is already placed correctly;
+            // OnEntries keeps it in sync from there.
+            _osd = new OsdHost((OsdAnchor)appConfiguration.OsdAnchor,
+                marginX: appConfiguration.OsdMarginX, marginY: appConfiguration.OsdMarginY,
+                monitor: DisplayMonitorResolver.GetMonitorIndex(
+                    appConfiguration.HookFreeDisplayDeviceName));
+            // Stall diagnostics (Extended OSD logging only): the render loop reports its own stalls
+            // (managed side, GC), the feed diagnostics report what the PresentMon stream delivered.
+            // Both land in CapFrameX.log next to the native "[diag]" lines in %TEMP%\cfx-osd-logs\cfx_osd.log.
+            _osd.Diagnostic += message => Log.Information("HookFree OSD: {Message}", message);
+            _feedDiagnostics = new HookFreeFeedDiagnostics(
+                message => Log.Information("HookFree feed: {Message}", message));
+            ApplyDiagnosticsSwitch();
+            _ftIndex = frametimeColumnIndex;
+            _runtimeIndex = presentRuntimeColumnIndex;
+            _displayChangedIndex = displayChangedColumnIndex;
+            _processIdIndex = processIdColumnIndex;
+            _swapChainIndex = swapChainColumnIndex;
+            _frameTypeIndex = frameTypeColumnIndex;
+            _presentModeIndex = presentModeColumnIndex;
+            _allowsTearingIndex = allowsTearingColumnIndex;
+            _frameDataStream = frameDataStream;
+            _startTimeIndexProvider = startTimeIndexProvider;
+            _filterFrameRowsByTarget = processIdStream != null;
+            _enabled = appConfiguration.EnableHookFreeOverlay;
+            _osd.SetValueSmoothing(appConfiguration.UseOsdValueSmoothing);
+            _osd.SetReplayBuffer(appConfiguration.OsdReplayBufferSize);
+            _osd.SetHookFreeRefreshRate(appConfiguration.HookFreeRefreshRate);
+            // Retained by OsdHost while stopped, so unlike the zoom it needs no retry on data ticks.
+            _osd.SetReferenceHeight(ReferenceHeight(appConfiguration.OsdScaleWithResolution));
+            // Retained the same way; only the classic layout uses it, designs keep their fonts.
+            _osd.SetFontFamily(appConfiguration.OsdFontFamily);
+
+            // FrameDataStream contains rows for every ETW process. Capture the selected game's PID
+            // before activating the feed so foreign desktop/process rows cannot alter its graph
+            // timeline or diagnostics.
+            if (_filterFrameRowsByTarget)
+                _targetPidSub = processIdStream
+                    .DistinctUntilChanged()
+                    .Subscribe(OnTargetPidChanged);
+
+            // Without a process list there is nothing to gate on. Subscribed before the active
+            // stream so its replayed state never shows the overlay ahead of the first count.
+            _hasProcesses = processCountStream == null;
+            if (processCountStream != null)
+                _processCountSub = processCountStream
+                    .Select(count => count > 0)
+                    .DistinctUntilChanged()
+                    .Subscribe(OnHasProcessesChanged);
+
+            _activeSub =overlayService.IsOverlayActiveStream.Subscribe(OnActiveChanged);
+            _entriesSub = overlayService.OnDictionaryUpdated.Subscribe(_ => OnEntries());
+            _enabledSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.EnableHookFreeOverlay))
+                .Subscribe(x => OnEnabledChanged((bool)x.value));
+            if (hookFreeFallbackStream != null)
+                _fallbackSub = hookFreeFallbackStream
+                    .DistinctUntilChanged()
+                    .Subscribe(OnFallbackChanged);
+            _valueSmoothingSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.UseOsdValueSmoothing))
+                .Subscribe(x => _osd.SetValueSmoothing((bool)x.value));
+            _replayBufferSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OsdReplayBufferSize))
+                .Subscribe(x => _osd.SetReplayBuffer((int)x.value));
+            _hookFreeRefreshRateSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.HookFreeRefreshRate))
+                .Subscribe(x => _osd.SetHookFreeRefreshRate((int)x.value));
+            _displaySub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.HookFreeDisplayDeviceName))
+                .Subscribe(_ => ApplyPosition());
+            _backgroundOpacitySub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OsdBackgroundOpacity))
+                .Subscribe(_ => ApplyBackgroundOpacity());
+            _zoomSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OsdZoom))
+                .Subscribe(_ => ApplyZoom());
+            _resolutionScalingSub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OsdScaleWithResolution))
+                .Subscribe(x => _osd.SetReferenceHeight(ReferenceHeight((bool)x.value)));
+            _fontFamilySub = appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OsdFontFamily))
+                .Subscribe(x => _osd.SetFontFamily(x.value as string));
+            if (_designRuntime != null)
+                _designSub = _designRuntime.Snapshots.Subscribe(snapshot =>
+                {
+                    UpdateFrameFeedRequirements(_overlayService.CurrentOverlayEntries);
+                    // A new, changed or removed design is applied at once; values alone wait for
+                    // the OSD refresh (OnEntries), see HookFreeDesignFeed.
+                    ApplyDesignSnapshot(snapshot, HookFreeDesignTrigger.Snapshot);
+                });
+        }
+
+        /// <summary>Configure the fixed overlay position (call from CapFrameX settings UI).</summary>
+        public void SetPosition(OsdAnchor anchor, int monitor, int marginX, int marginY)
+            => _osd.SetPosition(anchor, monitor, marginX, marginY);
+
+        private void OnActiveChanged(bool active) { _active = active; UpdateRunState(); }
+        private void OnEnabledChanged(bool enabled) { _enabled = enabled; UpdateRunState(); }
+        private void OnFallbackChanged(bool fallback) { _fallbackEnabled = fallback; UpdateRunState(); }
+        private void OnHasProcessesChanged(bool hasProcesses) { _hasProcesses = hasProcesses; UpdateRunState(); }
+
+        private bool IsVisible => IsShown(_enabled, _fallbackEnabled, _active, _hasProcesses);
+
+        // The renderer exists while the hook-free mode is selected or stands in for the in-game
+        // renderer (anti-cheat, blacklist, Direct3D 9).
+        internal static bool Exists(bool enabled, bool fallback) => enabled || fallback;
+
+        // An empty process list hides exactly like the overlay hotkey does: a soft-hide.
+        internal static bool IsShown(bool enabled, bool fallback, bool active, bool hasProcesses)
+            => active && hasProcesses && Exists(enabled, fallback);
+
+        private void OnTargetPidChanged(int processId)
+        {
+            int targetPid = processId > 0 ? processId : 0;
+            int previousPid = Interlocked.Exchange(ref _targetPid, targetPid);
+            if (previousPid == targetPid)
+            {
+                return;
+            }
+
+            _feedDiagnostics.OnTargetPidChanged(previousPid, targetPid, HookFreeFeedDiagnostics.Now());
+            _lastDiagnosticRuntime = null;
+        }
+
+        private void UpdateRunState()
+        {
+            // Two-level lifecycle: the renderer EXISTS while the hook-free mode is selected or
+            // stands in, and mere visibility toggles (IsOverlayActive — capture auto-disable,
+            // overlay hotkey — or an empty process list) are soft-hides that keep the window.
+            // Tearing the window down instead stalls the game's presentation path (measured 20-70 ms
+            // display hitches from the multi-stage DWM re-evaluation, including a delayed one
+            // seconds later). How a soft hide takes the window out of the picture follows the
+            // target's present mode (ChooseHideMethod).
+            bool exist = Exists(_enabled, _fallbackEnabled);
+            bool visible = IsVisible;
+
+            if (exist && !_started)
+            {
+                ApplyPosition(force: true);
+                UpdateFrameFeedRequirements(_overlayService.CurrentOverlayEntries);
+                ApplyDiagnosticsSwitch(); // applied natively right after the instance is created
+                _designFeedEverySnapshot = HookFreeDesignFeed.AppliesEverySnapshot();
+                _osd.Start();
+                _started = true;
+                UpdateFrameSubscription(running: true);
+                // Start creates the native handle asynchronously. These calls apply immediately
+                // if it is ready; otherwise OnEntries retries without poisoning the caches.
+                ApplyBackgroundOpacity();
+                ApplyZoom();
+            }
+
+            if (!_started) return;
+
+            if (!exist)
+            {
+                StopOsd();
+                return;
+            }
+
+            if (!visible && _lastShown != false)
+                ChooseHideMethod();
+            if (visible && _lastShown == false)
+            {
+                // The native core reads its repaint mode again at a show, so an A/B run switches
+                // both by hiding and showing the overlay. The values that waited for a refresh
+                // while the overlay was hidden are due now: it is shown with what is known.
+                _designFeedEverySnapshot = HookFreeDesignFeed.AppliesEverySnapshot();
+                ApplyDesignSnapshot(_designRuntime?.Current, HookFreeDesignTrigger.Refresh);
+            }
+            _lastShown = visible;
+            // Old prebuilt core without the hidden API: fall back to the historic full stop.
+            if (!_osd.SetHidden(!visible) && !visible)
+                StopOsd();
+        }
+
+        // Right before a hide: a target on a plane of its own is hidden by an empty frame, which
+        // keeps the window composed and spares it DWM's plane reassignment; anything else is cloaked.
+        private void ChooseHideMethod()
+        {
+            int targetPid = Volatile.Read(ref _targetPid);
+            string presentMode = null;
+            if (targetPid > 0 && _presentModeOfProcess != null)
+            {
+                try { presentMode = _presentModeOfProcess(targetPid); }
+                catch (Exception ex) { Log.Debug(ex, "HookFree OSD: present mode of pid {pid} unavailable", targetPid); }
+            }
+
+            HookFreeHideMethod method = HookFreeHideMethods.Choose(presentMode);
+            bool applied = ApplyHideMethod(method);
+            Log.Information("HookFree OSD: hides by {method}; pid {pid} presents {presentMode}",
+                applied ? method.ToString() : "Cloak (the native core has no hide methods)",
+                targetPid, presentMode ?? "nothing known");
+        }
+
+        private void StopOsd()
+        {
+            lock (_designGate)
+            {
+                _osd.Stop();
+                _started = false;
+                _lastShown = null;
+                _lastDesignRevision = 0;
+                _lastDesignMetricsRevision = 0;
+                _customDesignLoaded = false;
+            }
+            _lastBgOpacity = -1; // Stop destroys the native handle; re-feed on next start
+            _lastZoom = -1;
+            _lastAnchor = -1; _lastMonitor = -1; _lastMarginX = -1; _lastMarginY = -1;
+            _lastDiagnosticRuntime = null;
+            Interlocked.Exchange(ref _frameFeedRequirements, 0);
+            UpdateFrameSubscription(running: false);
+        }
+
+        private void OnEntries()
+        {
+            // Entries keep flowing with the overlay switched off while a remote API client reads
+            // them (IRemoteOverlayDemand). The switched-off renderer does not need them.
+            if (!_started || !_active) return;
+            // OnDictionaryUpdated is published after this processed display list is ready.
+            var entries = _overlayService.CurrentOverlayEntries;
+            UpdateFrameFeedRequirements(entries);
+            ApplyDesignSnapshot(_designRuntime?.Current, HookFreeDesignTrigger.Refresh);
+            // An empty profile must clear a linked classic block as well as a standalone overlay.
+            var list = OverlayEntryAdapter.ToOsdEntries(entries,
+                _appConfiguration.UseRunHistory,
+                _overlayService.RunHistory,
+                _overlayService.RunHistoryOutlierFlags,
+                _overlayService.RunHistoryAggregation);
+
+            ApplyBackgroundOpacity();
+            ApplyZoom();
+
+            ApplyPosition();
+
+            _osd.UpdateEntries(list);
+
+            // The OSD refresh (~1 Hz) doubles as the diagnostics heartbeat: follow the "Extended OSD
+            // logging" switch live and flush a due feed summary even when no rows arrive.
+            ApplyDiagnosticsSwitch();
+            _feedDiagnostics.Tick(HookFreeFeedDiagnostics.Now());
+        }
+
+        /// <summary>
+        /// Propagates the "Extended OSD logging" switch to every diagnostics consumer: the managed
+        /// render-loop monitor, the native core (via the host) and the feed diagnostics.
+        /// ExtendedOsdLoggingController mirrors the OsdDebug.json verboseLog flag into this process
+        /// environment variable when the user toggles the option.
+        /// </summary>
+        private void ApplyDiagnosticsSwitch()
+        {
+            bool enabled = Environment.GetEnvironmentVariable("CFX_OSD_VERBOSE_LOG") == "1";
+            _osd.VerboseDiagnostics = enabled;
+            _feedDiagnostics.Enabled = enabled;
+        }
+
+        private void UpdateFrameFeedRequirements(IEnumerable<IOverlayEntry> entries)
+        {
+            Interlocked.Exchange(ref _frameFeedRequirements,
+                GetFrameFeedRequirements(_designRuntime?.Current.Design, entries));
+            UpdateFrameSubscription(running: true);
+        }
+
+        internal static int GetFrameFeedRequirements(OverlayRuntimeDesign design, IEnumerable<IOverlayEntry> entries)
+        {
+            int requirements = 0;
+            if (design != null)
+            {
+                if (design.NeedsFrametimes) requirements |= NeedFrametimeGraph;
+                if (design.NeedsDisplayTimes) requirements |= NeedDisplayTimeGraph;
+            }
+            if ((design == null || design.HasClassicRows) && entries != null)
+            {
+                foreach (var entry in entries)
+                {
+                    if (entry == null || !entry.IsEntryEnabled || !entry.ShowOnOverlay || !entry.ShowGraph)
+                    {
+                        continue;
+                    }
+
+                    switch (entry.Identifier)
+                    {
+                        case "Framerate":
+                        case "Frametime":
+                            // FPS and frametime graphs share the timestamped frametime feed.
+                            requirements |= NeedFrametimeGraph;
+                            break;
+                        case "DisplayTime":
+                            requirements |= NeedDisplayTimeGraph;
+                            break;
+                    }
+                }
+            }
+
+            return requirements;
+        }
+
+        private void ApplyDesignSnapshot(OverlayDesignRuntimeSnapshot snapshot, HookFreeDesignTrigger trigger)
+        {
+            if (!_started || !_osd.IsRunning || snapshot == null) return;
+            bool rejected = false;
+            lock (_designGate)
+            {
+                if (!_started || !_osd.IsRunning) return;
+                bool metricsChanged = snapshot.MetricsRevision != _lastDesignMetricsRevision;
+                HookFreeDesignUpdate update = HookFreeDesignFeed.Decide(trigger, snapshot.Design != null,
+                    _customDesignLoaded, snapshot.DesignRevision != _lastDesignRevision, metricsChanged,
+                    _designFeedEverySnapshot);
+                // Values of the loaded design that stay with the publisher until the refresh.
+                bool waits = update == HookFreeDesignUpdate.None && snapshot.Design != null &&
+                    _customDesignLoaded && snapshot.DesignRevision == _lastDesignRevision && metricsChanged;
+                _feedDiagnostics.OnDesignFeed(trigger, update, waits);
+                if (update == HookFreeDesignUpdate.None) return;
+                if (update == HookFreeDesignUpdate.Clear)
+                {
+                    _osd.ClearTemplate();
+                    _customDesignLoaded = false;
+                    _lastDesignRevision = 0;
+                    _lastDesignMetricsRevision = 0;
+                    var entries = OverlayEntryAdapter.ToOsdEntries(_overlayService.CurrentOverlayEntries,
+                        _appConfiguration.UseRunHistory, _overlayService.RunHistory,
+                        _overlayService.RunHistoryOutlierFlags, _overlayService.RunHistoryAggregation);
+                    _osd.UpdateEntries(entries);
+                    return;
+                }
+                bool newDesign = update == HookFreeDesignUpdate.Template;
+                if (!_osd.ApplyDesignJson(newDesign ? snapshot.Design.TemplateJson : null, snapshot.MetricsJson))
+                {
+                    rejected = true;
+                }
+                else
+                {
+                    _customDesignLoaded = true;
+                    _lastDesignRevision = snapshot.DesignRevision;
+                    _lastDesignMetricsRevision = snapshot.MetricsRevision;
+                    if (newDesign)
+                    {
+                        _lastBgOpacity = -1;
+                        _lastZoom = -1;
+                        ApplyPosition(force: true);
+                        ApplyBackgroundOpacity();
+                        ApplyZoom();
+                    }
+                }
+            }
+            if (rejected)
+                _designRuntime.ReportRendererError(new LocalizedText("OverlayDesignStatus_RendererRejected"));
+            else
+                _designRuntime.ReportRendererReady();
+        }
+
+        // While the renderer runs, visible or hidden, and its layout draws a graph.
+        private void UpdateFrameSubscription(bool running)
+        {
+            bool shouldSubscribe = running && _started && _frameDataStream != null &&
+                _ftIndex >= 0 && Volatile.Read(ref _frameFeedRequirements) != 0;
+            lock (_frameSubscriptionLock)
+            {
+                if (shouldSubscribe)
+                {
+                    if (_frameSub == null)
+                    {
+                        _frameSub = _frameDataStream.Subscribe(OnFrameRow);
+                    }
+                }
+                else
+                {
+                    _frameSub?.Dispose();
+                    _frameSub = null;
+                }
+            }
+        }
+
+        private void ApplyPosition(bool force = false)
+        {
+            int anchor = _appConfiguration.OsdAnchor;
+            // The native API consumes the raw EnumDisplayMonitors index, whereas the setting
+            // stores the stable Windows device name exposed in the UI.
+            int monitor = DisplayMonitorResolver.GetMonitorIndex(
+                _appConfiguration.HookFreeDisplayDeviceName);
+            int marginX = _appConfiguration.OsdMarginX;
+            int marginY = _appConfiguration.OsdMarginY;
+            // A pixel orbit step is a single window move per interval, never an animation:
+            // continuously moving overlay windows cost the game's lows.
+            if (_pixelOrbit != null)
+                (marginX, marginY) = _pixelOrbit.Apply(marginX, marginY);
+
+            lock (_positionLock)
+            {
+                if (!force && anchor == _lastAnchor && monitor == _lastMonitor &&
+                    marginX == _lastMarginX && marginY == _lastMarginY)
+                {
+                    return;
+                }
+
+                _lastAnchor = anchor;
+                _lastMonitor = monitor;
+                _lastMarginX = marginX;
+                _lastMarginY = marginY;
+                _osd.SetPosition((OsdAnchor)anchor, monitor, marginX, marginY);
+            }
+        }
+
+        private void ApplyBackgroundOpacity()
+        {
+            int bgOpacity = Math.Max(0, Math.Min(100,
+                _appConfiguration.OsdBackgroundOpacity));
+            if (!_osd.IsRunning || bgOpacity == _lastBgOpacity)
+            {
+                return;
+            }
+
+            _osd.SetBackgroundAlpha(bgOpacity / 100.0);
+            // SetBackgroundAlpha is a no-op until the asynchronous native handle exists. Only
+            // cache the value after IsRunning confirms that the call could reach that handle.
+            _lastBgOpacity = bgOpacity;
+        }
+
+        private void ApplyZoom()
+        {
+            int zoom = Math.Max(50, Math.Min(200, _appConfiguration.OsdZoom));
+            if (!_osd.IsRunning || zoom == _lastZoom)
+            {
+                return;
+            }
+
+            _osd.SetZoom(zoom / 100.0);
+            // Like the opacity API, SetZoom does not retain values while OsdHost is stopped.
+            // Keep retrying on data ticks until the native renderer is actually available.
+            _lastZoom = zoom;
+        }
+
+        // The hook-free window follows the height of the monitor it is pinned to.
+        private static int ReferenceHeight(bool scaleWithResolution)
+            => scaleWithResolution ? OsdHost.DesignReferenceHeight : 0;
+
+        private void OnFrameRow(string[] row)
+        {
+            if (!_started || row == null || _ftIndex < 0 || row.Length <= _ftIndex) return;
+
+            int targetPid = 0;
+            if (_filterFrameRowsByTarget)
+            {
+                targetPid = Volatile.Read(ref _targetPid);
+                if (!PresentMonFrameFilter.IsForTargetProcess(
+                    row, _processIdIndex, targetPid))
+                {
+                    if (Volatile.Read(ref _frameFeedRequirements) != 0)
+                    {
+                        int.TryParse(row[_processIdIndex], NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out int rowPid);
+                        _feedDiagnostics.OnRowRejected(rowPid, targetPid, HookFreeFeedDiagnostics.Now());
+                    }
+                    return;
+                }
+            }
+
+            int requirements = Volatile.Read(ref _frameFeedRequirements);
+            if (requirements == 0) return;
+
+            // Runtime is read only for graph-feed diagnostics; display labels come from entries.
+            string runtime = null;
+            if (_runtimeIndex >= 0 && row.Length > _runtimeIndex)
+            {
+                runtime = row[_runtimeIndex]?.Trim();
+                if (!string.IsNullOrEmpty(runtime) && runtime != "<error>")
+                {
+                    string previousRuntime = _lastDiagnosticRuntime;
+                    if (!string.Equals(previousRuntime, runtime, StringComparison.Ordinal))
+                    {
+                        _lastDiagnosticRuntime = runtime;
+                        _feedDiagnostics.OnRuntimeLabelChanged(previousRuntime, runtime,
+                            HookFreeFeedDiagnostics.Now());
+                    }
+                }
+            }
+
+            bool needFrametimeSample = (requirements & NeedFrametimeGraph) != 0;
+            bool needDisplayTimeSample = (requirements & NeedDisplayTimeGraph) != 0;
+            if (!needFrametimeSample && !needDisplayTimeSample) return;
+
+            double ms = 0;
+            bool hasFrametimeSample = needFrametimeSample &&
+                double.TryParse(row[_ftIndex], NumberStyles.Any, CultureInfo.InvariantCulture, out ms) &&
+                ms > 0 && ms < 10000;
+
+            // per-present sample for the frametime graph, timestamped with StartTimeInMs
+            // (QPC ms) so the renderer replays the bursty stream smoothly over the window
+            double t = 0;
+            bool needGraphSample = (requirements &
+                (NeedFrametimeGraph | NeedDisplayTimeGraph)) != 0;
+            int startIdx = needGraphSample ? _startTimeIndexProvider?.Invoke() ?? -1 : -1;
+            bool hasTimestamp = needGraphSample && startIdx >= 0 && row.Length > startIdx &&
+                double.TryParse(row[startIdx], NumberStyles.Any, CultureInfo.InvariantCulture, out t) && t > 0;
+            // Display time (MsBetweenDisplayChange) for the "Displaytime" graph: same
+            // buffer + replay path as the frametimes. Dropped frames report 0 and are
+            // skipped, so only frames that actually reached the display produce a sample.
+            double dc = 0;
+            bool hasDisplaySample =
+                needDisplayTimeSample && _displayChangedIndex >= 0 && row.Length > _displayChangedIndex &&
+                double.TryParse(row[_displayChangedIndex], NumberStyles.Any, CultureInfo.InvariantCulture, out dc)
+                && dc > 0 && dc < 10000;
+
+            // A target switch can race an in-flight PresentMon callback. Drop the parsed row before
+            // publishing if its selection generation changed meanwhile.
+            if (_filterFrameRowsByTarget && targetPid != Volatile.Read(ref _targetPid)) return;
+
+            _feedDiagnostics.OnRowAccepted(
+                _swapChainIndex >= 0 && row.Length > _swapChainIndex ? row[_swapChainIndex] : null,
+                runtime,
+                _frameTypeIndex >= 0 && row.Length > _frameTypeIndex ? row[_frameTypeIndex] : null,
+                _presentModeIndex >= 0 && row.Length > _presentModeIndex ? row[_presentModeIndex] : null,
+                _allowsTearingIndex >= 0 && row.Length > _allowsTearingIndex ? row[_allowsTearingIndex] : null,
+                hasFrametimeSample ? ms : 0.0, hasTimestamp ? t : 0.0, hasDisplaySample ? dc : 0.0,
+                HookFreeFeedDiagnostics.Now());
+
+            bool pushFrametimeGraph = (requirements & NeedFrametimeGraph) != 0 &&
+                hasFrametimeSample;
+            bool pushDisplayTimeGraph = (requirements & NeedDisplayTimeGraph) != 0 &&
+                hasDisplaySample;
+            if (hasTimestamp && pushFrametimeGraph && pushDisplayTimeGraph)
+            {
+                // Queue the complete PresentMon row once. OsdHost drains all rows collected
+                // during a render slice through cfx_osd_push_samples, allowing the native replay
+                // clock to measure delivery waves and preventing per-row P/Invoke/mutex traffic.
+                _osd.PushSample(t, ms, dc);
+            }
+            else if (hasTimestamp && pushFrametimeGraph)
+            {
+                _osd.PushFrame(t, ms);
+            }
+            else if (hasTimestamp && pushDisplayTimeGraph)
+            {
+                _osd.PushDisplayChange(t, dc);
+            }
+            else if (!hasTimestamp)
+            {
+                // No source timestamp is available: retain the legacy synthetic timelines.
+                if (pushFrametimeGraph) _osd.PushFrametime(ms);
+                if (pushDisplayTimeGraph) _osd.PushDisplayTime(dc);
+            }
+        }
+
+        public void Dispose()
+        {
+            _designSub?.Dispose();
+            _activeSub?.Dispose();
+            _entriesSub?.Dispose();
+            UpdateFrameSubscription(running: false);
+            _enabledSub?.Dispose();
+            _fallbackSub?.Dispose();
+            _valueSmoothingSub?.Dispose();
+            _replayBufferSub?.Dispose();
+            _hookFreeRefreshRateSub?.Dispose();
+            _displaySub?.Dispose();
+            _backgroundOpacitySub?.Dispose();
+            _zoomSub?.Dispose();
+            _resolutionScalingSub?.Dispose();
+            _fontFamilySub?.Dispose();
+            _targetPidSub?.Dispose();
+            _processCountSub?.Dispose();
+            lock (_designGate) _osd?.Dispose();
+        }
+    }
+}

@@ -1,0 +1,817 @@
+﻿using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Contracts.Logging;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Contracts.RTSS;
+using CapFrameX.Contracts.Sensor;
+using CapFrameX.Data.Session.Contracts;
+using CapFrameX.Extensions.NetStandard;
+using CapFrameX.Statistics.NetStandard.Contracts;
+using LibreHardwareMonitor.Hardware;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Reactive;
+using System.Reactive.Concurrency;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CapFrameX.Overlay
+{
+    public class OverlayService : IOverlayService
+    {
+        private readonly object _dictLock = new object();
+
+        private readonly IStatisticProvider _statisticProvider;
+        private readonly IOverlayEntryProvider _overlayEntryProvider;
+        private readonly IAppConfiguration _appConfiguration;
+        private static ILogger<OverlayService> _logger;
+        private readonly IRecordManager _recordManager;
+        private readonly ISensorService _sensorService;
+        private readonly IRTSSService _rTSSService;
+        private readonly IOverlayEntryCore _overlayEntryCore;
+        private readonly ILogEntryManager _logEntryManager;
+        private readonly IRemoteOverlayDemand _remoteOverlayDemand;
+        private readonly IOverlayFrameMetrics _frameMetrics;
+        private readonly EventLoopScheduler _overlayRefreshScheduler;
+
+        private IDisposable _disposableCaptureTimer;
+        private IDisposable _disposableDelayCountdown;
+        private IDisposable _disposableCountdown;
+        private IDisposable _overlayActiveStreamDisposable;
+        private IDisposable _sensorRefreshDisposable;
+
+        private IList<string> _runHistory = new List<string>();
+        private volatile string[] _runHistorySnapshot = Array.Empty<string>();
+        private IList<ISessionRun> _captureDataHistory = new List<ISessionRun>();
+        private IList<IList<double>> _frametimeHistory = new List<IList<double>>();
+        private IList<IList<double>> _displaytimeHistory = new List<IList<double>>();
+        private bool[] _runHistoryOutlierFlags;
+        private volatile bool[] _runHistoryOutlierFlagsSnapshot = Array.Empty<bool>();
+        private volatile string _runHistoryAggregation = string.Empty;
+        private int _numberOfRuns;
+        private IList<IMetricAnalysis> _metricAnalysis = new List<IMetricAnalysis>();
+        private ISubject<IOverlayEntry[]> _onDictionaryUpdated = new Subject<IOverlayEntry[]>();
+        private readonly ISubject<Unit> _refreshRequested = Subject.Synchronize(new Subject<Unit>());
+        private volatile bool _isServiceAlive = true;
+        // Written only by the serialized entry refresh (Concat) when a read fails.
+        private DateTime _lastEntryRefreshFailureLogUtc = DateTime.MinValue;
+        private int _suppressedEntryRefreshFailures;
+
+        public bool IsOverlayActive => _appConfiguration.IsOverlayActive;
+
+        public ISubject<bool> IsOverlayActiveStream { get; }
+
+        public string SecondMetric { get; set; }
+
+        public string ThirdMetric { get; set; }
+
+        public int RunHistoryCount => _runHistory.Count(run => run != "N/A");
+
+        public IReadOnlyList<string> RunHistory => _runHistorySnapshot;
+
+        public IReadOnlyList<bool> RunHistoryOutlierFlags => _runHistoryOutlierFlagsSnapshot;
+
+        public string RunHistoryAggregation => _runHistoryAggregation;
+
+        public IObservable<IOverlayEntry[]> OnDictionaryUpdated => _onDictionaryUpdated;
+
+        public IOverlayEntry[] CurrentOverlayEntries { get; private set; } = Array.Empty<IOverlayEntry>();
+
+        public Action<IOverlayEntry[]> OSDUpdateNotifier { get; set; } = (_) => { };
+
+
+        public OverlayService(IStatisticProvider statisticProvider,
+            ISensorService sensorService,
+            IOverlayEntryProvider overlayEntryProvider,
+            IAppConfiguration appConfiguration,
+            ILogger<OverlayService> logger,
+            IRecordManager recordManager,
+            IRTSSService rTSSService,
+            IOverlayEntryCore overlayEntryCore,
+            ILogEntryManager logEntryManager,
+            IRemoteOverlayDemand remoteOverlayDemand,
+            IOverlayFrameMetrics frameMetrics)
+        {
+            _statisticProvider = statisticProvider;
+            _overlayEntryProvider = overlayEntryProvider;
+            _appConfiguration = appConfiguration;
+            _logger = logger;
+            _recordManager = recordManager;
+            _sensorService = sensorService;
+            _logEntryManager = logEntryManager;
+            _remoteOverlayDemand = remoteOverlayDemand;
+            _frameMetrics = frameMetrics;
+            _rTSSService = rTSSService;
+            _overlayEntryCore = overlayEntryCore;
+            _overlayRefreshScheduler = new EventLoopScheduler(start =>
+            {
+                var thread = new Thread(start)
+                {
+                    IsBackground = true,
+                    Name = "CapFrameX overlay refresh",
+                    Priority = ThreadPriority.BelowNormal
+                };
+                return thread;
+            });
+
+            _numberOfRuns = _appConfiguration.SelectedHistoryRuns;
+            SecondMetric = _appConfiguration.RunHistorySecondMetric;
+            ThirdMetric = _appConfiguration.RunHistoryThirdMetric;
+
+            bool isRTSSInstalled = _rTSSService.IsRTSSInstalled();
+            if (ShouldReplaceUnavailableRtss(isRTSSInstalled, _appConfiguration.OverlayRenderer))
+            {
+                // Do not leave a configuration on a renderer that cannot exist: persist the default
+                // in-game renderer so the UI and every downstream consumer observe the same usable
+                // mode. Explicit in-game, hook-free and Off choices are preserved.
+                _appConfiguration.OverlayRenderer = EOverlayRenderer.InGame;
+                _logger.LogInformation(
+                    "RTSS is not installed. Selecting the CapFrameX in-game overlay as the default renderer.");
+            }
+
+            _logger.LogInformation("Overlay renderer: {renderer}", _appConfiguration.OverlayRenderer);
+
+            bool configuredOverlayActive = _appConfiguration.IsOverlayActive;
+            bool initialOverlayActive = GetInitialOverlayActiveState(
+                configuredOverlayActive,
+                isRTSSInstalled,
+                _appConfiguration.OverlayRenderer);
+
+            if (configuredOverlayActive && !initialOverlayActive)
+            {
+                // Do not retain an active state that no renderer can show — a saved configuration
+                // can still select RTSS where it is absent, or the renderers are switched off:
+                // all consumers of the BehaviorSubject (including StateViewModel) must observe
+                // the same persisted state.
+                _appConfiguration.IsOverlayActive = false;
+                _logger.LogWarning(
+                    "Overlay was configured active, but the selected renderer ({renderer}) cannot show it. Disabling the overlay.",
+                    _appConfiguration.OverlayRenderer);
+            }
+
+            IsOverlayActiveStream = new BehaviorSubject<bool>(initialOverlayActive);
+            _runHistoryOutlierFlags = Enumerable.Repeat(false, _numberOfRuns).ToArray();
+
+            _logger.LogDebug("{componentName} Ready", this.GetType().Name);
+
+            var overlayOnAPIOnly = _appConfiguration.HideOverlay;
+            _appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.HideOverlay))
+                .Select(x => (bool)x.value)
+                .Subscribe(hideOSD =>
+                {
+                    overlayOnAPIOnly = hideOSD;
+                    if (hideOSD)
+                        _rTSSService.ReleaseOSD();
+                });
+
+            // Overlay-renderer switch (RTSS / in-game hook / hook-free / off). The configuration
+            // raises the renderer key first and each changed flag after it, all once the new
+            // selection is in place; DistinctUntilChanged turns that into one reaction per switch.
+            EOverlayRenderer previousRenderer = _appConfiguration.OverlayRenderer;
+            _appConfiguration.OnValueChanged
+                .Where(x => x.key == nameof(IAppConfiguration.OverlayRenderer)
+                         || x.key == nameof(IAppConfiguration.EnableHookFreeOverlay)
+                         || x.key == nameof(IAppConfiguration.EnableHookOverlay))
+                .Select(_ => _appConfiguration.OverlayRenderer)
+                .DistinctUntilChanged()
+                .Subscribe(renderer =>
+                {
+                    bool wasRtss = previousRenderer == EOverlayRenderer.Rtss;
+                    previousRenderer = renderer;
+                    UpdateFrameMetricsDemand();
+                    RequestRefresh();
+                    _logger.LogInformation("Overlay renderer switch: {renderer}, overlayActive={a}",
+                        renderer, _appConfiguration.IsOverlayActive);
+                    if (renderer == EOverlayRenderer.Off)
+                    {
+                        // Nothing may render any more. Switching the overlay off releases RTSS
+                        // through the feed below, and every toggle follows the stream.
+                        if (_appConfiguration.IsOverlayActive && _isServiceAlive)
+                        {
+                            _appConfiguration.IsOverlayActive = false;
+                            IsOverlayActiveStream.OnNext(false);
+                        }
+                    }
+                    else if (renderer != EOverlayRenderer.Rtss)
+                    {
+                        // Keep the RTSS slot owned while its renderer may still be reading it. Clearing
+                        // uses RTSS' dwBusy synchronization; ReleaseOSD zeroes the whole shared-memory
+                        // entry and is reserved for a real overlay shutdown.
+                        if (wasRtss)
+                            _rTSSService.ClearOSD();
+                    }
+                    else if (_appConfiguration.IsOverlayActive && _isServiceAlive)
+                    {
+                        // Switched back to the RTSS renderer while the overlay is active. Re-drive the
+                        // overlay-active pipeline (as an Alt+O toggle would) so it re-runs the RTSS init
+                        // (launch + OnOSDOn) AND rebuilds the entry feed via .Switch(). Nothing else
+                        // re-initializes RTSS after a hook path released it — that's why it looked
+                        // "stuck off"; a one-shot OnOSDOn wasn't enough because the feed wasn't re-driven.
+                        IsOverlayActiveStream.OnNext(true);
+                    }
+                });
+
+            Task.Run(async () => await InitializeOverlayEntryDict())
+                .ContinueWith(t =>
+               {
+                   int rtssFeedLogState = -1; // logs only when the RTSS-feed decision flips (avoids per-tick spam)
+                   EntryFeedMode? loggedFeedMode = null;
+                   _overlayActiveStreamDisposable = SelectEntryFeedModes(IsOverlayActiveStream, _remoteOverlayDemand.IsActiveStream)
+                       .Where(_ => _isServiceAlive)
+                       .Select(mode =>
+                       {
+                           _frameMetrics?.SetEnabled(mode != EntryFeedMode.Off &&
+                               _appConfiguration.OverlayRenderer != EOverlayRenderer.Rtss);
+                           if (mode != loggedFeedMode)
+                           {
+                               loggedFeedMode = mode;
+                               _logger.LogInformation("Overlay entry feed: {mode}", mode);
+                           }
+
+                           if (mode == EntryFeedMode.Off)
+                           {
+                               _rTSSService.ReleaseOSD();
+                               return Observable.Empty<(IOverlayEntry[] Entries, bool MayFeedRtss)>();
+                           }
+
+                           // Serialize profile changes and regular ticks on the refresh thread.
+                           // FromAsync defers each read until the previous one has completed.
+                           // A failed read skips its tick: the subscription below has no error
+                           // handler, so an error reaching it would be rethrown on the refresh
+                           // thread and terminate CapFrameX.
+                           var entryUpdates = _refreshRequested
+                               .StartWith(Unit.Default)
+                               .ObserveOn(_overlayRefreshScheduler)
+                               .Select(_ => Observable.FromAsync(() => _overlayEntryProvider.GetOverlayEntries())
+                                   .Catch((Exception ex) =>
+                                   {
+                                       LogEntryRefreshFailure(ex);
+                                       return Observable.Empty<IOverlayEntry[]>();
+                                   }))
+                               .Concat();
+
+                           if (mode == EntryFeedMode.RemoteOnly)
+                           {
+                               // The overlay is off, but a remote API client still reads the
+                               // entries. RTSS is released as in the Off mode and never fed.
+                               _rTSSService.ReleaseOSD();
+                               return entryUpdates.Select(entries => (Entries: entries, MayFeedRtss: false));
+                           }
+
+                           var overlayUpdates = entryUpdates.Select(entries => (Entries: entries, MayFeedRtss: true));
+
+                           if (_appConfiguration.OverlayRenderer == EOverlayRenderer.Rtss)
+                           {
+                               // Deferred instead of awaited inline: this selector runs on the
+                               // thread that pushed the value — the WPF dispatcher for the
+                               // overlay hotkey and for the checkbox — while the RTSS check
+                               // enumerates processes and may start RTSS. FromAsync preserves
+                               // the ordering (entries only flow once RTSS is up) without
+                               // blocking the caller, which .Wait() did.
+                               return Observable
+                                   .FromAsync(cancellationToken => InitializeRTSSAsync(cancellationToken))
+                                   .SelectMany(_ => overlayUpdates);
+                           }
+
+                           return overlayUpdates;
+                       })
+                       .Switch()
+                       .Subscribe(async update =>
+                       {
+                           // Publish one completed scalar snapshot to HTTP, WebSocket and both
+                           // renderers. Profile entries remain editable and keep their RTSS macros.
+                           var entries = _frameMetrics?.ApplySnapshot(update.Entries) ?? update.Entries;
+                           CurrentOverlayEntries = entries;
+                           OSDUpdateNotifier(entries);
+                           // Both CapFrameX renderers read CurrentOverlayEntries from this event.
+                           // Publishing the raw tick first could make them render the old profile.
+                           _onDictionaryUpdated.OnNext(entries);
+
+                           // IsOverlayActive is checked as well: an update already in flight when
+                           // the overlay is switched off must not refill the released RTSS slot.
+                           bool feedRtss = update.MayFeedRtss && _appConfiguration.FeedsRtss();
+                           int feedState = feedRtss ? 1 : 0;
+                           if (feedState != rtssFeedLogState)
+                           {
+                               rtssFeedLogState = feedState;
+                               _logger.LogInformation("RTSS feed {state} (overlay={active}, apiOnly={api}, renderer={renderer})",
+                                   feedRtss ? "ON" : "OFF", IsOverlayActive, overlayOnAPIOnly,
+                                   _appConfiguration.OverlayRenderer);
+                           }
+                           if (feedRtss)
+                           {
+                               _rTSSService.SetOverlayEntries(SelectRtssEntries(entries));
+                               await _rTSSService.CheckRTSSRunningAndRefresh();
+                           }
+                       });
+               });
+
+            Task.Run(async () => await _overlayEntryCore.OverlayEntryCoreCompletionSource.Task)
+                .ContinueWith(t =>
+                {
+                    var refreshTicks = _sensorService.OsdUpdateStream
+                       .Select(timespan => Observable.Concat(
+                            Observable.Return(-1L, _overlayRefreshScheduler),
+                            Observable.Interval(timespan, _overlayRefreshScheduler)))
+                       .Switch();
+
+                    _sensorRefreshDisposable = RefreshFromLatest(
+                        _sensorService.SensorSnapshotStream,
+                        refreshTicks,
+                        (DateTime.UtcNow, new Dictionary<ISensorEntry, float>()))
+                       .Where(_ => _isServiceAlive)
+                       .Where((_, idx) => idx == 0 || IsOverlayActive || _remoteOverlayDemand.IsActive)
+                       .Subscribe(sensorData =>
+                       {
+                           if (sensorData.Item2.Any())
+                               UpdateOverlayEntries(sensorData.Item2);
+
+                           RequestRefresh();
+                       });
+                });
+
+            _runHistory = Enumerable.Repeat("N/A", _numberOfRuns).ToList();
+            PublishRunHistory();
+            PublishRunHistoryAggregation(string.Empty);
+            PublishRunHistoryOutlierFlags();
+            _rTSSService.SetIsCaptureTimerActive(false);
+        }
+
+        // A persistent failure repeats on every refresh tick; report it at most every 10 s.
+        private void LogEntryRefreshFailure(Exception ex)
+        {
+            var now = DateTime.UtcNow;
+            if (now - _lastEntryRefreshFailureLogUtc < TimeSpan.FromSeconds(10))
+            {
+                _suppressedEntryRefreshFailures++;
+                return;
+            }
+
+            _logger.LogError(ex, "Overlay entry refresh failed; the tick was skipped ({suppressed} further failures since the last report).",
+                _suppressedEntryRefreshFailures);
+            _lastEntryRefreshFailureLogUtc = now;
+            _suppressedEntryRefreshFailures = 0;
+        }
+
+        /// <summary>
+        /// Brings RTSS up for an overlay that has just been activated.
+        ///
+        /// Failures are logged rather than propagated: an OnError here would travel through
+        /// Switch() to the subscriber and tear the overlay feed down for the rest of the session.
+        /// </summary>
+        private async Task InitializeRTSSAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _rTSSService.CheckRTSSRunning();
+
+                // The overlay can be switched off again while RTSS is starting. Switch() cancels
+                // this token when it drops the subscription, and turning the OSD on afterwards
+                // would leave it on against the user's last input.
+                if (cancellationToken.IsCancellationRequested)
+                    return;
+
+                _rTSSService.OnOSDOn();
+                _rTSSService.ClearOSD();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "RTSS initialization for the activated overlay failed.");
+            }
+        }
+
+        public void StartCountdown(double seconds)
+        {
+            IObservable<long> obs = Extensions.ObservableExtensions.CountDown(seconds);
+            _rTSSService.SetIsCaptureTimerActive(true);
+
+            SetCaptureTimerValue(0);
+            _disposableCountdown?.Dispose();
+            _disposableCountdown = obs.Subscribe(t =>
+            {
+                SetCaptureTimerValue((int)t);
+
+                if (_appConfiguration.FeedsRtss())
+                    _rTSSService.Refresh();
+
+                if (t == 0)
+                    _rTSSService.SetIsCaptureTimerActive(false);
+
+            });
+        }
+
+        internal static bool GetInitialOverlayActiveState(bool configuredOverlayActive,
+            bool isRTSSInstalled, EOverlayRenderer renderer)
+        {
+            return configuredOverlayActive &&
+                OverlayRendererSelection.CanShowOverlay(renderer, isRTSSInstalled);
+        }
+
+        internal enum EntryFeedMode
+        {
+            Off,
+            /// <summary>Overlay switched off, entries refreshed for remote API clients only.</summary>
+            RemoteOnly,
+            Overlay
+        }
+
+        /// <summary>
+        /// Combines the overlay switch with the remote API demand. Every overlay value is passed on,
+        /// repeats included, because pushing true again is how a renderer switch re-drives the RTSS
+        /// initialization. A demand change only passes when it changes the mode, so a client
+        /// connecting to an active overlay does not run that initialization again.
+        /// </summary>
+        internal static IObservable<EntryFeedMode> SelectEntryFeedModes(
+            IObservable<bool> overlayActive,
+            IObservable<bool> remoteDemand)
+        {
+            return Observable.Defer(() =>
+            {
+                bool? active = null;
+                bool demand = false;
+                EntryFeedMode? lastMode = null;
+
+                // Merge serializes both sources, so the state above is never touched concurrently.
+                return Observable.Merge(
+                        overlayActive.Select(value => (FromOverlay: true, Value: value)),
+                        remoteDemand.DistinctUntilChanged().Select(value => (FromOverlay: false, Value: value)))
+                    .Select(change =>
+                    {
+                        if (change.FromOverlay)
+                            active = change.Value;
+                        else
+                            demand = change.Value;
+
+                        if (active == null)
+                            return (EntryFeedMode?)null;
+
+                        var mode = active.Value ? EntryFeedMode.Overlay
+                            : demand ? EntryFeedMode.RemoteOnly
+                            : EntryFeedMode.Off;
+                        bool emit = change.FromOverlay || mode != lastMode;
+                        lastMode = mode;
+                        return emit ? mode : (EntryFeedMode?)null;
+                    })
+                    .Where(mode => mode.HasValue)
+                    .Select(mode => mode.Value);
+            });
+        }
+
+        internal static bool ShouldReplaceUnavailableRtss(bool isRTSSInstalled, EOverlayRenderer renderer)
+        {
+            return !isRTSSInstalled && renderer == EOverlayRenderer.Rtss;
+        }
+
+        /// <summary>
+        /// The entries RTSS can draw: a row needs ShowOnOverlay, a graph only ShowGraph. Sensor
+        /// entries are enabled by default, so sending every enabled entry marshalled and
+        /// formatted hundreds of hidden ones on each refresh.
+        /// </summary>
+        internal static IOverlayEntry[] SelectRtssEntries(IEnumerable<IOverlayEntry> entries)
+        {
+            return entries
+                .Where(entry => entry.IsEntryEnabled && (entry.ShowOnOverlay || entry.ShowGraph))
+                .ToArray();
+        }
+
+        /// <summary>
+        /// Drives consumers from their own refresh clock and reads only the latest completed
+        /// producer value. A slow producer therefore causes a repeated stale value, never a
+        /// delayed refresh or a queue of catch-up work.
+        /// </summary>
+        internal static IObservable<T> RefreshFromLatest<T>(
+            IObservable<T> values,
+            IObservable<long> refreshTicks,
+            T initialValue)
+        {
+            if (values == null)
+                throw new ArgumentNullException(nameof(values));
+            if (refreshTicks == null)
+                throw new ArgumentNullException(nameof(refreshTicks));
+
+            return refreshTicks.WithLatestFrom(
+                values.StartWith(initialValue),
+                (_, latestValue) => latestValue);
+        }
+
+        public void SetDelayCountdown(double seconds)
+        {
+            IObservable<long> obs = Extensions.ObservableExtensions.CountDown(seconds);
+            _rTSSService.SetIsCaptureTimerActive(true);
+
+            SetCaptureTimerValue(-(int)seconds);
+            _disposableDelayCountdown?.Dispose();
+            _disposableDelayCountdown = obs.Subscribe(t =>
+            {
+                if (t > 0)
+                {
+                    SetCaptureTimerValue((int)-t);
+
+                    if (_appConfiguration.FeedsRtss())
+                        _rTSSService.Refresh();
+                }
+            });
+        }
+
+        public void CancelDelayCountdown()
+        {
+            _disposableDelayCountdown?.Dispose();
+            _rTSSService.SetIsCaptureTimerActive(false);
+
+            if (_appConfiguration.FeedsRtss())
+                _rTSSService.Refresh();
+        }
+
+        public void StartCaptureTimer()
+        {
+            _disposableCaptureTimer = GetCaptureTimer();
+            _rTSSService.SetIsCaptureTimerActive(true);
+        }
+
+        public void StopCaptureTimer()
+        {
+            _disposableCaptureTimer?.Dispose();
+            _disposableCountdown?.Dispose();
+            _rTSSService.SetIsCaptureTimerActive(false);
+            SetCaptureTimerValue(0);
+        }
+
+        public void SetCaptureTimerValue(int t)
+        {
+            var captureTimer = _overlayEntryProvider.GetOverlayEntry("CaptureTimer");
+            if (captureTimer != null)
+            {
+                captureTimer.Value = $"{t} s";
+                _rTSSService.SetOverlayEntry(captureTimer);
+            }
+        }
+
+        public void SetCaptureServiceStatus(string status)
+        {
+            // Not gated on IsOverlayActive: remote API clients read the entry with the overlay
+            // off, and SetOverlayEntry only updates the RTSS entry list, like SetCaptureTimerValue.
+            var captureStatus = _overlayEntryProvider.GetOverlayEntry("CaptureServiceStatus");
+            if (captureStatus != null)
+            {
+                captureStatus.Value = status;
+                _rTSSService.SetOverlayEntry(captureStatus);
+            }
+        }
+
+        public void ResetHistory()
+        {
+            _runHistory = Enumerable.Repeat("N/A", _numberOfRuns).ToList();
+            _runHistoryOutlierFlags = Enumerable.Repeat(false, _numberOfRuns).ToArray();
+            _captureDataHistory.Clear();
+            _frametimeHistory.Clear();
+            _displaytimeHistory.Clear();
+            _metricAnalysis.Clear();
+            PublishRunHistory();
+            PublishRunHistoryAggregation(string.Empty);
+            PublishRunHistoryOutlierFlags();
+        }
+
+        public void AddRunToHistory(ISessionRun sessionRun, string process, string recordDirectory)
+        {
+            var frametimes = sessionRun.CaptureData.MsBetweenPresents;
+            var displaytimes = sessionRun.CaptureData.MsBetweenDisplayChange;
+
+            if (RunHistoryCount == _numberOfRuns)
+            {
+                if (!_runHistoryOutlierFlags.All(x => x == false)
+                    && _appConfiguration.OutlierHandling == EOutlierHandling.Replace.ConvertToString())
+                {
+                    var historyDefault = Enumerable.Repeat("N/A", _numberOfRuns).ToList();
+                    var validRuns = _runHistory.Where((run, i) => _runHistoryOutlierFlags[i] == false).ToList();
+
+                    for (int i = 0; i < validRuns.Count; i++)
+                    {
+                        historyDefault[i] = validRuns[i];
+                    }
+
+                    var validCaptureData = _captureDataHistory.Where((run, i) => _runHistoryOutlierFlags[i] == false);
+                    var validFrametimes = _frametimeHistory.Where((run, i) => _runHistoryOutlierFlags[i] == false);
+                    var validDisplaytimes = _displaytimeHistory.Where((run, i) => _runHistoryOutlierFlags[i] == false);
+                    var validMetricAnalysis = _metricAnalysis.Where((run, i) => _runHistoryOutlierFlags[i] == false);
+
+                    _runHistory = historyDefault.ToList();
+                    _captureDataHistory = validCaptureData.ToList();
+                    _frametimeHistory = validFrametimes.ToList();
+                    _displaytimeHistory = validDisplaytimes.ToList();
+                    _metricAnalysis = validMetricAnalysis.ToList();
+
+                    // local reset
+                    _runHistoryOutlierFlags = Enumerable.Repeat(false, _numberOfRuns).ToArray();
+                    PublishRunHistory();
+                    PublishRunHistoryAggregation(string.Empty);
+                    PublishRunHistoryOutlierFlags();
+                }
+                else
+                {
+                    ResetHistory();
+                }
+            }
+
+            if (RunHistoryCount < _numberOfRuns)
+            {
+                // metric history
+                var currentAnalysis = _statisticProvider.GetMetricAnalysis(frametimes, displaytimes,
+                    _appConfiguration.UseDisplayChangeMetrics, SecondMetric, ThirdMetric);
+
+                _metricAnalysis.Add(currentAnalysis);
+                _runHistory[RunHistoryCount] = currentAnalysis.ResultString;
+                PublishRunHistory();
+
+                // capture data history
+                _captureDataHistory.Add(sessionRun);
+
+                // frametime history
+                _frametimeHistory.Add(frametimes);
+
+                // displaytime history
+                _displaytimeHistory.Add(displaytimes);
+
+                if (_appConfiguration.UseAggregation)
+                {
+                    _logEntryManager.AddLogEntry($"Aggregation active. Adding captured data to history ({RunHistoryCount} of {_numberOfRuns})", ELogMessageType.BasicInfo, false);
+
+                    if (RunHistoryCount == _numberOfRuns)
+                    {
+                        _runHistoryOutlierFlags = _statisticProvider
+                            .GetOutlierAnalysis(_metricAnalysis,
+                                _appConfiguration.RelatedMetricOverlay,
+                                _appConfiguration.OutlierPercentageOverlay);
+                        PublishRunHistoryOutlierFlags();
+
+                        if ((_runHistoryOutlierFlags.All(x => x == false)
+                            && _appConfiguration.OutlierHandling == EOutlierHandling.Replace.ConvertToString())
+                            || _appConfiguration.OutlierHandling == EOutlierHandling.Ignore.ConvertToString())
+                        {
+                            PublishRunHistoryAggregation(GetAggregation());
+
+                            // write aggregated file
+                            Task.Run(async () =>
+                            {
+                                await Task.Delay(1000);
+                                bool checkSave = await _recordManager.SaveSessionRunsToFile(_captureDataHistory, process, string.Empty, recordDirectory, null);
+
+                                if (!checkSave)
+                                    _logEntryManager.AddLogEntry("Error while saving aggregated file.", ELogMessageType.Error, false);
+                                else
+                                    _logEntryManager.AddLogEntry("Aggregated file successfully written into directory.", ELogMessageType.BasicInfo, false);
+                            });
+                        }
+                        else
+                        {
+                            _logEntryManager.AddLogEntry($"Aggregation outliers detected ({_runHistoryOutlierFlags.Where(x => x == true).Count()}). Additional runs required.", ELogMessageType.BasicInfo, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        public void UpdateNumberOfRuns(int numberOfRuns)
+        {
+            _numberOfRuns = numberOfRuns;
+            ResetHistory();
+        }
+
+        private void PublishRunHistory()
+        {
+            var snapshot = _runHistory.ToArray();
+            _runHistorySnapshot = snapshot;
+            _rTSSService.SetRunHistory(snapshot);
+        }
+
+        private void PublishRunHistoryOutlierFlags()
+        {
+            var snapshot = _runHistoryOutlierFlags?.ToArray() ?? Array.Empty<bool>();
+            _runHistoryOutlierFlagsSnapshot = snapshot;
+            _rTSSService.SetRunHistoryOutlierFlags(snapshot);
+        }
+
+        private void PublishRunHistoryAggregation(string aggregation)
+        {
+            _runHistoryAggregation = aggregation ?? string.Empty;
+            _rTSSService.SetRunHistoryAggregation(_runHistoryAggregation);
+        }
+
+        public IOverlayEntry GetSensorOverlayEntry(string identifier)
+        {
+            lock (_dictLock)
+            {
+                _overlayEntryCore.OverlayEntryDict.TryGetValue(identifier, out IOverlayEntry entry);
+                return entry;
+            }
+        }
+
+        private void UpdateOverlayEntries(Dictionary<ISensorEntry, float> sensorData)
+        {
+            foreach (var sensorPair in sensorData)
+            {
+                var sensorIdentifier = sensorPair.Key.Identifier.ToString();
+                var sensorValue = sensorPair.Value;
+
+                lock (_dictLock)
+                {
+                    if (_overlayEntryCore.OverlayEntryDict.TryGetValue(sensorIdentifier, out IOverlayEntry entry))
+                    {
+                        entry.Value = sensorValue;
+                    }
+                }
+            }
+        }
+
+        public void ShutdownOverlayService()
+        {
+            _isServiceAlive = false;
+            _sensorRefreshDisposable?.Dispose();
+            _overlayActiveStreamDisposable?.Dispose();
+            _overlayRefreshScheduler?.Dispose();
+            _frameMetrics?.Dispose();
+        }
+
+        private void UpdateFrameMetricsDemand()
+        {
+            // CapFrameX computes the frame scalars itself for every renderer but RTSS, which
+            // measures them on its own. With the renderers off, the remote API still needs them.
+            _frameMetrics?.SetEnabled(_isServiceAlive && (IsOverlayActive || _remoteOverlayDemand.IsActive) &&
+                _appConfiguration.OverlayRenderer != EOverlayRenderer.Rtss);
+        }
+
+        public void RequestRefresh()
+        {
+            if (_isServiceAlive)
+                _refreshRequested.OnNext(Unit.Default);
+        }
+
+        private async Task InitializeOverlayEntryDict()
+        {
+            _overlayEntryCore.OverlayEntryDict.Clear();
+
+            try
+            {
+                var sensors = await _sensorService.GetSensorEntries();
+                if (sensors != null)
+                {
+                    foreach (var sensor in sensors)
+                    {
+                        var dictEntry = CreateOverlayEntry(sensor);
+                        var id = sensor.Identifier.ToString();
+                        if (!_overlayEntryCore.OverlayEntryDict.ContainsKey(id))
+                            _overlayEntryCore.OverlayEntryDict.TryAdd(id, dictEntry);
+                    }
+                }
+
+                _overlayEntryCore.OverlayEntryCoreCompletionSource.SetResult(true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error while getting sensors.");
+            }
+        }
+
+        private IOverlayEntry CreateOverlayEntry(ISensorEntry sensor)
+        {
+            return SensorOverlayEntryFactory.Create(sensor);
+        }
+
+        private IDisposable GetCaptureTimer()
+        {
+            return Observable
+                .Timer(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(1))
+                .Subscribe(t =>
+                {
+                    SetCaptureTimerValue((int)t);
+
+                    if (_appConfiguration.FeedsRtss())
+                        _rTSSService.Refresh();
+                });
+        }
+
+        private string GetAggregation()
+        {
+            var concatedFrametimes = new List<double>(_frametimeHistory.Sum(set => set.Count));
+            var concatedDisplaytimes = new List<double>(_displaytimeHistory.Sum(set => set.Count));
+
+            foreach (var frametimeSet in _frametimeHistory)
+            {
+                concatedFrametimes.AddRange(frametimeSet);
+            }
+
+            foreach (var displaytimeSet in _displaytimeHistory)
+            {
+                concatedDisplaytimes.AddRange(displaytimeSet);
+            }
+
+            return _statisticProvider.GetMetricAnalysis(concatedFrametimes, concatedDisplaytimes,
+                _appConfiguration.UseDisplayChangeMetrics, SecondMetric, ThirdMetric).ResultString;
+        }
+    }
+}

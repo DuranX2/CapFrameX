@@ -1,0 +1,557 @@
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Data;
+using CapFrameX.Data;
+using CapFrameX.Contracts.Localization;
+using CapFrameX.Contracts.Update;
+using CapFrameX.MVVM.Dialogs;
+using Microsoft.Extensions.Logging;
+using Prism.Commands;
+using Prism.Mvvm;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Data;
+using System.Windows.Threading;
+
+namespace CapFrameX.ViewModel
+{
+	/// <summary>
+	/// Single source of update state for the whole shell. The status bar, the update tab in the
+	/// options popup and the embedded dialog all bind against this instance, so it is registered as
+	/// a singleton instead of being resolved per view.
+	/// </summary>
+	public class UpdateViewModel : BindableBase
+	{
+		private readonly IUpdateService _updateService;
+		private readonly IAppConfiguration _appConfiguration;
+		private readonly IAppVersionProvider _appVersionProvider;
+		private readonly ILogger<UpdateViewModel> _logger;
+		private readonly Dispatcher _dispatcher;
+		private readonly Func<bool> _isCaptureBusy;
+		private readonly Action _shutdownApplication;
+
+		private UpdateStatus _status = new UpdateStatus(EUpdateState.Unknown);
+		private bool _isUpdateDialogOpen;
+		private UpdatePackageInfo _selectedVersion;
+		private ICollectionView _availableVersionsView;
+		private UpdateDialog _updateDialogContent;
+		private DispatcherTimer _installWaitTimer;
+		private bool _isWaitingForCapture;
+		private bool _isRestartingToInstall;
+
+		/// <summary>Created on first use, which is the shell binding it on the UI thread.</summary>
+		public UpdateDialog UpdateDialogContent => _updateDialogContent ?? (_updateDialogContent = new UpdateDialog());
+
+		public bool IsUpdateDialogOpen
+		{
+			get { return _isUpdateDialogOpen; }
+			set
+			{
+				_isUpdateDialogOpen = value;
+				RaisePropertyChanged();
+			}
+		}
+
+		public bool IsUpdateServerConfigured => _updateService.IsConfigured;
+
+		public string InstalledVersionString => FormatVersion(_appVersionProvider.GetAppVersion());
+
+		public string InstalledChannelString => _appVersionProvider.GetReleaseChannel().ToString();
+
+		public string AvailableVersionString => Package == null ? "-" : FormatVersion(Package.Version);
+
+		public string LatestReleaseVersionString => FormatVersion(AvailableVersions
+			.FirstOrDefault(package => package.Channel == EUpdateChannel.Release)?.Version);
+
+		public string LatestBetaVersionString => FormatVersion(AvailableVersions
+			.FirstOrDefault(package => package.Channel == EUpdateChannel.Beta)?.Version);
+
+		public string MinimumRollbackVersionString => FormatVersion(_updateService.MinimumRollbackVersion);
+
+		public IReadOnlyList<UpdatePackageInfo> AvailableVersions => _updateService.AvailablePackages;
+
+		public ICollectionView AvailableVersionsView => _availableVersionsView;
+
+		public bool HasAvailableVersions => AvailableVersions.Count > 0;
+
+		public UpdatePackageInfo SelectedVersion
+		{
+			get { return _selectedVersion; }
+			set
+			{
+				if (!SetProperty(ref _selectedVersion, value))
+					return;
+
+				RaisePropertyChanged(nameof(CanInstallSelectedVersion));
+				RaisePropertyChanged(nameof(IsSelectedVersionRollback));
+				RaisePropertyChanged(nameof(VersionSelectionActionText));
+				(InstallSelectedVersionCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			}
+		}
+
+		public bool IsSelectedVersionRollback => SelectedVersion != null
+			&& Normalize(SelectedVersion.Version) < Normalize(_appVersionProvider.GetAppVersion());
+
+		public bool CanInstallSelectedVersion => IsUpdateServerConfigured
+			&& SelectedVersion != null
+			&& !IsChecking
+			&& !IsDownloading
+			&& Normalize(SelectedVersion.Version) != Normalize(_appVersionProvider.GetAppVersion());
+
+		public string VersionSelectionActionText => CxLang.T(IsSelectedVersionRollback ? "UpdateViewModel_RollBack" : "UpdateViewModel_InstallVersion");
+
+		/// <summary>Full sentence for the tab and the status bar tooltip.</summary>
+		public string StatusText
+		{
+			get
+			{
+				if (!IsUpdateServerConfigured)
+					return CxLang.T("UpdateViewModel_NoUpdateServerIsConfigured");
+
+				if (_isRestartingToInstall)
+					return new LocalizedText("UpdateViewModel_RestartingToInstall", AvailableVersionString).Resolve();
+
+				if (_isWaitingForCapture && IsUpdateReadyToInstall)
+					return new LocalizedText("UpdateViewModel_InstallAfterCapture", AvailableVersionString).Resolve();
+
+				if (_status.LocalizedMessage != null)
+					return _status.LocalizedMessage.Resolve();
+
+				// Messages without a catalog key (e.g. technical reasons for rejecting the
+				// release catalog) are shown in English.
+				if (!string.IsNullOrWhiteSpace(_status.Message))
+					return _status.Message;
+
+				switch (_status.State)
+				{
+					case EUpdateState.Checking: return CxLang.T("UpdateViewModel_LookingForUpdates");
+					case EUpdateState.UpToDate: return CxLang.T("UpdateViewModel_CapFrameXIsUpToDate");
+					case EUpdateState.Failed: return CxLang.T("UpdateViewModel_TheUpdateCheckFailed");
+					default: return CxLang.T("UpdateViewModel_CapFrameXHasNotCheckedFor");
+				}
+			}
+		}
+
+		public bool IsChecking => _status.State == EUpdateState.Checking;
+
+		public bool IsDownloading => _status.State == EUpdateState.Downloading;
+
+		public bool IsUpdateAvailable => _status.State == EUpdateState.UpdateAvailable;
+
+		public bool IsUpdateReadyToInstall => _status.State == EUpdateState.ReadyToInstall;
+
+		public bool IsRollback => Package != null
+			&& Normalize(Package.Version) < Normalize(_appVersionProvider.GetAppVersion());
+
+		public string UpdateDialogTitle => CxLang.T(IsRollback ? "UpdateViewModel_RollBackCapFrameX" : "UpdateViewModel_CapFrameXUpdate");
+
+		public string ConfirmActionText => CxLang.T(IsRollback ? "UpdateViewModel_RollBack" : "UpdateViewModel_Update");
+
+		public string InstallConfirmationText => CxLang.T(IsRollback
+			? "UpdateViewModel_InstallConfirmationRollback"
+			: Package?.Channel == EUpdateChannel.Beta
+				? "UpdateViewModel_InstallConfirmationBeta"
+				: "UpdateViewModel_InstallConfirmationRegular");
+
+		/// <summary>Drives the download icon in the status bar.</summary>
+		public bool IsUpdateIndicatorVisible => IsUpdateAvailable || IsDownloading || IsUpdateReadyToInstall;
+
+		public double DownloadProgressPercent => _status.Progress * 100d;
+
+		public string DownloadProgressText
+			=> DownloadProgressPercent.ToString("F0", CultureInfo.InvariantCulture) + " %";
+
+		public string ReleaseSummary => string.IsNullOrWhiteSpace(Package?.Summary)
+			? CxLang.T("UpdateViewModel_NoDescriptionWasProvidedFor")
+			: Package.Summary;
+
+		public IReadOnlyList<string> ReleaseHighlights
+			=> Package?.Highlights?.Where(highlight => !string.IsNullOrWhiteSpace(highlight)).ToArray()
+				?? Array.Empty<string>();
+
+		public bool HasReleaseHighlights => ReleaseHighlights.Count > 0;
+
+		public string ReleaseDateText => Package?.ReleaseDate == null
+			? string.Empty
+			: Package.ReleaseDate.Value.ToString("d", CultureInfo.CurrentCulture);
+
+		public bool HasReleaseDate => Package?.ReleaseDate != null;
+
+		public string TargetChannelString => Package?.Channel.ToString() ?? string.Empty;
+
+		public string PackageSizeText
+		{
+			get
+			{
+				var sizeInBytes = Package?.SizeInBytes ?? 0L;
+
+				return sizeInBytes <= 0L
+					? string.Empty
+					: string.Format(CultureInfo.CurrentCulture, CxLang.T("UpdateViewModel_DownloadSize0MB"), (sizeInBytes / (1024d * 1024d)).ToString("F1", CultureInfo.CurrentCulture));
+			}
+		}
+
+		public bool HasReleaseNotesLink => Package?.ReleaseNotesUri != null;
+
+		/// <summary>True while the dialog may offer to start the download.</summary>
+		public bool CanConfirmUpdate => IsUpdateAvailable;
+
+		public bool AutoUpdateCheckActive
+		{
+			get { return _appConfiguration.AutoUpdateCheckActive; }
+			set
+			{
+				_appConfiguration.AutoUpdateCheckActive = value;
+				RaisePropertyChanged();
+			}
+		}
+
+		public ICommand CheckForUpdateCommand { get; }
+
+		public ICommand ShowUpdateDialogCommand { get; }
+
+		public ICommand ConfirmUpdateCommand { get; }
+
+		public ICommand CancelDownloadCommand { get; }
+
+		public ICommand OpenReleaseNotesCommand { get; }
+
+		public ICommand InstallSelectedVersionCommand { get; }
+
+		private UpdatePackageInfo Package => _status.Package;
+
+		public UpdateViewModel(IUpdateService updateService,
+			IAppConfiguration appConfiguration,
+			IAppVersionProvider appVersionProvider,
+			ILogger<UpdateViewModel> logger,
+			Lazy<CaptureManager> captureManager)
+			: this(updateService, appConfiguration, appVersionProvider, logger,
+				() => IsCaptureBusy(captureManager.Value),
+				() => Application.Current?.Shutdown())
+		{
+		}
+
+		internal UpdateViewModel(IUpdateService updateService,
+			IAppConfiguration appConfiguration,
+			IAppVersionProvider appVersionProvider,
+			ILogger<UpdateViewModel> logger,
+			Func<bool> isCaptureBusy,
+			Action shutdownApplication)
+		{
+			_updateService = updateService;
+			_appConfiguration = appConfiguration;
+			_appVersionProvider = appVersionProvider;
+			_logger = logger;
+			_isCaptureBusy = isCaptureBusy;
+			_shutdownApplication = shutdownApplication;
+			_dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
+
+			var checkForUpdateCommand = new DelegateCommand(
+				() => _ = CheckForUpdateAsync(), () => IsUpdateServerConfigured && !IsChecking && !IsDownloading);
+			var showUpdateDialogCommand = new DelegateCommand(
+				OnShowUpdateDialog, () => Package != null);
+			var confirmUpdateCommand = new DelegateCommand(
+				OnConfirmUpdate, () => CanConfirmUpdate);
+			var cancelDownloadCommand = new DelegateCommand(
+				() => _updateService.CancelDownload(), () => IsDownloading);
+			var installSelectedVersionCommand = new DelegateCommand(
+				OnInstallSelectedVersion, () => CanInstallSelectedVersion);
+
+			CheckForUpdateCommand = checkForUpdateCommand;
+			ShowUpdateDialogCommand = showUpdateDialogCommand;
+			ConfirmUpdateCommand = confirmUpdateCommand;
+			CancelDownloadCommand = cancelDownloadCommand;
+			InstallSelectedVersionCommand = installSelectedVersionCommand;
+			OpenReleaseNotesCommand = new DelegateCommand(OnOpenReleaseNotes, () => HasReleaseNotesLink);
+
+			CxLang.Instance.PropertyChanged += (_, __) =>
+			{
+				Action apply = () =>
+				{
+					RaisePropertyChanged(nameof(StatusText));
+					RaisePropertyChanged(nameof(VersionSelectionActionText));
+					RaisePropertyChanged(nameof(UpdateDialogTitle));
+					RaisePropertyChanged(nameof(ConfirmActionText));
+					RaisePropertyChanged(nameof(InstallConfirmationText));
+					RaisePropertyChanged(nameof(ReleaseSummary));
+					RaisePropertyChanged(nameof(PackageSizeText));
+				};
+				if (_dispatcher.CheckAccess()) apply();
+				else _dispatcher.BeginInvoke(apply);
+			};
+
+			// BehaviorSubject replays the current status, so this also seeds the initial state.
+			_updateService.StatusStream.Subscribe(status =>
+			{
+				Action apply = () => ApplyStatus(status);
+
+				if (_dispatcher.CheckAccess()) apply();
+				else _dispatcher.BeginInvoke(apply);
+			});
+
+			RefreshAvailableVersions();
+
+			if (IsUpdateServerConfigured && AutoUpdateCheckActive)
+			{
+				// Deferred to idle so the check never competes with the rest of app start.
+				_dispatcher.BeginInvoke(new Action(() => _ = CheckForUpdateAsync()),
+					DispatcherPriority.ApplicationIdle);
+			}
+		}
+
+		private async Task CheckForUpdateAsync()
+		{
+			try
+			{
+				await _updateService.CheckForUpdateAsync().ConfigureAwait(false);
+
+				Action refresh = RefreshAvailableVersions;
+				if (_dispatcher.CheckAccess()) refresh();
+				else _ = _dispatcher.BeginInvoke(refresh);
+			}
+			catch (Exception ex)
+			{
+				// The service reports failures through its status stream; this only guards against
+				// a command handler faulting the dispatcher.
+				_logger.LogError(ex, "Error while checking for updates.");
+			}
+		}
+
+		private void OnInstallSelectedVersion()
+		{
+			if (SelectedVersion == null)
+				return;
+
+			// The button in the options popup is the confirmation: the popup already shows the
+			// selected version, the rollback warning and the download progress. Opening the shell
+			// dialog here would put it underneath the popup and demand a second confirmation.
+			var status = _updateService.SelectVersion(SelectedVersion.Version);
+			if (status.State == EUpdateState.UpdateAvailable && status.Package != null)
+				_ = DownloadUpdateAsync();
+		}
+
+		private void OnShowUpdateDialog()
+		{
+			if (Package == null)
+				return;
+
+			IsUpdateDialogOpen = true;
+		}
+
+		private void OnConfirmUpdate()
+		{
+			// Closing first lets the status bar and the update tab show the download progress.
+			IsUpdateDialogOpen = false;
+
+			_ = DownloadUpdateAsync();
+		}
+
+		private async Task DownloadUpdateAsync()
+		{
+			try
+			{
+				var status = await _updateService.DownloadUpdateAsync().ConfigureAwait(false);
+				if (status?.State != EUpdateState.ReadyToInstall)
+					return;
+
+				// Every download is one the user asked for, so the app restarts into the installer now
+				// instead of leaving it to the next launch. Queued behind the status update.
+				Action install = InstallStagedUpdateWhenIdle;
+				if (_dispatcher.CheckAccess()) install();
+				else _ = _dispatcher.BeginInvoke(install);
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Error while downloading the update package.");
+			}
+		}
+
+		private void InstallStagedUpdateWhenIdle()
+		{
+			if (TryInstallStagedUpdate())
+				return;
+
+			if (_installWaitTimer == null)
+			{
+				_installWaitTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
+				{
+					Interval = TimeSpan.FromSeconds(1)
+				};
+				_installWaitTimer.Tick += (_, __) =>
+				{
+					if (TryInstallStagedUpdate())
+						_installWaitTimer.Stop();
+				};
+			}
+
+			_installWaitTimer.Start();
+		}
+
+		/// <summary>
+		/// Hands the staged package to a new instance and shuts the app down, unless a capture is
+		/// running or still being saved.
+		/// </summary>
+		/// <returns>False while a capture holds the installation back.</returns>
+		internal bool TryInstallStagedUpdate()
+		{
+			if (!IsUpdateReadyToInstall)
+			{
+				// A new check or download replaced the staged update in the meantime. Whatever is
+				// staged still installs on the next start.
+				SetWaitingForCapture(false);
+				return true;
+			}
+
+			if (IsCaptureBusySafe())
+			{
+				SetWaitingForCapture(true);
+				return false;
+			}
+
+			SetWaitingForCapture(false);
+
+			// On failure the package stays staged, and the status already names the next start.
+			if (!_updateService.StartInstallAfterExit())
+				return true;
+
+			_isRestartingToInstall = true;
+			RaisePropertyChanged(nameof(StatusText));
+			_logger.LogInformation("Shutting down to install version {targetVersion}.", AvailableVersionString);
+			_shutdownApplication();
+			return true;
+		}
+
+		private bool IsCaptureBusySafe()
+		{
+			try
+			{
+				return _isCaptureBusy();
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Unable to read the capture state; installing the update anyway.");
+				return false;
+			}
+		}
+
+		private void SetWaitingForCapture(bool isWaiting)
+		{
+			if (_isWaitingForCapture == isWaiting)
+				return;
+
+			_isWaitingForCapture = isWaiting;
+			RaisePropertyChanged(nameof(StatusText));
+		}
+
+		/// <summary>
+		/// A capture counts until its file is written: <see cref="CaptureManager.IsCapturing"/> turns
+		/// false before that, <see cref="CaptureManager.LockCaptureService"/> only after.
+		/// </summary>
+		private static bool IsCaptureBusy(CaptureManager captureManager)
+			=> captureManager.IsCapturing || captureManager.LockCaptureService || captureManager.DelayCountdownRunning;
+
+		private void OnOpenReleaseNotes()
+		{
+			var releaseNotesUri = Package?.ReleaseNotesUri;
+
+			if (releaseNotesUri == null)
+				return;
+
+			try
+			{
+				// UseShellExecute is required to open a URL in the default browser on .NET Core+
+				Process.Start(new ProcessStartInfo(releaseNotesUri.AbsoluteUri) { UseShellExecute = true });
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Unable to open the release notes at {releaseNotesUri}.", releaseNotesUri);
+			}
+		}
+
+		private void ApplyStatus(UpdateStatus status)
+		{
+			_status = status ?? new UpdateStatus(EUpdateState.Unknown);
+
+			// A download that fails or is cancelled must not leave the dialog stranded on screen.
+			if (IsUpdateDialogOpen && Package == null)
+				IsUpdateDialogOpen = false;
+
+			RaisePropertyChanged(nameof(StatusText));
+			RaisePropertyChanged(nameof(IsChecking));
+			RaisePropertyChanged(nameof(IsDownloading));
+			RaisePropertyChanged(nameof(IsUpdateAvailable));
+			RaisePropertyChanged(nameof(IsUpdateReadyToInstall));
+			RaisePropertyChanged(nameof(IsRollback));
+			RaisePropertyChanged(nameof(UpdateDialogTitle));
+			RaisePropertyChanged(nameof(ConfirmActionText));
+			RaisePropertyChanged(nameof(InstallConfirmationText));
+			RaisePropertyChanged(nameof(IsUpdateIndicatorVisible));
+			RaisePropertyChanged(nameof(DownloadProgressPercent));
+			RaisePropertyChanged(nameof(DownloadProgressText));
+			RaisePropertyChanged(nameof(AvailableVersionString));
+			RaisePropertyChanged(nameof(CanInstallSelectedVersion));
+			RaisePropertyChanged(nameof(IsSelectedVersionRollback));
+			RaisePropertyChanged(nameof(VersionSelectionActionText));
+			RaisePropertyChanged(nameof(ReleaseSummary));
+			RaisePropertyChanged(nameof(ReleaseHighlights));
+			RaisePropertyChanged(nameof(HasReleaseHighlights));
+			RaisePropertyChanged(nameof(ReleaseDateText));
+			RaisePropertyChanged(nameof(HasReleaseDate));
+			RaisePropertyChanged(nameof(TargetChannelString));
+			RaisePropertyChanged(nameof(PackageSizeText));
+			RaisePropertyChanged(nameof(HasReleaseNotesLink));
+			RaisePropertyChanged(nameof(CanConfirmUpdate));
+
+			(CheckForUpdateCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			(ShowUpdateDialogCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			(ConfirmUpdateCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			(CancelDownloadCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			(OpenReleaseNotesCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+			(InstallSelectedVersionCommand as DelegateCommand)?.RaiseCanExecuteChanged();
+		}
+
+		private void RefreshAvailableVersions()
+		{
+			var previousVersion = SelectedVersion?.Version;
+			var preferredVersion = previousVersion ?? Package?.Version ?? _appVersionProvider.GetAppVersion();
+			var groupedVersions = AvailableVersions
+				.OrderBy(package => package.Channel == EUpdateChannel.Release ? 0 : 1)
+				.ThenByDescending(package => Normalize(package.Version))
+				.ToList();
+			var availableVersionsView = new ListCollectionView(groupedVersions);
+			availableVersionsView.GroupDescriptions.Add(
+				new PropertyGroupDescription(nameof(UpdatePackageInfo.Channel)));
+			_availableVersionsView = availableVersionsView;
+
+			RaisePropertyChanged(nameof(AvailableVersions));
+			RaisePropertyChanged(nameof(AvailableVersionsView));
+			RaisePropertyChanged(nameof(HasAvailableVersions));
+			RaisePropertyChanged(nameof(LatestReleaseVersionString));
+			RaisePropertyChanged(nameof(LatestBetaVersionString));
+			RaisePropertyChanged(nameof(MinimumRollbackVersionString));
+
+			SelectedVersion = AvailableVersions.FirstOrDefault(candidate =>
+				Normalize(candidate.Version) == Normalize(preferredVersion))
+				?? AvailableVersions.FirstOrDefault();
+		}
+
+		/// <summary>
+		/// CapFrameX uses all four version components; the fourth one identifies the build.
+		/// </summary>
+		private static string FormatVersion(Version version)
+			=> version == null
+				? "-"
+				: $"{version.Major}.{version.Minor}.{Math.Max(version.Build, 0)}.{Math.Max(version.Revision, 0)}";
+
+		private static Version Normalize(Version version)
+			=> version == null
+				? new Version(0, 0, 0, 0)
+				: new Version(version.Major, version.Minor, Math.Max(version.Build, 0), Math.Max(version.Revision, 0));
+	}
+}

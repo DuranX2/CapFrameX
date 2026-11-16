@@ -1,0 +1,354 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using CapFrameX.Contracts.Configuration;
+using CapFrameX.Contracts.Overlay;
+using CapFrameX.Monitoring.Contracts;
+using CapFrameX.Sensor;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Moq;
+
+namespace CapFrameX.Test.Sensor
+{
+    [TestClass]
+    public class SensorConfigPollingPolicyTest
+    {
+        private string _configurationDirectory;
+
+        [TestInitialize]
+        public void Setup()
+        {
+            _configurationDirectory = Path.Combine(
+                Path.GetTempPath(),
+                "CapFrameX-SensorConfigTest-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(_configurationDirectory);
+        }
+
+        [TestCleanup]
+        public void Cleanup()
+        {
+            if (Directory.Exists(_configurationDirectory))
+                Directory.Delete(_configurationDirectory, recursive: true);
+        }
+
+        [TestMethod]
+        public void AllSensorLeasesComposeWithInfoVisibilityAndIgnoreClassicProfileReset()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+            const string sensor = "/amdcpu/0/power/0";
+            config.GetSensorEvaluate(sensor);
+            Assert.IsFalse(config.GetSensorEvaluate(sensor));
+            var first = config.AcquireAllSensors();
+            var second = config.AcquireAllSensors();
+            config.EvaluateAllSensors = true;
+            config.EvaluateAllSensors = false;
+            Assert.IsTrue(config.EvaluateAllSensors);
+            Assert.IsTrue(config.GetSensorEvaluate(sensor));
+            config.ResetEvaluate();
+            first.Dispose();
+            first.Dispose();
+            Assert.IsTrue(config.EvaluateAllSensors);
+            second.Dispose();
+            Assert.IsFalse(config.EvaluateAllSensors);
+            config.EvaluateAllSensors = true;
+            using (config.AcquireAllSensors()) { }
+            Assert.IsTrue(config.EvaluateAllSensors, "Releasing the editor must not stop a visible Info view.");
+        }
+
+        [TestMethod]
+        public void SensorLeaseEvaluatesOnlyItsSensorsAndCountsAsOverlaySelection()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+            const string leased = "/gpu-nvidia/0/load/0";
+            const string other = "/amdcpu/0/power/0";
+            const string pmc = "pmcreader/cpu/dram-bandwidth";
+            foreach (string sensor in new[] { leased, other, pmc })
+                config.GetSensorEvaluate(sensor);
+            IReadOnlySet<string> identifiers = new HashSet<string> { leased };
+            int reads = 0;
+
+            var lease = config.AcquireSensors(() => { reads++; return identifiers; });
+
+            Assert.IsTrue(config.GetSensorEvaluate(leased));
+            Assert.IsFalse(config.GetSensorEvaluate(other), "A sensor the lease does not name stays off.");
+            Assert.IsFalse(config.EvaluateAllSensors, "A narrow lease must not turn every sensor on.");
+            Assert.IsTrue(config.HasSelectedOverlaySensors, "The leased hardware keeps the hardware poll running.");
+            Assert.IsFalse(config.HasSelectedPmcOverlaySensors);
+            Assert.IsTrue(reads > 0, "The lease is read on every evaluation.");
+
+            // The consumer changes what it shows; the lease follows without being re-acquired.
+            identifiers = new HashSet<string> { pmc };
+            Assert.IsFalse(config.GetSensorEvaluate(leased));
+            Assert.IsTrue(config.GetSensorEvaluate(pmc));
+            Assert.IsTrue(config.HasSelectedPmcOverlaySensors);
+
+            // Null stands for every sensor, as an all-sensors lease does.
+            identifiers = null;
+            Assert.IsTrue(config.GetSensorEvaluate(other));
+            Assert.IsTrue(config.EvaluateAllSensors);
+
+            identifiers = new HashSet<string>();
+            Assert.IsFalse(config.HasSelectedOverlaySensors, "An empty lease names no hardware.");
+            identifiers = new HashSet<string> { leased };
+            config.ResetEvaluate();
+            Assert.IsTrue(config.GetSensorEvaluate(leased), "A profile reset does not touch the lease.");
+            Assert.IsTrue(config.GetSensorEvaluate(leased));
+
+            lease.Dispose();
+            lease.Dispose();
+            Assert.IsFalse(config.GetSensorEvaluate(leased));
+            Assert.IsFalse(config.HasSelectedOverlaySensors);
+            Assert.IsFalse(config.EvaluateAllSensors);
+
+            using (config.AcquireSensors(() => null))
+            using (config.AcquireSensors(() => identifiers))
+            {
+                Assert.IsTrue(config.GetSensorEvaluate(other));
+                Assert.IsTrue(config.GetSensorEvaluate(leased));
+            }
+            Assert.IsFalse(config.GetSensorEvaluate(other));
+            Assert.ThrowsExactly<ArgumentNullException>(() => config.AcquireSensors(null));
+        }
+
+        [TestMethod]
+        public void LoggingSelectionIsEvaluatedOnlyForCaptureOrActiveSensorWebsocket()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+            const string identifier = "/gpu-nvidia/0/load/0";
+            config.SelectForLogging(identifier, true);
+
+            Assert.IsTrue(config.GetSensorEvaluate(identifier),
+                "The first evaluation is retained for sensor discovery.");
+            Assert.IsFalse(config.GetSensorEvaluate(identifier),
+                "A saved capture selection must not poll while no capture is running.");
+
+            config.IsCapturing = true;
+            Assert.IsFalse(config.GetSensorEvaluate(identifier),
+                "Capture state alone must not poll sensors when sensor logging is disabled.");
+
+            config.IsSensorLoggingActive = true;
+            Assert.IsTrue(config.GetSensorEvaluate(identifier));
+
+            config.IsSensorLoggingActive = false;
+            config.WsActiveSensorsEnabled = true;
+            Assert.IsTrue(config.GetSensorEvaluate(identifier));
+
+            config.WsActiveSensorsEnabled = false;
+            Assert.IsFalse(config.GetSensorEvaluate(identifier));
+        }
+
+        [TestMethod]
+        public void AllSensorsWebsocketForcesEvaluation()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+            const string identifier = "/amdcpu/0/power/0";
+
+            Assert.IsTrue(config.GetSensorEvaluate(identifier));
+            Assert.IsFalse(config.GetSensorEvaluate(identifier));
+
+            config.WsSensorsEnabled = true;
+            Assert.IsTrue(config.GetSensorEvaluate(identifier));
+        }
+
+        [TestMethod]
+        public void OverlaySensorStateIgnoresSyntheticRowsAndTracksHardwareRows()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+
+            config.SelectForOverlay("OnlineAverage", true);
+            Assert.IsFalse(config.HasSelectedOverlaySensors);
+
+            config.SelectForOverlay("/gpu-nvidia/0/load/0", true);
+            config.SelectForOverlay("/gpu-nvidia/0/load/0", true);
+            Assert.IsTrue(config.HasSelectedOverlaySensors);
+
+            config.SelectForOverlay("/gpu-nvidia/0/load/0", false);
+            Assert.IsFalse(config.HasSelectedOverlaySensors);
+
+            config.SelectForOverlay("pmcreader/cpu/dram-bandwidth", true);
+            Assert.IsTrue(config.HasSelectedOverlaySensors);
+            Assert.IsTrue(config.HasSelectedPmcOverlaySensors);
+            config.SelectForOverlay("pmcreader/cpu/dram-bandwidth", false);
+            Assert.IsFalse(config.HasSelectedOverlaySensors);
+            Assert.IsFalse(config.HasSelectedPmcOverlaySensors);
+
+            config.SelectForOverlay("/amdcpu/0/load/0", true);
+            config.ResetEvaluate();
+            Assert.IsFalse(config.HasSelectedOverlaySensors);
+            Assert.IsFalse(config.HasSelectedPmcOverlaySensors);
+        }
+
+        [TestMethod]
+        public void PmcLoggingStateTracksOnlySelectedPmcEntries()
+        {
+            var config = new SensorConfig(_configurationDirectory);
+
+            config.SelectForLogging("/amdcpu/0/load/0", true);
+            Assert.IsFalse(config.HasSelectedPmcLoggingSensors);
+
+            config.SelectForLogging("pmcreader/cpu/l3-hitrate", true);
+            Assert.IsTrue(config.HasSelectedPmcLoggingSensors);
+
+            config.SelectForLogging("pmcreader/cpu/l3-hitrate", false);
+            Assert.IsFalse(config.HasSelectedPmcLoggingSensors);
+        }
+
+        [TestMethod]
+        public void SensorIntervalUsesLoggingRateOnlyDuringSensorCapture()
+        {
+            var loggingInterval = TimeSpan.FromMilliseconds(500);
+            var osdInterval = TimeSpan.FromMilliseconds(1000);
+
+            Assert.AreEqual(osdInterval, SensorService.SelectSensorTimespan(
+                loggingInterval, osdInterval, isLoggingActive: false, useSensorLogging: true));
+            Assert.AreEqual(osdInterval, SensorService.SelectSensorTimespan(
+                loggingInterval, osdInterval, isLoggingActive: true, useSensorLogging: false));
+            Assert.AreEqual(loggingInterval, SensorService.SelectSensorTimespan(
+                loggingInterval, osdInterval, isLoggingActive: true, useSensorLogging: true));
+        }
+
+        [TestMethod]
+        public void PmcPollingRequiresAnActivePmcConsumer()
+        {
+            Assert.IsFalse(SelectPmcPolling(
+                overlayActive: true,
+                hasOverlayPmc: false,
+                loggingActive: true,
+                useSensorLogging: true,
+                hasLoggingPmc: false));
+
+            Assert.IsTrue(SelectPmcPolling(
+                overlayActive: true,
+                hasOverlayPmc: true,
+                loggingActive: false,
+                useSensorLogging: true,
+                hasLoggingPmc: false));
+
+            Assert.IsTrue(SelectPmcPolling(
+                overlayActive: false,
+                hasOverlayPmc: false,
+                loggingActive: true,
+                useSensorLogging: true,
+                hasLoggingPmc: true));
+        }
+
+        [TestMethod]
+        public void RemoteOverlayDemand_KeepsThePollTimerRunningLikeAnActiveOverlay()
+        {
+            Assert.IsTrue(SensorService.SelectSensorPollTimerState(
+                overlayActive: false, remoteOverlayDemand: true, loggingActive: false,
+                useSensorLogging: false, websocketActive: false, evaluateAllSensors: false));
+
+            Assert.IsFalse(SensorService.SelectSensorPollTimerState(
+                overlayActive: false, remoteOverlayDemand: false, loggingActive: false,
+                useSensorLogging: true, websocketActive: false, evaluateAllSensors: false),
+                "With the overlay off and no other consumer the timer must stay idle.");
+        }
+
+        [TestMethod]
+        public void RemoteOverlayDemand_PollsHardwareOnlyForSelectedOverlaySensors()
+        {
+            Assert.IsTrue(SelectHardwarePolling(overlayActive: false, remoteDemand: true, hasOverlaySensors: true));
+            Assert.IsFalse(SelectHardwarePolling(overlayActive: false, remoteDemand: true, hasOverlaySensors: false),
+                "Remote clients read the overlay entries, which contain only the overlay sensors.");
+            Assert.IsFalse(SelectHardwarePolling(overlayActive: false, remoteDemand: false, hasOverlaySensors: true));
+            Assert.IsTrue(SelectHardwarePolling(overlayActive: true, remoteDemand: false, hasOverlaySensors: true));
+        }
+
+        [TestMethod]
+        public void RemoteOverlayDemand_PollsPmcOnlyForSelectedOverlayPmcSensors()
+        {
+            Assert.IsTrue(SelectPmcPolling(
+                overlayActive: false,
+                hasOverlayPmc: true,
+                loggingActive: false,
+                useSensorLogging: true,
+                hasLoggingPmc: false,
+                remoteDemand: true));
+
+            Assert.IsFalse(SelectPmcPolling(
+                overlayActive: false,
+                hasOverlayPmc: false,
+                loggingActive: false,
+                useSensorLogging: true,
+                hasLoggingPmc: true,
+                remoteDemand: true));
+        }
+
+        [TestMethod]
+        public void RunningService_ReadsTheRemoteOverlayDemandForEveryPollingDecision()
+        {
+            bool remoteActive = false;
+            var demand = new Mock<IRemoteOverlayDemand>();
+            demand.SetupGet(x => x.IsActive).Returns(() => remoteActive);
+            var service = CreateServiceWithoutHardware(demand.Object);
+
+            Assert.IsFalse(service.HasActiveSensorConsumer());
+            Assert.IsFalse(service.ShouldPollHardwareSensors());
+            Assert.IsFalse(service.ShouldPollPmcReaderSensors());
+
+            remoteActive = true;
+            Assert.IsTrue(service.HasActiveSensorConsumer());
+            Assert.IsTrue(service.ShouldPollHardwareSensors());
+            Assert.IsTrue(service.ShouldPollPmcReaderSensors());
+        }
+
+        // The constructor starts LibreHardwareMonitor and the PMC reader. The polling decisions
+        // read nothing but the configuration, the sensor selection and the remote demand.
+        private static SensorService CreateServiceWithoutHardware(IRemoteOverlayDemand demand)
+        {
+            var sensorConfig = new Mock<ISensorConfig>();
+            sensorConfig.SetupGet(x => x.HasSelectedOverlaySensors).Returns(true);
+            sensorConfig.SetupGet(x => x.HasSelectedPmcOverlaySensors).Returns(true);
+
+            var service = (SensorService)RuntimeHelpers.GetUninitializedObject(typeof(SensorService));
+            SetField(service, "_appConfiguration", new Mock<IAppConfiguration>().Object);
+            SetField(service, "_sensorConfig", sensorConfig.Object);
+            SetField(service, "_remoteOverlayDemand", demand);
+            service.IsSensorWebsocketActive = () => false;
+            return service;
+        }
+
+        private static void SetField(object target, string name, object value)
+        {
+            var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException($"Missing field: {name}");
+            field.SetValue(target, value);
+        }
+
+        private static bool SelectHardwarePolling(bool overlayActive, bool remoteDemand, bool hasOverlaySensors)
+        {
+            return SensorService.SelectHardwarePollingState(
+                overlayActive,
+                remoteDemand,
+                hasOverlaySensors,
+                loggingActive: false,
+                useSensorLogging: true,
+                websocketActive: false,
+                evaluateAllSensors: false);
+        }
+
+        private static bool SelectPmcPolling(
+            bool overlayActive,
+            bool hasOverlayPmc,
+            bool loggingActive,
+            bool useSensorLogging,
+            bool hasLoggingPmc,
+            bool remoteDemand = false)
+        {
+            return SensorService.SelectPmcReaderPollingState(
+                overlayActive,
+                remoteDemand,
+                hasOverlayPmc,
+                loggingActive,
+                useSensorLogging,
+                hasLoggingPmc,
+                websocketActive: false,
+                websocketAllSensors: false,
+                websocketActiveSensors: false,
+                evaluateAllSensors: false);
+        }
+    }
+}

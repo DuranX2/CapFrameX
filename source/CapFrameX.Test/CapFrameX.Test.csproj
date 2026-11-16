@@ -1,0 +1,88 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="MSTest.TestAdapter" />
+    <PackageReference Include="MSTest.TestFramework" />
+    <PackageReference Include="Moq" />
+    <PackageReference Include="DryIoc.dll" />
+    <PackageReference Include="Newtonsoft.Json" />
+    <PackageReference Include="OxyPlot.Core" />
+    <PackageReference Include="Prism.Core" />
+    <PackageReference Include="System.Reactive" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <ShouldUnsetParentConfigurationAndPlatform Condition="'$(CfxOsdFromSource)' == 'true' And '$(ShouldUnsetParentConfigurationAndPlatform)' == ''">false</ShouldUnsetParentConfigurationAndPlatform>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(CfxOsdFromSource)' == 'true'">
+    <ProjectReference Include="$(_CfxOsdSourceDir)CapFrameX.OSD.Controls\CapFrameX.OSD.Controls.csproj">
+      <SetPlatform>Platform=x64</SetPlatform>
+      <CfxOptionalOsd>true</CfxOptionalOsd>
+      <AdditionalProperties>ShouldUnsetParentConfigurationAndPlatform=false</AdditionalProperties>
+    </ProjectReference>
+    <ProjectReference Include="$(_CfxOsdSourceDir)CapFrameX.OSD.Interop\CapFrameX.OSD.Interop.csproj">
+      <SetPlatform>Platform=x64</SetPlatform>
+      <CfxOptionalOsd>true</CfxOptionalOsd>
+      <AdditionalProperties>ShouldUnsetParentConfigurationAndPlatform=false</AdditionalProperties>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(CfxOsdFromSource)' != 'true'">
+    <Reference Include="CapFrameX.OSD.Controls">
+      <HintPath>..\..\external\CapFrameX.OSD-prebuilt\net10.0-windows\CapFrameX.OSD.Controls.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="CapFrameX.OSD.Interop">
+      <HintPath>..\..\external\CapFrameX.OSD-prebuilt\net10.0-windows\CapFrameX.OSD.Interop.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="TestRecordFiles\**">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Sensor\*.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.ApiInterface\CapFrameX.Remote.csproj" />
+    <ProjectReference Include="..\CapFrameX.Capture.Contracts\CapFrameX.Capture.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Configuration\CapFrameX.Configuration.csproj" />
+    <ProjectReference Include="..\CapFrameX.Contracts\CapFrameX.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Data.Session\CapFrameX.Data.Session.csproj" />
+    <ProjectReference Include="..\CapFrameX.Data\CapFrameX.Data.csproj" />
+    <ProjectReference Include="..\CapFrameX.EventAggregation\CapFrameX.EventAggregation.csproj" />
+    <ProjectReference Include="..\CapFrameX.Extensions.NetStandard\CapFrameX.Extensions.NetStandard.csproj" />
+    <ProjectReference Include="..\CapFrameX.Extensions\CapFrameX.Extensions.csproj" />
+    <ProjectReference Include="..\CapFrameX.Hardware.Controller\CapFrameX.Hardware.Controller.csproj" />
+    <ProjectReference Include="..\CapFrameX.Hotkey\CapFrameX.Hotkey.csproj" />
+    <ProjectReference Include="..\CapFrameX.Mcp\CapFrameX.Mcp.csproj" />
+    <ProjectReference Include="..\CapFrameX.OSD.Integration\CapFrameX.OSD.Integration.csproj" />
+    <ProjectReference Include="..\CapFrameX.Sensor.Reporting\CapFrameX.Sensor.Reporting.csproj" />
+    <ProjectReference Include="..\CapFrameX\CapFrameX.csproj" />
+    <ProjectReference Include="..\LibreHardwareMonitorLib\LibreHardwareMonitorLib.csproj" />
+    <ProjectReference Include="..\CapFrameX.Monitoring.Contracts\CapFrameX.Monitoring.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Overlay\CapFrameX.Overlay.csproj" />
+    <ProjectReference Include="..\CapFrameX.PMD\CapFrameX.PMD.csproj" />
+    <ProjectReference Include="..\CapFrameX.PresentMonInterface\CapFrameX.PresentMonInterface.csproj" />
+    <ProjectReference Include="..\CapFrameX.Sensor\CapFrameX.Sensor.csproj" />
+    <ProjectReference Include="..\CapFrameX.Statistics.NetStandard\CapFrameX.Statistics.NetStandard.csproj" />
+    <ProjectReference Include="..\CapFrameX.Statistics.PlotBuilder\CapFrameX.Statistics.PlotBuilder.csproj" />
+    <ProjectReference Include="..\CapFrameX.Updater\CapFrameX.Updater.csproj" />
+    <ProjectReference Include="..\CapFrameX.ViewModel\CapFrameX.ViewModel.csproj" />
+    <ProjectReference Include="..\CapFrameX.Webservice.Implementation\CapFrameX.Webservice.Implementation.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,229 @@
+﻿// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// Copyright (C) LibreHardwareMonitor and Contributors.
+// Partial Copyright (C) Michael Möller <mmoeller@openhardwaremonitor.org> and Contributors.
+// All Rights Reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using CapFrameX.Monitoring.Contracts;
+using LibreHardwareMonitor.Hardware.Memory.Sensors;
+using RAMSPDToolkit.I2CSMBus;
+using RAMSPDToolkit.SPD;
+using RAMSPDToolkit.SPD.Interfaces;
+using RAMSPDToolkit.SPD.Interop.Shared;
+
+namespace LibreHardwareMonitor.Hardware.Memory;
+
+internal sealed class DimmMemory : Hardware
+{
+    /// <summary>
+    /// Minimum time between two temperature reads of one module.
+    /// </summary>
+    internal static readonly TimeSpan TemperatureRefreshInterval = TimeSpan.FromSeconds(2);
+
+    // SPD5118 hub registers MR49/MR50: the current temperature, read as one word.
+    private const byte Ddr5TemperatureRegister = 0x31;
+
+    // The toolkit's retry policy for a busy bus (EBUSY, ETIMEDOUT, ERROR_SEM_TIMEOUT of the SMBus mutex).
+    private const int BusBusyRetries = 12;
+
+    private readonly SpdThermalSensor _thermalSensor;
+    private readonly string _manufacturer;
+    private readonly string _partNumber;
+
+    // bus and address: where the module was detected. temperatureRefreshPhase offsets this module's
+    // temperature reads from those of the other modules.
+    public DimmMemory(SPDAccessor accessor, SMBusInterface bus, byte address, TimeSpan temperatureRefreshPhase, string name, string manufacturer, string partNumber, Identifier identifier, ISettings settings, ISensorConfig sensorConfig = null)
+        : base(name, identifier, settings)
+    {
+        _manufacturer = manufacturer;
+        _partNumber = partNumber;
+
+        //Only add thermal sensor if present
+        if (accessor is IThermalSensor ts && ts.HasThermalSensor)
+        {
+            //Check which kind of RAM we have
+            switch (accessor.MemoryType())
+            {
+                case SPDMemoryType.SPD_DDR4_SDRAM:
+                case SPDMemoryType.SPD_DDR4E_SDRAM:
+                case SPDMemoryType.SPD_LPDDR4_SDRAM:
+                case SPDMemoryType.SPD_LPDDR4X_SDRAM:
+                case SPDMemoryType.SPD_DDR5_SDRAM:
+                case SPDMemoryType.SPD_LPDDR5_SDRAM:
+                    _thermalSensor = new SpdThermalSensor($"DIMM #{accessor.Index}",
+                        accessor.Index,
+                        SensorType.Temperature,
+                        this,
+                        settings,
+                        CreateTemperatureReader(ts, bus, address),
+                        new RefreshThrottle(TemperatureRefreshInterval, temperatureRefreshPhase),
+                        sensorConfig)
+                    { PresentationSortKey = $"1_{accessor.Index}"};
+                    break;
+            }
+        }
+
+        bool hasThermalSensor = _thermalSensor != null;
+
+        //Add thermal sensor
+        if (hasThermalSensor)
+            ActivateSensor(_thermalSensor);
+
+        //Add other sensors
+        CreateSensors(accessor, hasThermalSensor);
+    }
+
+    public override HardwareType HardwareType => HardwareType.Memory;
+
+    public override IDictionary<string, string> Properties
+    {
+        get
+        {
+            // Identity is cached during discovery; reading properties never accesses the SMBus.
+            SortedDictionary<string, string> properties = new();
+
+            if (!string.IsNullOrWhiteSpace(_manufacturer))
+                properties.Add("Manufacturer", _manufacturer);
+
+            if (!string.IsNullOrWhiteSpace(_partNumber))
+                properties.Add("PartNumber", _partNumber);
+
+            return properties;
+        }
+    }
+
+    public override void Update()
+    {
+        _thermalSensor?.UpdateSensor();
+    }
+
+    private static Func<float?> CreateTemperatureReader(IThermalSensor thermalSensor, SMBusInterface bus, byte address)
+    {
+        // DDR5: one word read of MR49/MR50. The toolkit's UpdateTemperature first reads the page
+        // register MR11 to select page 0, a second SMBus transaction of about 0.5 ms, but the page
+        // only applies to the NVM; the hub registers do not depend on it. MemoryGroup leaves page 0
+        // selected after discovery anyway.
+        if (thermalSensor is DDR5Accessor ddr5 && bus != null)
+        {
+            return () =>
+            {
+                if (!ddr5.ThermalSensorEnabled)
+                    return null;
+
+                int raw = bus.i2c_smbus_read_word_data(address, Ddr5TemperatureRegister);
+                for (int retry = 0; retry < BusBusyRetries && IsBusBusy(raw); retry++)
+                {
+                    Thread.Sleep(1);
+                    raw = bus.i2c_smbus_read_word_data(address, Ddr5TemperatureRegister);
+                }
+
+                return raw < 0 ? null : ConvertTemperature((ushort)raw);
+            };
+        }
+
+        return () => thermalSensor.UpdateTemperature() ? thermalSensor.Temperature : null;
+    }
+
+    // The conversion of the toolkit's internal SPDTemperatureConverter: 1/16 °C per bit, bit 12 is the sign.
+    internal static float ConvertTemperature(ushort raw)
+    {
+        return (raw & 0x1000) != 0
+            ? (raw & ~0x1000) * 0.0625f - 256f
+            : raw * 0.0625f;
+    }
+
+    private static bool IsBusBusy(int result)
+    {
+        return result is -16 or -138 or unchecked((int)0x80070079);
+    }
+
+    private void CreateSensors(SPDAccessor accessor, bool hasThermalSensor)
+    {
+        if (accessor is DDR4Accessor ddr4)
+        {
+            CreateSensorsDDR4(ddr4, hasThermalSensor, addTimings: false);
+        }
+        else if (accessor is DDR5Accessor ddr5)
+        {
+            CreateSensorsDDR5(ddr5, hasThermalSensor, addTimings: false);
+        }
+    }
+
+    private void CreateSensorsDDR4(DDR4Accessor accessor, bool hasThermalSensor, bool addTimings = false)
+    {
+        //if (hasThermalSensor)
+        //{
+        //    //Temperature Resolution (fixed value)
+        //    AddSensor("Temperature Sensor Resolution", 0, false, SensorType.Temperature, accessor.TemperatureResolution);
+        //}
+
+        if (addTimings)
+        {
+            //Timings
+            AddSensor("tCKAVGmin (Minimum Cycle Time)", 1, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumCycleTime);
+            AddSensor("tCKAVGmax (Maximum Cycle Time)", 2, false, SensorType.Timing, (float)accessor.SDRAMTimings.MaximumCycleTime);
+            AddSensor("tAA (CAS Latency Time)", 3, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumCASLatencyTime);
+            AddSensor("tRCD (RAS to CAS Delay Time)", 4, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRASToCASDelayTime);
+            AddSensor("tRP (Row Precharge Delay Time)", 5, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRowPrechargeDelayTime);
+            AddSensor("tRAS (Active to Precharge Delay Time)", 6, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActiveToPrechargeDelayTime);
+            AddSensor("tRC (Active to Active/Refresh Delay Time)", 7, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActiveToActiveRefreshDelayTime);
+            AddSensor("tRFC1 (Refresh Recovery Delay Time)", 8, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRefreshRecoveryDelayTime1);
+            AddSensor("tRFC2 (Refresh Recovery Delay Time)", 9, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRefreshRecoveryDelayTime2);
+            AddSensor("tRFC4 (Refresh Recovery Delay Time)", 10, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRefreshRecoveryDelayTime4);
+            AddSensor("tFAW (Four Activate Window Time)", 11, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumFourActivateWindowTime);
+            AddSensor("tRRD_S (Activate to Activate Delay Time)", 12, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActivateToActivateDelay_DiffGroup);
+            AddSensor("tRRD_L (Activate to Activate Delay Time)", 13, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActivateToActivateDelay_SameGroup);
+            AddSensor("tCCD_L (CAS to CAS Delay Time)", 14, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumCASToCASDelay_SameGroup);
+            AddSensor("tWR (Write Recovery Time)", 15, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumWriteRecoveryTime);
+            AddSensor("tWTR_S (Write to Read Time)", 16, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumWriteToReadTime_DiffGroup);
+            AddSensor("tWTR_L (Write to Read Time)", 17, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumWriteToReadTime_SameGroup);
+        }
+
+        //Data
+        AddSensor("Capacity", 18, false, SensorType.Data, accessor.GetCapacity());
+    }
+
+    private void CreateSensorsDDR5(DDR5Accessor accessor, bool hasThermalSensor, bool addTimings = false)
+    {
+        //if (hasThermalSensor)
+        //{
+        //    //Temperature Resolution (fixed value)
+        //    AddSensor("Temperature Sensor Resolution", 0, false, SensorType.Temperature, accessor.TemperatureResolution);
+        //}
+
+        if (addTimings)
+        {
+            //Timings
+            AddSensor("tCKAVGmin (Minimum Cycle Time)", 1, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumCycleTime);
+            AddSensor("tCKAVGmax (Maximum Cycle Time)", 2, false, SensorType.Timing, (float)accessor.SDRAMTimings.MaximumCycleTime);
+            AddSensor("tAA (CAS Latency Time)", 3, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumCASLatencyTime);
+            AddSensor("tRCD (RAS to CAS Delay Time)", 4, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRASToCASDelayTime);
+            AddSensor("tRP (Row Precharge Delay Time)", 5, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumRowPrechargeDelayTime);
+            AddSensor("tRAS (Active to Precharge Delay Time)", 6, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActiveToPrechargeDelayTime);
+            AddSensor("tRC (Active to Active/Refresh Delay Time)", 7, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumActiveToActiveRefreshDelayTime);
+            AddSensor("tWR (Write Recovery Time)", 8, false, SensorType.Timing, (float)accessor.SDRAMTimings.MinimumWriteRecoveryTime);
+            AddSensor("tRFC1 (Normal Refresh Recovery Time)", 9, false, SensorType.Timing, (float)accessor.SDRAMTimings.NormalRefreshRecoveryTime);
+            AddSensor("tRFC2 (Fine Granularity Refresh Recovery Time)", 10, false, SensorType.Timing, (float)accessor.SDRAMTimings.FineGranularityRefreshRecoveryTime);
+            AddSensor("tRFCsb (Same Bank Refresh Recovery Time)", 11, false, SensorType.Timing, (float)accessor.SDRAMTimings.SameBankRefreshRecoveryTime);
+            AddSensor("tRFC1_dlr (Normal Refresh Recovery Time 3DS)", 12, false, SensorType.Timing, (float)accessor.SDRAMTimings.NormalRefreshRecoveryTime_3DSDifferentLogicalRank);
+            AddSensor("tRFC2_dlr (Fine Granularity Refresh Recovery Time 3DS)", 13, false, SensorType.Timing, (float)accessor.SDRAMTimings.FineGranularityRefreshRecoveryTime_3DSDifferentLogicalRank);
+            AddSensor("tRFCsb_dlr (Same Bank Refresh Recovery Time 3DS)", 14, false, SensorType.Timing, (float)accessor.SDRAMTimings.SameBankRefreshRecoveryTime_3DSDifferentLogicalRank);
+        }
+
+        //Data
+        AddSensor("Capacity", 15, false, SensorType.Data, accessor.GetCapacity());
+    }
+
+    private void AddSensor(string name, int index, bool defaultHidden, SensorType sensorType, float value)
+    {
+        var sensor = new Sensor(name, index, defaultHidden, sensorType, this, null, _settings)
+        {
+            Value = value,
+        };
+
+        ActivateSensor(sensor);
+    }
+}

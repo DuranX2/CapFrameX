@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Managed MSI custom actions run inside the Windows Installer service through DTF, which
+         hosts the .NET Framework CLR; this project has to stay on .NET Framework. The targeting
+         pack comes from the Microsoft.NETFramework.ReferenceAssemblies package the SDK adds
+         implicitly, so no Visual Studio component is needed to build it. -->
+    <TargetFramework>net472</TargetFramework>
+    <Platforms>x86;x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <!-- MakeSfxCA bundles every copy-local reference into the .CA.dll; the custom action fails at
+         install time without WixToolset.Dtf.WindowsInstaller.dll and Microsoft.Win32.TaskScheduler.dll. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- MakeSfxCA packs files flat; the TaskScheduler satellite assemblies all share one file name
+         and the custom actions never show TaskScheduler messages. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\CapFrameX.Configuration\DotNetRuntimeDetector.cs" Link="DotNetRuntimeDetector.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Content items are packed into the .CA.dll next to the assembly. -->
+    <None Remove="CustomAction.config" />
+    <Content Include="CustomAction.config" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="TaskScheduler" />
+    <PackageReference Include="WixToolset.Dtf.CustomAction" PrivateAssets="all" />
+    <PackageReference Include="WixToolset.Dtf.WindowsInstaller" />
+  </ItemGroup>
+
+  <Target Name="EnsureWixToolsetInstalled" BeforeTargets="PrepareForBuild" Condition=" '$(WixCATargetsImported)' != 'true' ">
+    <Error Text="The WixToolset.Dtf.CustomAction package is missing. Restore NuGet packages before building this project." />
+  </Target>
+
+</Project>

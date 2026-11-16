@@ -1,0 +1,372 @@
+﻿using CapFrameX.Configuration;
+using CapFrameX.Data;
+using CapFrameX.Extensions;
+using CapFrameX.Hotkey;
+using CapFrameX.Overlay;
+using CapFrameX.Statistics;
+using CapFrameX.ViewModel;
+using Microsoft.Extensions.Logging;
+using Prism.Events;
+using System.ComponentModel;
+using System.Text.RegularExpressions;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+
+namespace CapFrameX.View
+{
+	/// <summary>
+	/// Interaction logic for OverlayView.xaml
+	/// </summary>
+	public partial class OverlayView : UserControl
+	{
+        public void ShowClassicProfile()
+        {
+            if (DataContext is OverlayViewModel model)
+            {
+                model.CancelDeleteDesignCommand.Execute();
+                model.IsTileOverlayEnabled = false;
+                model.SelectedOverlayTabIndex = 0;
+            }
+        }
+
+        private void OnSavedTileProfileRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is ListBoxItem item)
+            {
+                item.IsSelected = true;
+                item.Focus();
+            }
+        }
+
+        private void OnTileProfileDialogPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape && DataContext is OverlayViewModel model && model.IsDeleteDesignDialogOpen)
+            {
+                model.CancelDeleteDesignCommand.Execute();
+                e.Handled = true;
+            }
+        }
+
+		public static readonly DependencyProperty OverlayHotkeyProperty =
+			DependencyProperty.Register(nameof(OverlayHotkey), typeof(CXHotkey), typeof(OverlayView),
+			new FrameworkPropertyMetadata(default(CXHotkey), FrameworkPropertyMetadataOptions.BindsTwoWayByDefault));
+
+		public static readonly DependencyProperty OverlayConfigHotkeyProperty =
+			DependencyProperty.Register(nameof(OverlayConfigHotkey), typeof(CXHotkey), typeof(OverlayView),
+			new FrameworkPropertyMetadata(default(CXHotkey), FrameworkPropertyMetadataOptions.BindsTwoWayByDefault));
+
+		public static readonly DependencyProperty OverlayPositionHotkeyProperty =
+			DependencyProperty.Register(nameof(OverlayPositionHotkey), typeof(CXHotkey), typeof(OverlayView),
+			new FrameworkPropertyMetadata(default(CXHotkey), FrameworkPropertyMetadataOptions.BindsTwoWayByDefault));
+
+		public static readonly DependencyProperty ThreadAffinityConfigHotkeyProperty =
+			DependencyProperty.Register(nameof(ThreadAffinityHotkey), typeof(CXHotkey), typeof(OverlayView),
+			new FrameworkPropertyMetadata(default(CXHotkey), FrameworkPropertyMetadataOptions.BindsTwoWayByDefault));
+
+		public static readonly DependencyProperty ResetMetricsHotkeyProperty =
+			DependencyProperty.Register(nameof(ResetMetricsHotkey), typeof(CXHotkey), typeof(OverlayView),
+			new FrameworkPropertyMetadata(default(CXHotkey), FrameworkPropertyMetadataOptions.BindsTwoWayByDefault));
+
+
+		public CXHotkey OverlayHotkey
+		{
+			get => (CXHotkey)GetValue(OverlayHotkeyProperty);
+			set => SetValue(OverlayHotkeyProperty, value);
+		}
+
+		public CXHotkey OverlayConfigHotkey
+		{
+			get => (CXHotkey)GetValue(OverlayConfigHotkeyProperty);
+			set => SetValue(OverlayConfigHotkeyProperty, value);
+		}
+
+		public CXHotkey OverlayPositionHotkey
+		{
+			get => (CXHotkey)GetValue(OverlayPositionHotkeyProperty);
+			set => SetValue(OverlayPositionHotkeyProperty, value);
+		}
+
+		public CXHotkey ThreadAffinityHotkey
+		{
+			get => (CXHotkey)GetValue(ThreadAffinityConfigHotkeyProperty);
+			set => SetValue(ThreadAffinityConfigHotkeyProperty, value);
+		}
+
+		public CXHotkey ResetMetricsHotkey
+		{
+			get => (CXHotkey)GetValue(ResetMetricsHotkeyProperty);
+			set => SetValue(ResetMetricsHotkeyProperty, value);
+		}
+
+		public OverlayView()
+		{
+			InitializeComponent();
+
+			// Overlay hotkey
+			try
+			{
+				var overlayHotkeyString = (DataContext as OverlayViewModel).AppConfiguration.OverlayHotKey;
+				var keyStrings = overlayHotkeyString.Split('+');
+
+				OverlayHotkey = CXHotkey.Create(keyStrings, Key.O, ModifierKeys.Alt);
+			}
+			catch { OverlayHotkey = new CXHotkey(Key.O, ModifierKeys.Alt); }
+
+			// Overlay config hotkey
+			try
+			{
+				var overlayConfigHotkeyString = (DataContext as OverlayViewModel).AppConfiguration.OverlayConfigHotKey;
+				var keyStrings = overlayConfigHotkeyString.Split('+');
+
+				OverlayConfigHotkey = CXHotkey.Create(keyStrings, Key.C, ModifierKeys.Alt);
+			}
+			catch { OverlayConfigHotkey = new CXHotkey(Key.C, ModifierKeys.Alt); }
+
+			// Overlay position hotkey
+			try
+			{
+				var overlayPositionHotkeyString = (DataContext as OverlayViewModel).AppConfiguration.OverlayPositionHotkey;
+				var keyStrings = overlayPositionHotkeyString.Split('+');
+
+				OverlayPositionHotkey = CXHotkey.Create(keyStrings, Key.P, ModifierKeys.Alt);
+			}
+			catch { OverlayPositionHotkey = new CXHotkey(Key.P, ModifierKeys.Alt); }
+
+			// Thread affinity hotkey
+			try
+			{
+				var threadAffinityHotkeyString = (DataContext as OverlayViewModel).AppConfiguration.ThreadAffinityHotkey;
+				var keyStrings = threadAffinityHotkeyString.Split('+');
+
+				ThreadAffinityHotkey = CXHotkey.Create(keyStrings, Key.A, ModifierKeys.Control);
+			}
+			catch { ThreadAffinityHotkey = new CXHotkey(Key.A, ModifierKeys.Control); }
+
+			// Reset metrics hotkey
+			try
+			{
+				var resetMetricsHotkeyString = (DataContext as OverlayViewModel).AppConfiguration.ResetMetricsHotkey;
+				var keyStrings = resetMetricsHotkeyString.Split('+');
+
+				ResetMetricsHotkey = CXHotkey.Create(keyStrings, Key.M, ModifierKeys.Alt);
+			}
+			catch { ResetMetricsHotkey = new CXHotkey(Key.M, ModifierKeys.Alt); }
+		}
+
+		private void OverlayHotkeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			e.Handled = true;
+
+			var modifiers = Keyboard.Modifiers;
+			var key = e.Key;
+
+			if (key == Key.System)
+			{
+				key = e.SystemKey;
+			}
+
+			if (modifiers == ModifierKeys.None && key.IsEither(Key.Delete, Key.Back, Key.Escape))
+			{
+				OverlayHotkey = null;
+				(DataContext as OverlayViewModel).OverlayHotkeyString = string.Empty;
+				Keyboard.ClearFocus();
+				return;
+			}
+
+			if (key.IsEither(
+				Key.LeftCtrl, Key.RightCtrl, Key.LeftAlt, Key.RightAlt,
+				Key.LeftShift, Key.RightShift, Key.LWin, Key.RWin,
+				Key.Clear, Key.OemClear, Key.Apps))
+			{
+				return;
+			}
+
+			OverlayHotkey = new CXHotkey(key, modifiers);
+			var dataContext = DataContext as OverlayViewModel;
+			dataContext.OverlayHotkeyString = OverlayHotkey.ToString();
+
+			Keyboard.ClearFocus();
+		}
+
+		private void ConfigHotkeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			e.Handled = true;
+
+			var modifiers = Keyboard.Modifiers;
+			var key = e.Key;
+
+			if (key == Key.System)
+			{
+				key = e.SystemKey;
+			}
+
+			if (modifiers == ModifierKeys.None && key.IsEither(Key.Delete, Key.Back, Key.Escape))
+			{
+				OverlayConfigHotkey = null;
+				(DataContext as OverlayViewModel).OverlayConfigHotkeyString = string.Empty;
+				Keyboard.ClearFocus();
+				return;
+			}
+
+			if (key.IsEither(
+				Key.LeftCtrl, Key.RightCtrl, Key.LeftAlt, Key.RightAlt,
+				Key.LeftShift, Key.RightShift, Key.LWin, Key.RWin,
+				Key.Clear, Key.OemClear, Key.Apps))
+			{
+				return;
+			}
+
+			OverlayConfigHotkey = new CXHotkey(key, modifiers);
+			var dataContext = DataContext as OverlayViewModel;
+			dataContext.OverlayConfigHotkeyString = OverlayConfigHotkey.ToString();
+
+			Keyboard.ClearFocus();
+		}
+
+		private void OverlayPositionHotkeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			e.Handled = true;
+
+			var modifiers = Keyboard.Modifiers;
+			var key = e.Key;
+
+			if (key == Key.System)
+			{
+				key = e.SystemKey;
+			}
+
+			if (modifiers == ModifierKeys.None && key.IsEither(Key.Delete, Key.Back, Key.Escape))
+			{
+				OverlayPositionHotkey = null;
+				(DataContext as OverlayViewModel).OverlayPositionHotkeyString = string.Empty;
+				Keyboard.ClearFocus();
+				return;
+			}
+
+			if (key.IsEither(
+				Key.LeftCtrl, Key.RightCtrl, Key.LeftAlt, Key.RightAlt,
+				Key.LeftShift, Key.RightShift, Key.LWin, Key.RWin,
+				Key.Clear, Key.OemClear, Key.Apps))
+			{
+				return;
+			}
+
+			OverlayPositionHotkey = new CXHotkey(key, modifiers);
+			var dataContext = DataContext as OverlayViewModel;
+			dataContext.OverlayPositionHotkeyString = OverlayPositionHotkey.ToString();
+
+			Keyboard.ClearFocus();
+		}
+
+		private void ThreadAffinityHotkeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			e.Handled = true;
+
+			var modifiers = Keyboard.Modifiers;
+			var key = e.Key;
+
+			if (key == Key.System)
+			{
+				key = e.SystemKey;
+			}
+
+			if (modifiers == ModifierKeys.None && key.IsEither(Key.Delete, Key.Back, Key.Escape))
+			{
+				ThreadAffinityHotkey = null;
+				(DataContext as OverlayViewModel).ThreadAffinityHotkeyString = string.Empty;
+				Keyboard.ClearFocus();
+				return;
+			}
+
+			if (key.IsEither(
+				Key.LeftCtrl, Key.RightCtrl, Key.LeftAlt, Key.RightAlt,
+				Key.LeftShift, Key.RightShift, Key.LWin, Key.RWin,
+				Key.Clear, Key.OemClear, Key.Apps))
+			{
+				return;
+			}
+
+			ThreadAffinityHotkey = new CXHotkey(key, modifiers);
+			var dataContext = DataContext as OverlayViewModel;
+			dataContext.ThreadAffinityHotkeyString = ThreadAffinityHotkey.ToString();
+
+			Keyboard.ClearFocus();
+		}
+
+		private void ResetMetricsHotkeyTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			e.Handled = true;
+
+			var modifiers = Keyboard.Modifiers;
+			var key = e.Key;
+
+			if (key == Key.System)
+			{
+				key = e.SystemKey;
+			}
+
+			if (modifiers == ModifierKeys.None && key.IsEither(Key.Delete, Key.Back, Key.Escape))
+			{
+				ResetMetricsHotkey = null;
+				(DataContext as OverlayViewModel).ResetMetricsHotkeyString = string.Empty;
+				Keyboard.ClearFocus();
+				return;
+			}
+
+			if (key.IsEither(
+				Key.LeftCtrl, Key.RightCtrl, Key.LeftAlt, Key.RightAlt,
+				Key.LeftShift, Key.RightShift, Key.LWin, Key.RWin,
+				Key.Clear, Key.OemClear, Key.Apps))
+			{
+				return;
+			}
+
+			ResetMetricsHotkey = new CXHotkey(key, modifiers);
+			var dataContext = DataContext as OverlayViewModel;
+			dataContext.ResetMetricsHotkeyString = ResetMetricsHotkey.ToString();
+
+			Keyboard.ClearFocus();
+		}
+
+		private void OSDRefreshPeriodComboBox_MouseLeave(object sender, MouseEventArgs e)
+		{
+			Keyboard.ClearFocus();
+		}
+
+		private void MetricIntervalComboBox_MouseLeave(object sender, MouseEventArgs e)
+		{
+			Keyboard.ClearFocus();
+		}
+
+		private void SelectedColorChanged(object sender, RoutedPropertyChangedEventArgs<Color?> e) { }
+
+		private void LostFocus_PreviewKeyDown(object sender, KeyEventArgs e)
+		{
+			var key = e.Key;
+
+			if (key == Key.Enter)
+			{
+				OverlayItemDataGrid.Focus();
+			}
+		}
+
+		private void NumberValidationTextBox(object sender, TextCompositionEventArgs e)
+		{
+			Regex regex = new Regex("[^0-9.-]+");
+			e.Handled = regex.IsMatch(e.Text);
+		}
+
+		private void IntegerNumberValidationTextBox(object sender, TextCompositionEventArgs e)
+		{
+			Regex regex = new Regex("[^0-9]+");
+			e.Handled = regex.IsMatch(e.Text);
+		}
+
+		private void CopyButton_Click(object sender, RoutedEventArgs e)
+		{
+			CopyButtonPopup.IsOpen = true;
+		}
+	}
+}

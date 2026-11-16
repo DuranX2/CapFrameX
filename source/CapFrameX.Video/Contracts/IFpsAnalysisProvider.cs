@@ -16,4 +16,10 @@ public interface IFpsAnalysisProvider
     Task<IReadOnlyList<FrameTimestamp>> ReadFrameTimestampsAsync(
         string videoPath,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Probes the file and returns static stream metadata (resolution, declared
+    /// frame rate, duration) without decoding any frames.
+    /// </summary>
+    VideoInfo GetVideoInfo(string videoPath);
 }

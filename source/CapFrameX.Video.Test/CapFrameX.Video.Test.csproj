@@ -21,4 +21,13 @@
     <ProjectReference Include="..\CapFrameX.Video\CapFrameX.Video.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Sample media for the E2E fps-analysis tests. -->
+    <Content Include="TestVideos\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Local FFmpeg shared libraries (scripts/Get-FfmpegNative.ps1). -->
+    <Content Include="..\CapFrameX.Video\native\ffmpeg\*.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             Condition="Exists('..\CapFrameX.Video\native\ffmpeg\avutil-61.dll')" />
+  </ItemGroup>
+
 </Project>

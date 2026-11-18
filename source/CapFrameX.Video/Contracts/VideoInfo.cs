@@ -21,6 +21,6 @@ public sealed record VideoInfo
     /// <summary>Index of the video stream within the container.</summary>
     public required int StreamIndex { get; init; }
 
-    public string CodecName { get; init; }
-    public string PixelFormat { get; init; }
+    public string? CodecName { get; init; }
+    public string? PixelFormat { get; init; }
 }

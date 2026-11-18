@@ -15,6 +15,8 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="MSTest.TestAdapter" />
     <PackageReference Include="MSTest.TestFramework" />
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" />
   </ItemGroup>
 
   <ItemGroup>
@@ -24,6 +26,8 @@
   <ItemGroup>
     <!-- Sample media for the E2E fps-analysis tests. -->
     <Content Include="TestVideos\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Golden reference data (fps-analyzer metrics, font subset, PIL-composited frames). -->
+    <Content Include="TestAssets\**\*" CopyToOutputDirectory="PreserveNewest" />
     <!-- Local FFmpeg shared libraries (scripts/Get-FfmpegNative.ps1). -->
     <Content Include="..\CapFrameX.Video\native\ffmpeg\*.dll"
              CopyToOutputDirectory="PreserveNewest"

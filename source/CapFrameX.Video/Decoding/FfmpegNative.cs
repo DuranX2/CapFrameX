@@ -16,7 +16,7 @@ public static class FfmpegNative
     public const string EnvironmentVariable = "CAPFRAMX_FFMPEG_ROOT";
 
     private static readonly object SyncRoot = new();
-    private static string _root;
+    private static string? _root;
 
     /// <summary>
     /// Ensures FFmpeg.AutoGen is pointed at a directory containing the FFmpeg
@@ -24,7 +24,7 @@ public static class FfmpegNative
     /// (FFmpeg's library handles are process-lifetime singletons).
     /// </summary>
     /// <param name="rootPath">Explicit directory override, e.g. from a settings property.</param>
-    public static void EnsureLoaded(string rootPath = null)
+    public static void EnsureLoaded(string? rootPath = null)
     {
         lock (SyncRoot)
         {
@@ -40,7 +40,7 @@ public static class FfmpegNative
     /// <see cref="EnvironmentVariable"/> variable, then beside the executing
     /// assembly, then the repo layout <c>&lt;ancestor&gt;/source/CapFrameX.Video/native/ffmpeg</c>.
     /// </summary>
-    public static string ResolveRoot(string rootPath = null)
+    public static string ResolveRoot(string? rootPath = null)
     {
         if (!string.IsNullOrWhiteSpace(rootPath) && Directory.Exists(rootPath) && HasLibraries(rootPath))
             return rootPath;

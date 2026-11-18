@@ -16,13 +16,13 @@ namespace CapFrameX.Video.Decoding;
 /// </summary>
 public sealed class FfmpegVideoSource : IFpsAnalysisProvider
 {
-    private readonly string _ffmpegRoot;
+    private readonly string? _ffmpegRoot;
 
     /// <param name="ffmpegRoot">
     /// Optional explicit directory containing the FFmpeg shared libraries.
     /// When null, <see cref="FfmpegNative.ResolveRoot"/> is used.
     /// </param>
-    public FfmpegVideoSource(string ffmpegRoot = null) => _ffmpegRoot = ffmpegRoot;
+    public FfmpegVideoSource(string? ffmpegRoot = null) => _ffmpegRoot = ffmpegRoot;
 
     /// <inheritdoc/>
     /// <remarks>
@@ -197,10 +197,10 @@ public sealed class FfmpegVideoSource : IFpsAnalysisProvider
             else if (fmtCtx->duration > 0)
                 duration = fmtCtx->duration / 1_000_000.0; // AV_TIME_BASE units
 
-            string pixelFormat = par->format >= 0
+            string? pixelFormat = par->format >= 0
                 ? ffmpeg.av_get_pix_fmt_name((AVPixelFormat)par->format)
                 : null;
-            string codecName = par->codec_id == AVCodecID.AV_CODEC_ID_NONE
+            string? codecName = par->codec_id == AVCodecID.AV_CODEC_ID_NONE
                 ? null
                 : ffmpeg.avcodec_get_name(par->codec_id);
 

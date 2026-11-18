@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <Platforms>AnyCPU;x64;x86</Platforms>
+    <!-- FFmpeg.AutoGen 9.x bindings use native pointers (AVFormatContext*, ...). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" />
+    <PackageReference Include="NAudio" />
+    <PackageReference Include="NAudio.Wasapi" />
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- HUD font: Pillow's embedded Aileron Regular subset (pixel-compatible
+         with the fps-analyzer reference rendering). -->
+    <EmbeddedResource Include="assets\overlay-font.ttf" LogicalName="overlay-font.ttf" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <IsPackable>false</IsPackable>
+    <!-- MSTEST0044: [DataTestMethod]/[DataRow] are obsolete in favor of the new
+         dynamic data APIs, but the repo-wide test suite still uses them; keep the
+         build warning-free until the suite migrates. -->
+    <NoWarn>$(NoWarn);MSTEST0044</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="MSTest.TestAdapter" />
+    <PackageReference Include="MSTest.TestFramework" />
+    <PackageReference Include="SkiaSharp" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CapFrameX.Video\CapFrameX.Video.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Sample media for the E2E fps-analysis tests. -->
+    <Content Include="TestVideos\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Golden reference data (fps-analyzer metrics, font subset, PIL-composited frames). -->
+    <Content Include="TestAssets\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Local FFmpeg shared libraries (scripts/Get-FfmpegNative.ps1). -->
+    <Content Include="..\CapFrameX.Video\native\ffmpeg\*.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             Condition="Exists('..\CapFrameX.Video\native\ffmpeg\avutil-61.dll')" />
+  </ItemGroup>
+
+</Project>

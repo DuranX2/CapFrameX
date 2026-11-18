@@ -279,3 +279,6 @@ crash-report/
 
 # Native overlay design-test preview output
 /design-preview.bmp
+
+# Local FFmpeg shared libraries (scripts/Get-FfmpegNative.ps1)
+/source/CapFrameX.Video/native/ffmpeg/

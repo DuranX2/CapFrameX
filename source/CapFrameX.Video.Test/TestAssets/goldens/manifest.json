@@ -1,0 +1,48 @@
+{
+ "clip_30fps": [
+  {
+   "index": 45,
+   "png": "clip_30fps_frame45.png",
+   "panel": [
+    234,
+    128,
+    390,
+    216
+   ]
+  }
+ ],
+ "clip_60fps": [
+  {
+   "index": 60,
+   "png": "clip_60fps_frame60.png",
+   "panel": [
+    234,
+    128,
+    390,
+    216
+   ]
+  }
+ ],
+ "clip_vfr": [
+  {
+   "index": 1,
+   "png": "clip_vfr_frame1.png",
+   "panel": [
+    234,
+    128,
+    390,
+    216
+   ]
+  },
+  {
+   "index": 45,
+   "png": "clip_vfr_frame45.png",
+   "panel": [
+    234,
+    128,
+    390,
+    216
+   ]
+  }
+ ]
+}

@@ -30,7 +30,9 @@ public unsafe sealed class FfmpegFrameDecoder : IDisposable
     private SwsContext* _sws;
     private int _videoStream = -1;
     private double _secondsPerTick;
-    private bool _flushing;
+    private bool _flushing;   // demux exhausted
+    private bool _flushSent;  // decoder accepted the null flush signal
+    private bool _pktHeld;    // _pkt holds a packet the decoder rejected with EAGAIN
 
     /// <summary>Decoded frame width (px); valid after construction.</summary>
     public int Width { get; private set; }
@@ -144,30 +146,87 @@ public unsafe sealed class FfmpegFrameDecoder : IDisposable
         // 2) Otherwise keep pulling packets until a frame comes out or the
         //    stream is truly exhausted. EAGAIN from receive means "more
         //    packets needed" — NOT end of stream; only AVERROR_EOF after the
-        //    flush (null packet sent) ends the stream.
+        //    flush (null packet accepted) ends the stream.
+        //
+        // Two defer rules keep the send/receive handshake lossless:
+        //  - A packet the decoder rejected with EAGAIN is HELD (not unref'd)
+        //    and retried after the decoder has been drained; discarding it
+        //    would silently drop its frame.
+        //  - The null flush is sent only once the demux is exhausted AND the
+        //    decoder no longer holds output (send_packet(null) returns EAGAIN
+        //    until those pending frames are drained).
         while (true)
         {
-            if (!_flushing)
+            if (!_flushSent)
             {
-                int rd = ffmpeg.av_read_frame(_fmtCtx, _pkt);
-                if (rd < 0)
+                if (_pktHeld)
                 {
-                    // Stream exhausted: signal EOF to the decoder and drain.
-                    _flushing = true;
+                    // Retry the pending packet now that the decoder was
+                    // drained by a previous pass.
+                    int resend = ffmpeg.avcodec_send_packet(_ictx, _pkt);
+                    if (resend == 0)
+                    {
+                        _pktHeld = false;
+                        ffmpeg.av_packet_unref(_pkt);
+                    }
+                    else if (resend != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                        throw new InvalidOperationException(
+                            $"avcodec_send_packet (retry) failed with error code {resend}.");
+                    // else: still busy; the receive below returns frames.
+                }
+                else if (_flushing)
+                {
                     int flush = ffmpeg.avcodec_send_packet(_ictx, null);
-                    if (flush < 0) return false;
+                    if (flush < 0)
+                    {
+                        if (flush != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                            throw new InvalidOperationException(
+                                $"avcodec_send_packet (flush) failed with error code {flush}.");
+                        // EAGAIN: the decoder has frames to give; the
+                        // receive below returns them, the flush retries.
+                    }
+                    else
+                    {
+                        _flushSent = true;
+                    }
                 }
                 else
                 {
-                    // Audio/other packets are not for this decoder; skip them.
-                    if (_pkt->stream_index == _videoStream)
+                    int rd = ffmpeg.av_read_frame(_fmtCtx, _pkt);
+                    if (rd < 0)
                     {
-                        int send = ffmpeg.avcodec_send_packet(_ictx, _pkt);
-                        if (send < 0 && send != ffmpeg.AVERROR(ffmpeg.EAGAIN))
-                            throw new InvalidOperationException(
-                                $"avcodec_send_packet failed with error code {send}.");
+                        // Stream exhausted; the flush is attempted next pass,
+                        // after any pending decoder output.
+                        _flushing = true;
                     }
-                    ffmpeg.av_packet_unref(_pkt);
+                    else
+                    {
+                        // Audio/other packets are not for this decoder; skip.
+                        if (_pkt->stream_index == _videoStream)
+                        {
+                            int send = ffmpeg.avcodec_send_packet(_ictx, _pkt);
+                            if (send == 0)
+                            {
+                                ffmpeg.av_packet_unref(_pkt);
+                            }
+                            else if (send == ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                            {
+                                // The decoder needs to drain first. Keep the
+                                // packet for the next pass; do NOT unref it.
+                                _pktHeld = true;
+                            }
+                            else
+                            {
+                                ffmpeg.av_packet_unref(_pkt);
+                                throw new InvalidOperationException(
+                                    $"avcodec_send_packet failed with error code {send}.");
+                            }
+                        }
+                        else
+                        {
+                            ffmpeg.av_packet_unref(_pkt);
+                        }
+                    }
                 }
             }
 
@@ -179,7 +238,7 @@ public unsafe sealed class FfmpegFrameDecoder : IDisposable
                 continue;
             }
             if (r == ffmpeg.AVERROR(ffmpeg.EAGAIN))
-                continue; // need more input
+                continue; // need more input (or more flush time)
             if (r == ffmpeg.AVERROR_EOF)
                 return false; // decoder fully drained after flush
             throw new InvalidOperationException(

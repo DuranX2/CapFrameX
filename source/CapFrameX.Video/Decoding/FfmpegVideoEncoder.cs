@@ -41,6 +41,7 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
     private readonly bool _lossless;
     private bool _headerWritten;
     private bool _finished;
+    private readonly int _ptsTicksPerFrame;
 
     /// <summary>
     /// Open the output container and encoder.
@@ -109,7 +110,22 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
             _ictx->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
 
             var (num, den) = RationalFromRate(frameRate);
-            var tb = new AVRational { num = num, den = den };
+            // RationalFromRate returns (num, den) ≈ 1/rate (the time base),
+            // e.g. 44.262 → (42, 1859). The mov muxer stores packet
+            // timestamps UNRESCALED and sets the track timescale to
+            // time_base.den, doubling until >= 10000 (movenc.c 7.1). A base
+            // like 42/1859 therefore lands in a file whose timescale (14872)
+            // is 8x the base's denominator: playback runs 8x fast, and the
+            // elst/mdhd durations (computed from pkt->duration in the same
+            // units) come out wrong, so the mp4 demuxer drops tail samples.
+            // Use a 1/T base instead, with T = den scaled by a power of two
+            // to >= 10000 (matching the muxer's doubling, so it stays T);
+            // one frame is then exactly num*(T/den) ticks.
+            int timeScale = den;
+            while (timeScale < 10000)
+                timeScale *= 2;
+            _ptsTicksPerFrame = num * (timeScale / den);
+            var tb = new AVRational { num = 1, den = timeScale };
             _ictx->width = _width;
             _ictx->height = _height;
             _ictx->time_base = tb;
@@ -218,7 +234,8 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
     /// Encode and write one RGB24 frame with pts <paramref name="pts"/>.
     /// </summary>
     /// <param name="rgb24Buffer">Packed RGB24, at least Width * Height * 3 bytes.</param>
-    /// <param name="pts">Frame presentation timestamp (ticks of the stream time base).</param>
+    /// <param name="pts">Frame presentation index at the output rate (0,1,2,...);
+    /// internally scaled to stream time-base ticks (one frame per 1/rate).</param>
     public void WriteFrame(byte[] rgb24Buffer, long pts)
     {
         if (_ictx == null || _frame == null)
@@ -279,17 +296,41 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
             }
         }
 
-        _frame->pts = pts;
+        _frame->pts = pts * _ptsTicksPerFrame;
 
-        int send = ffmpeg.avcodec_send_frame(_ictx, _frame);
-        if (send < 0 && send != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+        // Send the frame, draining the encoder between retries: send_frame
+        // returns EAGAIN while the encoder still has output to give, and the
+        // frame must be retried after draining (it stays in _frame until
+        // accepted — dropping it here would silently lose the frame).
+        int send;
+        while ((send = ffmpeg.avcodec_send_frame(_ictx, _frame)) == ffmpeg.AVERROR(ffmpeg.EAGAIN))
+            DrainAndWrite();
+        if (send < 0)
             throw new InvalidOperationException(
                 $"avcodec_send_frame failed with error code {send}.");
 
+        DrainAndWrite();
+        ffmpeg.av_frame_unref(_frame);
+    }
+
+    /// <summary>
+    /// Receive all pending encoded packets and write them to the muxer.
+    /// </summary>
+    private void DrainAndWrite()
+    {
         int recv;
         while ((recv = ffmpeg.avcodec_receive_packet(_ictx, _pkt)) == 0)
         {
             _pkt->stream_index = 0;
+            // One frame = _ptsTicksPerFrame ticks (time base is 1/T, T >=
+            // 10000, see the constructor). The mov muxer uses pkt->duration
+            // (stored UNRESCALED) to compute the mdhd/tkhd duration and the
+            // elst (edit list) duration; a zero duration makes the elst
+            // shorter than the sample count by the codec delay, and the mp4
+            // demuxer then DROPS the tail samples ("drop a frame at
+            // curr_cts"). Encoders leave duration unset (fftools sets it in
+            // the CLI), so set it here.
+            _pkt->duration = _ptsTicksPerFrame;
             int w = ffmpeg.av_interleaved_write_frame(_ofmt, _pkt);
             ffmpeg.av_packet_unref(_pkt);
             if (w < 0)
@@ -299,8 +340,6 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
         if (recv != ffmpeg.AVERROR(ffmpeg.EAGAIN) && recv != ffmpeg.AVERROR_EOF)
             throw new InvalidOperationException(
                 $"avcodec_receive_packet failed with error code {recv}.");
-
-        ffmpeg.av_frame_unref(_frame);
     }
 
     /// <summary>
@@ -329,22 +368,54 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
             return;
         }
 
-        int send = ffmpeg.avcodec_send_frame(_ictx, null);
-        if (send < 0 && send != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+        // Send the null flush, retrying after draining: send_frame returns
+        // EAGAIN while the encoder still has output (x264 B-frame tail).
+        // The flush request is retried, never dropped.
+        int send = 0;
+        while ((send = ffmpeg.avcodec_send_frame(_ictx, null)) == ffmpeg.AVERROR(ffmpeg.EAGAIN))
+        {
+            int r;
+            do
+            {
+                r = ffmpeg.avcodec_receive_packet(_ictx, _pkt);
+                if (r == 0)
+                {
+                    _pkt->stream_index = 0;
+                    _pkt->duration = _ptsTicksPerFrame; // same as DrainAndWrite
+                    int w = ffmpeg.av_interleaved_write_frame(_ofmt, _pkt);
+                    ffmpeg.av_packet_unref(_pkt);
+                    if (w < 0)
+                        throw new InvalidOperationException(
+                            $"av_interleaved_write_frame failed with error code {w}.");
+                }
+            } while (r == 0);
+            if (r != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+                throw new InvalidOperationException(
+                    $"avcodec_receive_packet (flush drain) failed with error code {r}.");
+        }
+        if (send < 0)
             throw new InvalidOperationException(
                 $"avcodec_send_frame (flush) failed with error code {send}.");
 
-        int recv;
-        while ((recv = ffmpeg.avcodec_receive_packet(_ictx, _pkt)) == 0)
+        // Final drain: only AVERROR_EOF ends the loop. A transient EAGAIN can
+        // arrive while the encoder finalizes delayed frames (x264 B-frame
+        // reordering); treating it as terminal silently drops the tail frames.
+        int recv = 0;
+        do
         {
-            _pkt->stream_index = 0;
-            int w = ffmpeg.av_interleaved_write_frame(_ofmt, _pkt);
-            ffmpeg.av_packet_unref(_pkt);
-            if (w < 0)
-                throw new InvalidOperationException(
-                    $"av_interleaved_write_frame failed with error code {w}.");
-        }
-        if (recv != ffmpeg.AVERROR_EOF && recv != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+            recv = ffmpeg.avcodec_receive_packet(_ictx, _pkt);
+            if (recv == 0)
+            {
+                _pkt->stream_index = 0;
+                _pkt->duration = _ptsTicksPerFrame; // same as DrainAndWrite
+                int w = ffmpeg.av_interleaved_write_frame(_ofmt, _pkt);
+                ffmpeg.av_packet_unref(_pkt);
+                if (w < 0)
+                    throw new InvalidOperationException(
+                        $"av_interleaved_write_frame failed with error code {w}.");
+            }
+        } while (recv == 0 || recv == ffmpeg.AVERROR(ffmpeg.EAGAIN));
+        if (recv != ffmpeg.AVERROR_EOF)
             throw new InvalidOperationException(
                 $"avcodec_receive_packet (flush) failed with error code {recv}.");
 
@@ -392,9 +463,13 @@ public unsafe sealed class FfmpegVideoEncoder : IDisposable
 
     /// <summary>
     /// Nearest simple rational (denominator ≤ 10000, ≤ 5 continued-fraction
-    /// terms) for a double frame rate, e.g. 30 → 30/1, 29.97 → 2997/100.
-    /// Used as the 1/rate stream time base; sub-frame precision is far below
-    /// what a container timestamp needs.
+    /// terms) for the TIME BASE, i.e. 1/rate: 30 → 1/30, 29.97 → 100/2997.
+    /// The continued-fraction state below returns the reciprocal convergent
+    /// (for 44.262 it yields 42/1859 ≈ 1/44.262) — use the result as-is as
+    /// num/den; swap the pair to get the rate back (as in <c>framerate</c>).
+    /// The encoder constructor rescales this base to a 1/T form (T ≥ 10000,
+    /// a power-of-two multiple of den) so the mov muxer's timescale stays
+    /// exact; see the constructor for why.
     /// </summary>
     internal static (int Num, int Den) RationalFromRate(double rate)
     {

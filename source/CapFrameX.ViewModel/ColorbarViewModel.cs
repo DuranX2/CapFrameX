@@ -59,6 +59,7 @@ namespace CapFrameX.ViewModel
         private bool _reportIsChecked;
         private bool _sensorIsChecked;
         private bool _pmdIsChecked;
+        private bool _videoIsChecked;
         private bool _cloudIsChecked;
         private bool _aggregatioIsChecked;
         private bool _hasCustomInfo;
@@ -183,6 +184,19 @@ namespace CapFrameX.ViewModel
 
                 if (value)
                     OnPmdIsCheckedChanged();
+            }
+        }
+
+        public bool VideoIsChecked
+        {
+            get { return _videoIsChecked; }
+            set
+            {
+                _videoIsChecked = value;
+                RaisePropertyChanged();
+
+                if (value)
+                    OnVideoIsCheckedChanged();
             }
         }
 
@@ -878,6 +892,12 @@ namespace CapFrameX.ViewModel
         {
             _regionManager.RequestNavigate("DataRegion", "PmdView");
             CurrentPageName = "Pmd";
+        }
+
+        private void OnVideoIsCheckedChanged()
+        {
+            _regionManager.RequestNavigate("DataRegion", "VideoView");
+            CurrentPageName = "Video";
         }
 
         private void OnReportIsCheckedChanged()

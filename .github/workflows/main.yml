@@ -325,7 +325,9 @@ jobs:
       - name: Download workflow artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: "*.zip"
+          # Artifact names are capframex-installer-<ref> / capframex-portable-<ref>;
+          # the zip filenames live inside them, so "*.zip" would match nothing.
+          pattern: "capframex-*"
           merge-multiple: true
           skip-decompress: true
           path: artifacts

@@ -325,7 +325,9 @@ jobs:
       - name: Download workflow artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: "*.zip"
+          # Artifact names are capframex-installer-<ref> / capframex-portable-<ref>;
+          # the zip filenames live inside them, so "*.zip" would match nothing.
+          pattern: "capframex-*"
           merge-multiple: true
           skip-decompress: true
           path: artifacts
@@ -352,3 +354,61 @@ jobs:
             --pattern "*.zip" `
             --destination-path "$env:REF_NAME/${{ github.run_number }}" `
             --account-key "$env:AZURE_STORAGE_KEY"
+
+  # Tag pushes attach the built installer and portable archives to the GitHub
+  # release so the Releases page carries the binaries, not just the source.
+  # Runs on ubuntu-latest on purpose: it only moves files between Actions
+  # artifacts and the releases API, so the windows runner cost is not needed.
+  release-assets:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@v8
+        with:
+          # The build job names its artifacts capframex-installer-<ref> and
+          # capframex-portable-<ref>; the zip filenames live inside them.
+          pattern: "capframex-*"
+          merge-multiple: true
+          skip-decompress: true
+          path: artifacts
+
+      - name: Upload archives to the GitHub release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $api = "https://api.github.com/repos/${{ github.repository }}"
+
+          # A release may not exist yet when a bare tag is pushed; create one
+          # so the binaries have somewhere to live.
+          $release = try {
+            Invoke-RestMethod -Uri "$api/releases/tags/${{ github.ref_name }}" -Headers $headers -MaximumRetryCount 3
+          } catch {
+            if ($_.Exception.Response.StatusCode.Value__ -eq 404) { $null } else { throw }
+          }
+          if ($null -eq $release) {
+            $body = @{ tag_name = "${{ github.ref_name }}"; name = "${{ github.ref_name }}" } | ConvertTo-Json
+            $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Headers $headers -Body $body -ContentType "application/json" -MaximumRetryCount 3
+            Write-Host "Created release $($release.html_url)"
+          } else {
+            Write-Host "Using existing release $($release.html_url)"
+          }
+
+          Get-ChildItem -Path artifacts -Filter *.zip | ForEach-Object {
+            $zipName = $_.Name
+            if (@($release.assets | Where-Object { $_.name -eq $zipName }).Count -gt 0) {
+              Write-Host "Asset $zipName already present, skipping (re-run)"
+              return
+            }
+            $uploadUrl = "https://uploads.github.com/repos/${{ github.repository }}/releases/$($release.id)/assets?name=$zipName"
+            $uploaded = Invoke-RestMethod -Method Post -Uri $uploadUrl `
+              -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "Content-Type" = "application/zip" } `
+              -InFile $_.FullName -MaximumRetryCount 3
+            Write-Host "Uploaded $zipName -> $($uploaded.browser_download_url)"
+          }

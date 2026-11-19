@@ -28,6 +28,7 @@
   <ItemGroup>
     <ProjectReference Include="..\CapFrameX.ApiInterface\CapFrameX.Remote.csproj" />
     <ProjectReference Include="..\CapFrameX.Capture.Contracts\CapFrameX.Capture.Contracts.csproj" />
+    <ProjectReference Include="..\CapFrameX.Video\CapFrameX.Video.csproj" />
     <ProjectReference Include="..\CapFrameX.Charts\Core40\Core.csproj" />
     <ProjectReference Include="..\CapFrameX.Charts\WpfView\WpfView.csproj" />
     <ProjectReference Include="..\CapFrameX.Configuration\CapFrameX.Configuration.csproj" />

@@ -55,6 +55,7 @@ namespace CapFrameX
                 deferredViews.Add(typeof(SensorView));
                 deferredViews.Add(typeof(PmdView));
                 deferredViews.Add(typeof(ReportView));
+                deferredViews.Add(typeof(VideoView));
                 deferredViews.Add(typeof(SynchronizationView));
                 deferredViews.Add(typeof(CloudView));
 

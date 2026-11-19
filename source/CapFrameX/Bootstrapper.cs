@@ -405,6 +405,12 @@ namespace CapFrameX
                     Container.Register<IFrametimeAnalyzer, FrametimeAnalyzer>(Reuse.Singleton);
                     Container.Register<ICaptureService, PresentMonCaptureService>(Reuse.Singleton);
                     Container.Register<IRTSSService, RTSSService>(Reuse.Singleton);
+                    // Video Analysis tab (Phase 3): FFmpeg-backed timestamp source and the
+                    // burn wrapper around CapFrameX.Video.Overlay.OverlayBurn.
+                    Container.Register<CapFrameX.Video.Contracts.IFpsAnalysisProvider,
+                        CapFrameX.Video.Decoding.FfmpegVideoSource>(Reuse.Singleton);
+                    Container.Register<ViewModel.Video.IVideoBurnService,
+                        ViewModel.Video.VideoBurnService>(Reuse.Singleton);
                     Container.Register<IOverlayEntryCore, OverlayEntryCore>(Reuse.Singleton);
                     Container.Register<IRemoteOverlayDemand, RemoteOverlayDemand>(Reuse.Singleton);
                     Container.Register<IOverlayFrameMetrics, PresentMonOverlayMetrics>(Reuse.Singleton);

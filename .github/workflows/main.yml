@@ -221,6 +221,19 @@ jobs:
         run: |
           msbuild source\CapFrameX\CapFrameX.csproj /p:Configuration=%CONFIGURATION% /p:Platform=%PLATFORM% /p:DeployOnBuild=true /p:VisualStudioVersion=%VS_VERSION%
 
+      # Release builds bundle the FFmpeg shared libraries next to CapFrameX.exe so the
+      # Video Analysis tab works out of the box: FfmpegNative resolves
+      # AppContext.BaseDirectory before the repo's dev layout, and both the installer
+      # (Files Include="BinaryDir\**") and the portable archive pick the DLLs up.
+      # Get-FfmpegNative.ps1 verifies the DLL major versions against the pinned
+      # FFmpeg.AutoGen package and smoke-tests a load before the app would ever fail.
+      - name: Stage FFmpeg native libraries
+        shell: pwsh
+        run: |
+          & (Join-Path $env:GITHUB_WORKSPACE "scripts\Get-FfmpegNative.ps1") -RepoRoot $env:GITHUB_WORKSPACE
+          $appOutput = Join-Path $env:GITHUB_WORKSPACE "source\CapFrameX\bin\x64\Release\net10.0-windows"
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "source\CapFrameX.Video\native\ffmpeg\*.dll") -Destination $appOutput -Force
+
       - name: Verify native runtime payloads
         shell: pwsh
         run: |
@@ -233,7 +246,9 @@ jobs:
             "vulkan\x86\cfx_osd_vklayer.dll", "vulkan\x86\cfx_osd_vklayer_v1.json",
             "vulkan\Register-CapFrameXVulkanLayer.ps1",
             "benchlab-service\BL_Service.exe", "benchlab-service\appsettings.json",
-            "benchlab-service\LICENSE-BENCHLAB-Service.txt", "benchlab-service\VERSION"
+            "benchlab-service\LICENSE-BENCHLAB-Service.txt", "benchlab-service\VERSION",
+            "avutil-61.dll", "avcodec-63.dll", "avformat-63.dll", "avfilter-12.dll",
+            "avdevice-63.dll", "swscale-10.dll", "swresample-7.dll"
           )
           foreach ($relativePath in $requiredPaths) {
             if (-not (Test-Path -LiteralPath (Join-Path $appOutput $relativePath) -PathType Leaf)) {

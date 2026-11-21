@@ -8,7 +8,10 @@ namespace CapFrameX.Video.Decoding;
 /// libav*.so on Linux, libav*.dylib on macOS) and points FFmpeg.AutoGen at
 /// them. The binaries are not committed to the repo: run
 /// <c>scripts/Get-FfmpegNative.ps1</c> to install a pinned FFmpeg-Builds
-/// shared build into <c>source/CapFrameX.Video/native/ffmpeg/</c>.
+/// shared build into <c>source/CapFrameX.Video/native/ffmpeg/</c>. Release
+/// builds stage the same DLLs beside the executable (see
+/// <c>.github/workflows/main.yml</c>), so shipped apps resolve them from
+/// <see cref="AppContext.BaseDirectory"/>.
 /// </summary>
 public static class FfmpegNative
 {

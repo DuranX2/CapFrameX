@@ -44,6 +44,12 @@
     <None Include="Files\bf0822e8-2e55-4b99-82ee-939d8ac2384e.bat">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+    <!-- Local FFmpeg shared libraries (scripts/Get-FfmpegNative.ps1). Release builds
+         stage the same DLLs from CI; copying them here keeps a local build's layout
+         identical to the shipped one so the Video Analysis tab works in both. -->
+    <Content Include="..\CapFrameX.Video\native\ffmpeg\*.dll"
+             CopyToOutputDirectory="PreserveNewest"
+             Condition="Exists('..\CapFrameX.Video\native\ffmpeg\avutil-61.dll')" />
   </ItemGroup>
 
   <Import Project="benchlab-service.items" Condition="Exists('benchlab-service.items')" />

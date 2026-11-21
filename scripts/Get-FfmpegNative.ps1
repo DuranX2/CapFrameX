@@ -7,18 +7,12 @@
     FFmpeg's *shared* libraries (avutil-*.dll, avcodec-*.dll, ...), not the
     ffmpeg.exe from a static build. The loaded DLLs must match both the
     *major versions* the FFmpeg.AutoGen package expects (it loads
-    avutil-61 / avcodec-63 / ... by name) and the *CPU architecture* of the
-    machine running the app (a x64 build silently fails to load on an ARM64
-    machine, and vice versa).
+    avutil-61 / avcodec-63 / ... by name) and the *CPU architecture* the app
+    runs as: the app and its test suite are pinned to x64 (on ARM64 machines
+    that means emulated x64), so this script always installs the x64 build:
 
-    This script detects the machine architecture and installs:
-
-      * ARM64 (e.g. Windows on Snapdragon): the pinned stable FFmpeg 9.0.2
-        "essentials-shared" build for win-arm64 from
-        https://github.com/tordona/ffmpeg-win-arm64 (a .7z archive; 7-Zip's
-        7z.exe is required, e.g. "C:\Program Files\7-Zip\7z.exe").
-      * x64: the latest "shared" 64-bit build from
-        https://github.com/BtbN/FFmpeg-Builds (releases), a .zip archive.
+      * the n9.0 gpl "shared" 64-bit build from the latest release of
+        https://github.com/BtbN/FFmpeg-Builds, a .zip archive.
 
     The libraries are copied into:
 
@@ -45,8 +39,18 @@
 [CmdletBinding()]
 param(
     # Override the repo root if the script is run from a checkout elsewhere.
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$RepoRoot = ""
 )
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    # $PSScriptRoot is empty in the param block under Windows PowerShell 5.1
+    # when the script is started with a relative path; fall back to the
+    # invocation path.
+    $scriptDir = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    $RepoRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -57,46 +61,32 @@ $ErrorActionPreference = "Stop"
 $ExpectedDlls = @("avutil-61", "avcodec-63", "avformat-63", "avfilter-12", "avdevice-63", "swscale-10", "swresample-7")
 
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-Write-Host "Machine architecture: $arch"
-
-$assetName = $null
-$downloadUrl = $null
-$archiveKind = $null   # "zip" or "7z"
-$sevenZip = $null
-
-if ($arch -eq "Arm64") {
-    # BtbN's FFmpeg-Builds repo has no ARM64 builds. tordona/ffmpeg-win-arm64
-    # does; pin the stable 9.0.2 essentials-shared release so the DLL major
-    # versions stay in lockstep with FFmpeg.AutoGen 9.x (avutil-61/avcodec-63).
-    $assetName = "ffmpeg-9.0.2-essentials-shared-win-arm64.7z"
-    $downloadUrl = "https://github.com/tordona/ffmpeg-win-arm64/releases/download/9.0.2/$assetName"
-    $archiveKind = "7z"
-    $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)
-    if (-not $sevenZip) { $sevenZip = Join-Path ${env:ProgramFiles} "7-Zip\7z.exe" }
-    if (-not (Test-Path $sevenZip)) {
-        throw "ARM64 FFmpeg ships as a .7z archive; install 7-Zip (7z.exe) and re-run, or add it to PATH."
-    }
-    Write-Host "Selected: tordona ffmpeg-win-arm64 $assetName (pinned 9.0.2 stable, shared)"
+Write-Host "Process architecture: $arch"
+# Windows FFmpeg shared builds are installed for x64 only: the app's release
+# build targets x64 and the test suite pins its host to x64 (see
+# CapFrameX.Video.Test.csproj), so on ARM64 machines everything runs as
+# emulated x64 - the same mode the shipped app uses. (Note: on Windows this
+# API reports the *process* architecture, which under emulation differs from
+# the machine's; the choice above does not depend on it.)
+# BtbN's FFmpeg-Builds repo is the source for the x64 build.
+Write-Host "Querying latest BtbN FFmpeg-Builds release..."
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+# The SHARED builds are the only ones that expose DLLs; static builds ship
+# only an ffmpeg.exe and would fail to load at runtime.
+# Pinned to the n9.0 GPL series on purpose: the DLL major versions must stay
+# in lockstep with the pinned FFmpeg.AutoGen 9.x package (avutil-61/avcodec-63),
+# and the gpl flavor carries libx264, which the lossy burn uses. If
+# FFmpeg.AutoGen moves to a new FFmpeg major line, update this filter and
+# $ExpectedDlls together.
+$x64Asset = $release.assets |
+    Where-Object { $_.name -match '^ffmpeg-n9\.0-latest-win64-gpl-shared-\d+\.\d+\.zip$' } |
+    Select-Object -First 1
+if (-not $x64Asset) {
+    throw "No n9.0 gpl shared 64-bit asset in release '$($release.tag_name)'; assets: $($release.assets.name -join ', ')"
 }
-elseif ($arch -eq "X64") {
-    Write-Host "Querying latest BtbN FFmpeg-Builds release..."
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
-    # The SHARED builds are the only ones that expose DLLs; static builds ship
-    # only an ffmpeg.exe and would fail to load at runtime.
-    $x64Asset = $release.assets |
-        Where-Object { $_.name -match '^ffmpeg-.*-shared-64bit\.zip$' } |
-        Select-Object -First 1
-    if (-not $x64Asset) {
-        throw "No shared 64-bit asset in release '$($release.tag_name)'; assets: $($release.assets.name -join ', ')"
-    }
-    $assetName = $x64Asset.name
-    $downloadUrl = $x64Asset.browser_download_url
-    $archiveKind = "zip"
-    Write-Host "Selected: BtbN $($release.tag_name) $assetName"
-}
-else {
-    throw "Unsupported architecture '$arch' - no Windows FFmpeg shared build is known for it."
-}
+$assetName = $x64Asset.name
+$downloadUrl = $x64Asset.browser_download_url
+Write-Host "Selected: BtbN $($release.tag_name) $assetName"
 
 $dest = Join-Path $RepoRoot "source/CapFrameX.Video/native/ffmpeg"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
@@ -110,15 +100,9 @@ try {
     Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing
 
     Write-Host "Extracting..."
-    if ($archiveKind -eq "zip") {
-        Expand-Archive -Path $archivePath -DestinationPath $tmp -Force
-    }
-    else {
-        & $sevenZip x "-y" "-o$tmp" $archivePath | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "7z extraction failed with exit code $LASTEXITCODE" }
-    }
+    Expand-Archive -Path $archivePath -DestinationPath $tmp -Force
 
-    # Both layouts nest the DLLs in a bin/ subdirectory; find it by content.
+    # The archive nests the DLLs in a bin/ subdirectory; find it by content.
     $libDir = Get-ChildItem -Path $tmp -Directory -Recurse |
         Where-Object { Get-ChildItem -Path $_.FullName -Filter 'avcodec-*.dll' -ErrorAction SilentlyContinue } |
         Select-Object -First 1
@@ -168,7 +152,7 @@ $avutil = Get-ChildItem -Path $dest -Filter 'avutil-*.dll' | Select-Object -Firs
 $handle = $probe::LoadLibraryEx($avutil.FullName, [IntPtr]::Zero, 0x00000000)
 if ($handle -eq [IntPtr]::Zero) {
     throw "Smoke test FAILED: LoadLibraryEx could not load $($avutil.Name) (Win32 error $( [System.Runtime.InteropServices.Marshal]::GetLastWin32Error())). " +
-          "On ARM64 machines this usually means the x64 DLLs were installed by an older version of this script."
+          "The DLLs are x64: run this script from a 64-bit PowerShell."
 }
 $proc = $probe::GetProcAddress($handle, "av_version_info")
 $probe::FreeLibrary($handle) | Out-Null

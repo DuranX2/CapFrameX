@@ -230,8 +230,8 @@
                                Text="{loc:Tr VideoView_BurnDescription}"/>
 
                     <StackPanel Orientation="Horizontal" Margin="0 14 0 12">
+                        <!-- Uses the app-level implicit ToggleButton style (CxCompactSwitchToggleButton). -->
                         <ToggleButton Width="22" Height="22" VerticalAlignment="Center"
-                                      Style="{StaticResource MaterialDesignToggleButton}"
                                       IsChecked="{Binding IsLossless, Mode=TwoWay}"/>
                         <TextBlock Margin="10 0 0 0" VerticalAlignment="Center" FontSize="13"
                                    Text="{loc:Tr VideoView_Lossless}"/>

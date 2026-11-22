@@ -340,11 +340,13 @@ jobs:
       - name: Download workflow artifacts
         uses: actions/download-artifact@v8
         with:
-          # Artifact names are capframex-installer-<ref> / capframex-portable-<ref>;
-          # the zip filenames live inside them, so "*.zip" would match nothing.
-          pattern: "capframex-*"
-          merge-multiple: true
-          skip-decompress: true
+          # No pattern: download everything the build job produced. The
+          # artifact names have not matched prior assumptions (with
+          # upload-artifact `archive: false` the artifact is named after the
+          # file, e.g. v0.1.2_installer.zip, not capframex-installer-<ref>),
+          # and a pattern that matches nothing fails silently with 0
+          # downloads. A successful build only produces the two zip archives,
+          # so this cannot pull in unrelated artifacts.
           path: artifacts
 
       - name: Upload archives to Azure Blob Storage
@@ -385,11 +387,13 @@ jobs:
       - name: Download workflow artifacts
         uses: actions/download-artifact@v8
         with:
-          # The build job names its artifacts capframex-installer-<ref> and
-          # capframex-portable-<ref>; the zip filenames live inside them.
-          pattern: "capframex-*"
-          merge-multiple: true
-          skip-decompress: true
+          # No pattern: download everything the build job produced. The
+          # artifact names have not matched prior assumptions (with
+          # upload-artifact `archive: false` the artifact is named after the
+          # file, e.g. v0.1.2_installer.zip, not capframex-installer-<ref>),
+          # and a pattern that matches nothing fails silently with 0
+          # downloads. A successful build only produces the two zip archives,
+          # so this cannot pull in unrelated artifacts.
           path: artifacts
 
       - name: Upload archives to the GitHub release
@@ -415,7 +419,15 @@ jobs:
             Write-Host "Using existing release $($release.html_url)"
           }
 
-          Get-ChildItem -Path artifacts -Filter *.zip | ForEach-Object {
+          # Each downloaded artifact lands in artifacts/<artifact-name>/, so
+          # the zip files need a recursive search. Fail loudly if nothing was
+          # found instead of silently releasing with zero assets.
+          $zips = @(Get-ChildItem -Path artifacts -Filter *.zip -Recurse -File)
+          if ($zips.Count -eq 0) {
+            throw "No zip archives found under ./artifacts - release assets would be empty."
+          }
+
+          $zips | ForEach-Object {
             $zipName = $_.Name
             if (@($release.assets | Where-Object { $_.name -eq $zipName }).Count -gt 0) {
               Write-Host "Asset $zipName already present, skipping (re-run)"

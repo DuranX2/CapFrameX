@@ -348,6 +348,26 @@ jobs:
           # downloads. A successful build only produces the two zip archives,
           # so this cannot pull in unrelated artifacts.
           path: artifacts
+          # With upload-artifact `archive: false` the artifact payload is the
+          # original .zip file's raw bytes, and the client's default
+          # decompression would "extract" those bytes into a directory, which
+          # destroys the .zip files the publish job would upload. Skipping it
+          # keeps the files byte-identical under artifacts/<name>/<name>.
+          skip-decompress: true
+
+      - name: Flatten artifact layout
+        shell: pwsh
+        run: |
+          # download-artifact writes each artifact to
+          # artifacts/<artifact-name>/<original-file-name>. Flatten that extra
+          # level so upload-batch stores plain builds/<ref>/<run>/<name>.zip
+          # blobs instead of same-named nested directories.
+          Get-ChildItem -Path artifacts -Directory | ForEach-Object {
+            Get-ChildItem $_.FullName -File | ForEach-Object {
+              Move-Item -Path $_.FullName -Destination (Join-Path 'artifacts' $_.Name) -Force
+            }
+            Remove-Item $_.FullName -Recurse -Force
+          }
 
       - name: Upload archives to Azure Blob Storage
         shell: pwsh
@@ -362,6 +382,12 @@ jobs:
 
           if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
             throw "Azure CLI is not available on this runner."
+          }
+
+          # Fail loudly if the artifact download produced nothing instead of
+          # letting upload-batch succeed at publishing zero files.
+          if (@(Get-ChildItem -Path artifacts -Filter *.zip -File).Count -eq 0) {
+            throw "No zip archives found under ./artifacts - Azure upload would be empty."
           }
 
           az storage blob upload-batch `
@@ -395,6 +421,12 @@ jobs:
           # downloads. A successful build only produces the two zip archives,
           # so this cannot pull in unrelated artifacts.
           path: artifacts
+          # With upload-artifact `archive: false` the artifact payload is the
+          # original .zip file's raw bytes, and the client's default
+          # decompression would "extract" those bytes into a directory, which
+          # destroys the .zip files the release needs. Skipping it keeps the
+          # files byte-identical under artifacts/<name>/<name>.
+          skip-decompress: true
 
       - name: Upload archives to the GitHub release
         shell: pwsh

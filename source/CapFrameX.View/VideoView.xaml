@@ -259,7 +259,7 @@
                                 Style="{StaticResource MaterialDesignRaisedButton}"
                                 Command="{Binding BurnCommand}">
                             <StackPanel Orientation="Horizontal">
-                                <materialDesign:PackIcon Kind="FireOutline" Width="16" Height="16" Margin="0 0 8 0"
+                                <materialDesign:PackIcon Kind="Fire" Width="16" Height="16" Margin="0 0 8 0"
                                                          VerticalAlignment="Center" Foreground="White"/>
                                 <TextBlock Text="{loc:Tr VideoView_Burn}" VerticalAlignment="Center" Foreground="White"/>
                             </StackPanel>

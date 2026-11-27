@@ -12,7 +12,8 @@
     that means emulated x64), so this script always installs the x64 build:
 
       * the n9.0 gpl "shared" 64-bit build from the latest release of
-        https://github.com/BtbN/FFmpeg-Builds, a .zip archive.
+        https://github.com/FFmpeg-Builds/FFmpeg-Builds (formerly
+        BtbN/FFmpeg-Builds), a .zip archive.
 
     The libraries are copied into:
 
@@ -70,7 +71,10 @@ Write-Host "Process architecture: $arch"
 # the machine's; the choice above does not depend on it.)
 # BtbN's FFmpeg-Builds repo is the source for the x64 build.
 Write-Host "Querying latest BtbN FFmpeg-Builds release..."
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+# The BtbN/FFmpeg-Builds repo moved to the FFmpeg-Builds org; the old path
+# now 301-redirects, which Invoke-RestMethod does not follow. Query the
+# canonical location directly.
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/FFmpeg-Builds/FFmpeg-Builds/releases/latest"
 # The SHARED builds are the only ones that expose DLLs; static builds ship
 # only an ffmpeg.exe and would fail to load at runtime.
 # Pinned to the n9.0 GPL series on purpose: the DLL major versions must stay
@@ -149,15 +153,30 @@ public static class DllProbe
 '@
 $probe = Add-Type -TypeDefinition $probeSource -PassThru
 $avutil = Get-ChildItem -Path $dest -Filter 'avutil-*.dll' | Select-Object -First 1
-$handle = $probe::LoadLibraryEx($avutil.FullName, [IntPtr]::Zero, 0x00000000)
-if ($handle -eq [IntPtr]::Zero) {
-    throw "Smoke test FAILED: LoadLibraryEx could not load $($avutil.Name) (Win32 error $( [System.Runtime.InteropServices.Marshal]::GetLastWin32Error())). " +
-          "The DLLs are x64: run this script from a 64-bit PowerShell."
+# PE machine-type check (valid from any host architecture): the installed
+# DLLs must be x64, which is what the app runs as (natively or emulated).
+$peBytes = [System.IO.File]::ReadAllBytes($avutil.FullName)
+$peOffset = [BitConverter]::ToInt32($peBytes, 0x3C)
+$peMachine = [BitConverter]::ToUInt16($peBytes, $peOffset + 4)
+if ($peMachine -ne 0x8664) {
+    throw "Smoke test FAILED: $($avutil.Name) PE machine type is 0x$('{0:x4}' -f $peMachine), expected 0x8664 (x64) - wrong architecture build."
 }
-$proc = $probe::GetProcAddress($handle, "av_version_info")
-$probe::FreeLibrary($handle) | Out-Null
-if ($proc -eq [IntPtr]::Zero) {
-    throw "Smoke test FAILED: av_version_info not found in $($avutil.Name) - not a valid shared FFmpeg build."
+if ($arch -eq 'Arm64') {
+    # An ARM64 PowerShell process cannot load the x64 DLLs (ERROR_BAD_EXE_FORMAT
+    # would be a false positive); the PE check above is authoritative. The app
+    # itself runs as emulated x64, where these DLLs load.
+    Write-Host "Smoke test: $($avutil.Name) verified x64 (PE machine 0x8664); in-process load skipped on ARM64 host (the app runs as emulated x64)."
+} else {
+    $handle = $probe::LoadLibraryEx($avutil.FullName, [IntPtr]::Zero, 0x00000000)
+    if ($handle -eq [IntPtr]::Zero) {
+        throw "Smoke test FAILED: LoadLibraryEx could not load $($avutil.Name) (Win32 error $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())). " +
+              "The DLLs are x64: run this script from a 64-bit PowerShell."
+    }
+    $proc = $probe::GetProcAddress($handle, "av_version_info")
+    $probe::FreeLibrary($handle) | Out-Null
+    if ($proc -eq [IntPtr]::Zero) {
+        throw "Smoke test FAILED: av_version_info not found in $($avutil.Name) - not a valid shared FFmpeg build."
+    }
+    Write-Host "Smoke test OK: $($avutil.Name) loads and exports av_version_info on $arch."
 }
-Write-Host "Smoke test OK: $($avutil.Name) loads and exports av_version_info on $arch."
 Write-Host "Rebuild the test project to have the DLLs copied into its output directory."

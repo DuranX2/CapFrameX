@@ -1,16 +1,19 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Windows;
 using System.Threading;
 using System.Threading.Tasks;
 using CapFrameX.Contracts.Localization;
 using CapFrameX.Video.Contracts;
+using CapFrameX.ViewModel.Video;
+using GongSolutions.Wpf.DragDrop;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using Prism.Commands;
 using Prism.Mvvm;
 
-namespace CapFrameX.ViewModel.Video
+namespace CapFrameX.ViewModel
 {
     /// <summary>UI state of the Video Analysis tab.</summary>
     public enum EVideoState
@@ -36,7 +39,7 @@ namespace CapFrameX.ViewModel.Video
     /// or lossy x264/MP4). The heavy lifting lives in CapFrameX.Video; this
     /// view model owns the state machine, threading and file dialogs.
     /// </summary>
-    public class VideoViewModel : BindableBase
+    public class VideoViewModel : BindableBase, IDropTarget
     {
         private readonly IFpsAnalysisProvider _videoSource;
         private readonly IVideoBurnService _burnService;
@@ -283,6 +286,78 @@ namespace CapFrameX.ViewModel.Video
             };
             if (dialog.ShowDialog() == true)
                 _ = OpenVideoAsync(dialog.FileName);
+        }
+
+        // --- GongSolutions.Wpf.DragDrop: drop video files onto the tab. ---
+
+        void IDropTarget.DragOver(IDropInfo dropInfo)
+        {
+            if (dropInfo == null)
+                return;
+            dropInfo.Effects = GetDroppedVideoPath(dropInfo.Data) != null
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
+        }
+
+        void IDropTarget.Drop(IDropInfo dropInfo)
+        {
+            if (dropInfo == null)
+                return;
+            var videoPath = GetDroppedVideoPath(dropInfo.Data);
+            if (videoPath == null)
+                return;
+            _ = OpenVideoAsync(videoPath);
+        }
+
+        /// <summary>
+        /// The first dropped file with a supported video extension, or null.
+        /// Public static so tests can drive the drop path without a WPF drag.
+        /// </summary>
+        public static string? GetDroppedVideoPath(object droppedData)
+        {
+            if (droppedData is string[] paths)
+            {
+                foreach (var p in paths)
+                {
+                    var pick = Pick(p);
+                    if (pick != null)
+                        return pick;
+                }
+                return null;
+            }
+
+            if (droppedData is string singlePath)
+                return Pick(singlePath);
+
+            if (droppedData is FileInfo fileInfo)
+                return Pick(fileInfo.FullName);
+
+            if (droppedData is IDataObject dataObject
+                && dataObject.GetDataPresent(DataFormats.FileDrop)
+                && dataObject.GetData(DataFormats.FileDrop) is string[] fileDropPaths)
+            {
+                return Pick(fileDropPaths.Length > 0 ? fileDropPaths[0] : null);
+            }
+
+            return null;
+
+            static string? Pick(string? candidate)
+                => !string.IsNullOrWhiteSpace(candidate) && IsVideoFile(candidate)
+                    ? candidate
+                    : null;
+        }
+
+        /// <summary>Extensions accepted by the Browse dialog filter.</summary>
+        private static bool IsVideoFile(string path)
+        {
+            var ext = Path.GetExtension(path);
+            return string.Equals(ext, ".mp4", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".mkv", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".mov", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".webm", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".avi", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".m4v", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(ext, ".ts", StringComparison.OrdinalIgnoreCase);
         }
 
         private void BrowseOutputDialog()

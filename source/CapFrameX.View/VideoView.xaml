@@ -6,13 +6,16 @@
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:prism="http://prismlibrary.com/"
+             xmlns:dragdrop="urn:gong-wpf-dragdrop"
              xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
              xmlns:mvvm="clr-namespace:CapFrameX.MVVM.Converter;assembly=CapFrameX.MVVM"
              mc:Ignorable="d"
              d:DesignHeight="720" d:DesignWidth="1100"
              Background="{DynamicResource MaterialDesign.Brush.Card.Background}"
              Foreground="{DynamicResource MaterialDesign.Brush.Foreground}"
-             prism:ViewModelLocator.AutoWireViewModel="True">
+             prism:ViewModelLocator.AutoWireViewModel="True"
+             dragdrop:DragDrop.IsDropTarget="True"
+             dragdrop:DragDrop.DropHandler="{Binding}">
     <UserControl.Resources>
         <ResourceDictionary>
             <mvvm:BoolToVisibilityConverter x:Key="TrueToVisibleConverter" FalseValue="Collapsed" TrueValue="Visible"/>
